@@ -3,8 +3,9 @@ import lmd_catalog as lmd
 from miao.config import MiaoConfig
 from miao import VolumeDataset
 from rich import print as pprint
-import os, shutil
+import os
 
+lmd.set_data_root("/Volumes/miaai/lmd-v0.0.1/data")
 volumes = [x.to_miao() for x in lmd.all() if "flyliconn" in x.name]
 mcfg = MiaoConfig(
     volumes=volumes,
@@ -14,8 +15,12 @@ mcfg = MiaoConfig(
     sampling="random",
     output_axes="lzyx",
 )
-# dl = VolumeDataset(mcfg)
+dl = VolumeDataset(mcfg)
 pprint(mcfg)
+pprint(dl[0])
+
+import sys
+sys.exit(0)
 
 savedir = "outdir/e00/main/basic/"
 os.makedirs(savedir, exist_ok=True)
@@ -33,13 +38,13 @@ import torch
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"We're using torch device {device} .")
+net = model.to(device)
 opt = torch.optim.Adam(model.parameters(), lr = 1e-4)
 
 for ep in range(100):
     x = torch.rand(mcfg.patch_size)
     out = model(x)
     out.loss.backwards()
-    net = model.to(device)
     # init_weights(net)
     opt.step()
     opt.zero_grad()
