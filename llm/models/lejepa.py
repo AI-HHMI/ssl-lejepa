@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Optional, Tuple, Union
+from pathlib import Path
+from typing import Any, Iterator, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.profiler
 from torch import Tensor
 
 from llm.encoders import ViT3DEncoder
@@ -102,6 +105,9 @@ class LejepaConfig:
     sigreg_knots: int = 17
     sigreg_tmax: float = 3.0
 
+    # Profiling
+    profile: Optional[Union[str, Path, bool]] = None
+
     # Extra options bag
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -132,6 +138,7 @@ class LejepaConfig:
         num_slices: int = 256,
         sigreg_knots: int = 17,
         sigreg_tmax: float = 3.0,
+        profile: Optional[Union[str, Path, bool]] = None,
         **kwargs: Any,
     ):
         # Resolve aliases
@@ -183,6 +190,7 @@ class LejepaConfig:
         self.num_slices = num_slices
         self.sigreg_knots = sigreg_knots
         self.sigreg_tmax = sigreg_tmax
+        self.profile = profile
         self.extra = kwargs
 
         # Sync kwargs onto self.__dict__ for direct access
@@ -248,6 +256,8 @@ class LejepaConfig:
         ]
         if self.use_projector:
             parts.append(f"proj_dim={self.proj_dim}")
+        if self.profile:
+            parts.append(f"profile={str(self.profile)!r}")
         return f"LejepaConfig({', '.join(parts)})"
 
 
@@ -312,6 +322,65 @@ class Lejepa(nn.Module):
         else:
             self.view_maker = None
 
+        # Profiler configuration
+        if isinstance(self.cfg.profile, (str, Path)):
+            self.profile_path: Optional[Path] = Path(self.cfg.profile)
+        elif self.cfg.profile is True:
+            self.profile_path = Path("profile.out")
+        else:
+            self.profile_path = None
+        self._is_profiling: bool = False
+
+    def extra_repr(self) -> str:
+        if self.profile_path:
+            return f"profile={str(self.profile_path)!r}"
+        return ""
+
+    @contextmanager
+    def profile_context(
+        self,
+        path: Optional[Union[str, Path]] = None,
+        activities: Optional[list[torch.profiler.ProfilerActivity]] = None,
+        record_shapes: bool = True,
+        profile_memory: bool = True,
+        with_stack: bool = False,
+    ) -> Iterator[Optional[torch.profiler.profile]]:
+        """Context manager that profiles execution with torch.profiler and writes to path."""
+        target_path = Path(path) if path is not None else self.profile_path
+        if target_path is None:
+            yield None
+            return
+
+        if activities is None:
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+        self._is_profiling = True
+        try:
+            with torch.profiler.profile(
+                activities=activities,
+                record_shapes=record_shapes,
+                profile_memory=profile_memory,
+                with_stack=with_stack,
+            ) as prof:
+                yield prof
+        finally:
+            self._is_profiling = False
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        sort_by = "cuda_time_total" if torch.cuda.is_available() else "cpu_time_total"
+        table_str = prof.key_averages().table(sort_by=sort_by, row_limit=100)
+
+        if target_path.suffix == ".json":
+            prof.export_chrome_trace(str(target_path))
+        else:
+            target_path.write_text(table_str)
+            try:
+                prof.export_chrome_trace(str(target_path.with_suffix(".json")))
+            except Exception:
+                pass
+
     def encode(self, x: Tensor) -> Tensor:
         """Encode input volume directly to embedding representations (B, width)."""
         return self.encoder(x)
@@ -327,26 +396,13 @@ class Lejepa(nn.Module):
         emb = self.encode(x)
         return self.project(emb)
 
-    def forward(
+    def _forward_impl(
         self,
         x: Union[Tensor, dict[str, Any]],
         views: Optional[Tuple[list[Tensor], list[Tensor]]] = None,
         return_loss: bool = True,
         **kwargs: Any,
     ) -> Union[Tensor, dict[str, Tensor]]:
-        """Forward pass through LeJEPA.
-
-        Args:
-            x: Input volume tensor or batch dictionary from Miao VolumeDataset.
-               Accepts 3D (Z, Y, X), 4D (C, Z, Y, X), or 5D (B, C, Z, Y, X).
-            views: Optional pre-constructed tuple of (globals, locals).
-            return_loss: If True and views are enabled, returns loss dictionary.
-                         If False, returns projected features for input x.
-
-        Returns:
-            Loss dictionary containing 'loss', 'inv', 'sigreg', 'weighted_sigreg',
-            or projected representation tensor.
-        """
         # Handle dict input from Miao VolumeDataset (e.g. dl[0])
         if isinstance(x, dict):
             vol = x["img"]
@@ -392,3 +448,17 @@ class Lejepa(nn.Module):
             sigreg=self.sigreg,
             lamb=self.cfg.lamb,
         )
+
+    def forward(
+        self,
+        x: Union[Tensor, dict[str, Any]],
+        views: Optional[Tuple[list[Tensor], list[Tensor]]] = None,
+        return_loss: bool = True,
+        **kwargs: Any,
+    ) -> Union[Tensor, dict[str, Tensor]]:
+        """Forward pass through LeJEPA. Automatically profiles if profile path is set."""
+        if self.profile_path is not None and not self._is_profiling:
+            with self.profile_context(self.profile_path):
+                return self._forward_impl(x, views=views, return_loss=return_loss, **kwargs)
+        return self._forward_impl(x, views=views, return_loss=return_loss, **kwargs)
+
