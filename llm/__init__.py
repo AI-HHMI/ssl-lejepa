@@ -23,5 +23,13 @@ def _safe_rand(*args, **kwargs):
 
 torch.rand = _safe_rand
 
+from llm.profiler import analyze_and_format, format_bottleneck_report
+
 __version__ = "0.1.0"
-__all__ = ["Lejepa", "LejepaConfig", "LejepaOutput"]
+__all__ = [
+    "Lejepa",
+    "LejepaConfig",
+    "LejepaOutput",
+    "analyze_and_format",
+    "format_bottleneck_report",
+]

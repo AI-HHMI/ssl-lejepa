@@ -377,10 +377,17 @@ class Lejepa(nn.Module):
         sort_by = "cuda_time_total" if torch.cuda.is_available() else "cpu_time_total"
         table_str = prof.key_averages().table(sort_by=sort_by, row_limit=100)
 
+        try:
+            from llm.profiler import format_bottleneck_report, analyze_key_averages
+            bottleneck_summary = format_bottleneck_report(analyze_key_averages(prof.key_averages()))
+            full_report = bottleneck_summary + "\n" + table_str
+        except Exception:
+            full_report = table_str
+
         if target_path.suffix == ".json":
             prof.export_chrome_trace(str(target_path))
         else:
-            target_path.write_text(table_str)
+            target_path.write_text(full_report)
             try:
                 prof.export_chrome_trace(str(target_path.with_suffix(".json")))
             except Exception:

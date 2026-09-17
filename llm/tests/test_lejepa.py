@@ -106,3 +106,12 @@ def test_profiler(tmp_path):
     assert prof_file.exists()
     assert prof_file.stat().st_size > 0
     assert (tmp_path / "profile.json").exists()
+
+    content = prof_file.read_text()
+    assert "BOTTLENECK ANALYSIS SUMMARY" in content
+    assert "CPU Compute" in content
+    assert "Primary Bottleneck" in content
+
+    from llm import analyze_and_format
+    report_json = analyze_and_format(tmp_path / "profile.json")
+    assert "BOTTLENECK ANALYSIS SUMMARY" in report_json

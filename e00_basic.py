@@ -4,6 +4,7 @@ from miao.config import MiaoConfig
 from miao import VolumeDataset
 from rich import print as pprint
 import os, sys
+import torch
 
 # lmd.set_data_root("/Volumes/miaai/lmd-v0.0.1/data")
 # volumes = [x.to_miao() for x in lmd.all() if "flyliconn" in x.name]
@@ -24,8 +25,6 @@ dl = VolumeDataset(mcfg)
 
 savedir = "outdir/e00/main/basic/"
 os.makedirs(savedir, exist_ok=True)
-
-import torch
 
 cfg = LejepaConfig(
     n_layers = 12,

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Commit locally, push bookmark, and run a command on the cluster via SSH.
+#
+# Examples:
+#   ./run uv run python scripts/pretrain.py
+#   ./run -- python scripts/example.py
+#
+# Optional environment overrides:
+#   BM=my-branch MSG="run exp" HOST=login1.int.janelia.org REMOTE_REPO=~/proj/mia-muvit ./jj_run.sh ...
+
+set -e
+[[ "$1" == "--" ]] && shift
+BM="${BM:-$(jj bookmark list -r 'heads(bookmarks() & ancestors(@))' -T name 2>/dev/null)}"
+BM="${BM:-main}"
+CMD=$(printf '%q ' "$@")
+jj commit -m "${MSG:-running cmd: $* }"
+jj bookmark set -r @- "$BM"
+jj git push -b "$BM"
+ssh -o ConnectTimeout=15 "${HOST:-login1.int.janelia.org}" "cd ${REMOTE_REPO:-~/proj/ssl-lejepa/} && jj git fetch && jj new ${BM}@origin && $CMD"
