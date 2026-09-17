@@ -13,7 +13,8 @@ set -e
 BM="${BM:-$(jj bookmark list -r 'heads(bookmarks() & ancestors(@))' -T name 2>/dev/null)}"
 BM="${BM:-main}"
 CMD=$(printf '%q ' "$@")
-jj commit -m "${MSG:-running cmd: $* }"
+# jj commit -m "${MSG:-running cmd: $* }"
 jj bookmark set -r @- "$BM"
 jj git push -b "$BM"
-ssh -o ConnectTimeout=15 "${HOST:-login1.int.janelia.org}" "cd ${REMOTE_REPO:-~/proj/ssl-lejepa/} && jj git fetch && jj new ${BM}@origin && $CMD"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$BM] $CMD" >> experiment.log
+ssh -o ConnectTimeout=15 "${HOST:-login1.int.janelia.org}" "cd ${REMOTE_REPO:-~/proj/ssl-lejepa/} && jj git fetch && jj new ${BM}@origin && uv run python $CMD"
