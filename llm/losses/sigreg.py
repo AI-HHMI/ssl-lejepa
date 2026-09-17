@@ -78,12 +78,31 @@ class SIGReg(nn.Module):
         return f"num_slices={self.num_slices}, knots={self.knots}, t_max={self.t_max}"
 
 
+class LejepaOutput(dict):
+    """Output dictionary from LeJEPA supporting attribute and dict key access (e.g. out.loss, out['loss'])."""
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        self[name] = value
+
+    def __delattr__(self, name: str) -> None:
+        try:
+            del self[name]
+        except KeyError:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+
 def lejepa_loss(
     globals: Tensor,
     views: Tensor,
     sigreg: nn.Module,
     lamb: float = 0.02,
-) -> dict[str, Tensor]:
+) -> LejepaOutput:
     """Compute joint invariance + SIGReg loss.
 
     Args:
@@ -93,7 +112,7 @@ def lejepa_loss(
         lamb: Weight for the SIGReg regularization term.
 
     Returns:
-        Dictionary containing 'loss', 'inv', 'sigreg', 'weighted_sigreg'.
+        LejepaOutput containing 'loss', 'inv', 'sigreg', 'weighted_sigreg'.
     """
     # Invariance loss: pull all views toward the mean of the global views
     global_mean = globals.mean(dim=0, keepdim=True)
@@ -104,9 +123,10 @@ def lejepa_loss(
     weighted_sig = lamb * sig
     total_loss = inv + weighted_sig
 
-    return {
-        "loss": total_loss,
-        "inv": inv,
-        "sigreg": sig,
-        "weighted_sigreg": weighted_sig,
-    }
+    return LejepaOutput(
+        loss=total_loss,
+        inv=inv,
+        sigreg=sig,
+        weighted_sigreg=weighted_sig,
+    )
+

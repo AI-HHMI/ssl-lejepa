@@ -13,7 +13,7 @@ import torch.profiler
 from torch import Tensor
 
 from llm.encoders import ViT3DEncoder
-from llm.losses import SIGReg, lejepa_loss
+from llm.losses import LejepaOutput, SIGReg, lejepa_loss
 from llm.views import ViewMaker
 
 
@@ -330,6 +330,11 @@ class Lejepa(nn.Module):
         else:
             self.profile_path = None
         self._is_profiling: bool = False
+        self._profile_done: bool = False
+
+    def reset_profile(self) -> None:
+        """Reset the profile_done flag so the next forward pass is profiled."""
+        self._profile_done = False
 
     def extra_repr(self) -> str:
         if self.profile_path:
@@ -402,7 +407,7 @@ class Lejepa(nn.Module):
         views: Optional[Tuple[list[Tensor], list[Tensor]]] = None,
         return_loss: bool = True,
         **kwargs: Any,
-    ) -> Union[Tensor, dict[str, Tensor]]:
+    ) -> Union[Tensor, LejepaOutput]:
         # Handle dict input from Miao VolumeDataset (e.g. dl[0])
         if isinstance(x, dict):
             vol = x["img"]
@@ -416,6 +421,14 @@ class Lejepa(nn.Module):
             vol = vol.unsqueeze(0)
         elif vol.dim() != 5:
             raise ValueError(f"Expected 3D, 4D, or 5D input, got tensor with shape {tuple(vol.shape)}")
+
+        # Ensure volume is on the same device as model parameters
+        try:
+            param_device = next(self.parameters()).device
+            if vol.device != param_device:
+                vol = vol.to(param_device)
+        except StopIteration:
+            pass
 
         # If views are disabled or inference mode requested, return embeddings directly
         if not return_loss or self.cfg.views == "none" or self.view_maker is None:
@@ -455,10 +468,18 @@ class Lejepa(nn.Module):
         views: Optional[Tuple[list[Tensor], list[Tensor]]] = None,
         return_loss: bool = True,
         **kwargs: Any,
-    ) -> Union[Tensor, dict[str, Tensor]]:
+    ) -> Union[Tensor, LejepaOutput]:
         """Forward pass through LeJEPA. Automatically profiles if profile path is set."""
-        if self.profile_path is not None and not self._is_profiling:
+        should_profile = (
+            self.profile_path is not None
+            and not self._is_profiling
+            and (not self._profile_done or self.cfg.extra.get("profile_all_steps", False))
+        )
+        if should_profile:
             with self.profile_context(self.profile_path):
-                return self._forward_impl(x, views=views, return_loss=return_loss, **kwargs)
+                out = self._forward_impl(x, views=views, return_loss=return_loss, **kwargs)
+            self._profile_done = True
+            return out
         return self._forward_impl(x, views=views, return_loss=return_loss, **kwargs)
+
 
