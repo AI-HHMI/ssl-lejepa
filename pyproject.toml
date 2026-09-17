@@ -26,8 +26,10 @@ dev = [
 packages = ["llm"]
 
 [tool.uv.sources]
-lmd-catalog = { path = "../lmd-data-versioning", editable = true }
-miao-io = { path = "../miao", editable = true }
+lmd-catalog = { git = "https://github.com/AI-HHMI/lmd-catalog", branch = "main" }
+miao-io = { git = "https://github.com/AI-HHMI/miao.git", branch = "lazy-torch-import" }
+# lmd-catalog = { path = "../lmd-data-versioning", editable = true }
+# miao-io = { path = "../miao", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["llm/tests"]
