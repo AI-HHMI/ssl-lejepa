@@ -9,12 +9,12 @@
 #   BM=my-branch MSG="run exp" HOST=login1.int.janelia.org REMOTE_REPO=~/proj/mia-muvit ./jj_run.sh ...
 
 set -e
-[[ "$1" == "--" ]] && shift
-BM="${BM:-$(jj bookmark list -r 'heads(bookmarks() & ancestors(@))' -T name 2>/dev/null)}"
-BM="${BM:-main}"
-CMD=$(printf '%q ' "$@")
-# jj commit -m "${MSG:-running cmd: $* }"
-jj bookmark set -r @- "$BM"
-jj git push -b "$BM"
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$BM] $CMD" >> experiment.log
-ssh -o ConnectTimeout=15 "${HOST:-login1.int.janelia.org}" "cd ${REMOTE_REPO:-~/proj/ssl-lejepa/} && jj git fetch && jj new ${BM}@origin && uv run python $CMD"
+# [[ "$1" == "--" ]] && shift
+# jj bookmark set -r @- main
+jj git push -b main
+ssh -o ConnectTimeout=15 login1.int.janelia.org cd ~/proj/ssl-lejepa/ && jj git fetch && jj new main@origin
+
+# set -e
+# CMD=$(printf '%q ' "$@")
+# echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$BM] $CMD" >> experiment.log
+# ssh -o ConnectTimeout=15 "${HOST:-login1.int.janelia.org}" "cd ${REMOTE_REPO:-~/proj/ssl-lejepa/} && uv run python $CMD
