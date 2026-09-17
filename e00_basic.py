@@ -5,7 +5,7 @@ from miao import VolumeDataset
 from rich import print as pprint
 import os, sys
 
-lmd.set_data_root("/Volumes/miaai/lmd-v0.0.1/data")
+# lmd.set_data_root("/Volumes/miaai/lmd-v0.0.1/data")
 # volumes = [x.to_miao() for x in lmd.all() if "flyliconn" in x.name]
 volumes = [x.to_miao() for x in lmd.all() if x.name == "exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001"]
 pprint(volumes)
