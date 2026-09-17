@@ -16,10 +16,13 @@ mcfg = MiaoConfig(
 # dl = VolumeDataset(mcfg)
 pprint(mcfg)
 
+savedir = "outdir/e00/main/basic/"
+
 cfg = LejepaConfig(
     n_layers = 12,
     width = 512,
     views = 'basic',
+    profile=savedir + 'profile.out', ## Turn on profiling, which uses pytorch profiler and writes to this file
 )
 model = Lejepa(cfg)
 pprint(model)
