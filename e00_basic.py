@@ -73,7 +73,8 @@ def rungpu():
 
 if __name__=="__main__":
     import sys
-    if sys.argv[1] == 'gpu':
+    print(sys.argv)
+    if len(sys.argv) > 1 and sys.argv[1] == 'gpu':
         rungpu()
     else:
         run()
