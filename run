@@ -1,20 +1,4 @@
-#!/usr/bin/env bash
-# Commit locally, push bookmark, and run a command on the cluster via SSH.
-#
-# Examples:
-#   ./run uv run python scripts/pretrain.py
-#   ./run -- python scripts/example.py
-#
-# Optional environment overrides:
-#   BM=my-branch MSG="run exp" HOST=login1.int.janelia.org REMOTE_REPO=~/proj/mia-muvit ./jj_run.sh ...
-
 set -e
-# [[ "$1" == "--" ]] && shift
-# jj bookmark set -r @- main
-jj git push -b main
-ssh -o ConnectTimeout=15 login1.int.janelia.org cd ~/proj/ssl-lejepa/ && jj git fetch && jj new main@origin
-
-# set -e
-# CMD=$(printf '%q ' "$@")
-# echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$BM] $CMD" >> experiment.log
-# ssh -o ConnectTimeout=15 "${HOST:-login1.int.janelia.org}" "cd ${REMOTE_REPO:-~/proj/ssl-lejepa/} && uv run python $CMD
+CMD=$(printf '%q ' "$@")
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] [main] $CMD" >> experiment.log
+ssh -o ConnectTimeout=15 login1.int.janelia.org cd '~/proj/ssl-lejepa/' && uv run python $CMD 
