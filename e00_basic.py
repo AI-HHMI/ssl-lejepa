@@ -5,6 +5,7 @@ from miao import VolumeDataset
 from rich import print as pprint
 import os, sys
 import torch
+import json
 
 def run():
     # lmd.set_data_root("/Volumes/miaai/lmd-v0.0.1/data")
@@ -26,6 +27,7 @@ def run():
 
     savedir = "outdir/e00/main/basic/"
     os.makedirs(savedir, exist_ok=True)
+    metrics_file = open(savedir + "metrics.jsonl", 'a')
 
     cfg = LejepaConfig(
         n_layers = 12,
@@ -49,6 +51,10 @@ def run():
         out.loss.backwards()
         opt.step()
         opt.zero_grad()
+
+        metrics_file.write(json.dumps({"epoch":ep, "loss":float(out.loss.detach().item())}) + '\n')
+        metrics_file.flush()
+
         print("\033[F",end='') ## move cursor UP one line 
         # print(f"finished epoch {ep+1}/{100}, loss={torch.rand():4f}, dt={dt:4f}, rate={N_pix/dt:5f} Mpix/s", end='\n',flush=True)
         print(f"finished epoch {ep+1}/{100}, loss={out.loss.detach():4f},", end='\n',flush=True)
@@ -65,7 +71,7 @@ def rungpu():
         -R "span[hosts=1]" \
         -gpu "num={NUM_GPUS}:mode=exclusive_process" \
         -q gpu_h100 \
-        -o ./logs/${RUN_NAME}.log \
+        -o logs/${RUN_NAME}.log \
         uv run python e00_basic.py
         """
     subprocess.Popen(cmd, shell=True, stdin=subprocess.DEVNULL, start_new_session=True)
