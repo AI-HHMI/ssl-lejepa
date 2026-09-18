@@ -38,7 +38,7 @@ def run():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"We're using torch device {device} .")
-    net = model.to(device)
+    model = model.to(device)
     opt = torch.optim.Adam(model.parameters(), lr = 1e-4)
     # init_weights(net)
 
