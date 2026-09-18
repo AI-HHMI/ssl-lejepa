@@ -6,6 +6,9 @@ from rich import print as pprint
 import os, sys
 import torch
 import json
+import time
+
+savedir = "outdir/e00/main/basic/"
 
 def run():
     # lmd.set_data_root("/Volumes/miaai/lmd-v0.0.1/data")
@@ -52,7 +55,7 @@ def run():
         opt.step()
         opt.zero_grad()
 
-        metrics_file.write(json.dumps({"epoch":ep, "loss":float(out.loss.detach().item())}) + '\n')
+        metrics_file.write(json.dumps({"tbl":"metrics", "epoch":ep, "time":time.time(), "loss":float(out.loss.detach().item())}) + '\n')
         metrics_file.flush()
 
         print("\033[F",end='') ## move cursor UP one line 
@@ -71,7 +74,7 @@ def rungpu():
         -R "span[hosts=1]" \
         -gpu "num={NUM_GPUS}:mode=exclusive_process" \
         -q gpu_h100 \
-        -o logs/${RUN_NAME}.log \
+        -o {savedir}/job_%J.log \
         uv run python e00_basic.py
         """
     subprocess.Popen(cmd, shell=True, stdin=subprocess.DEVNULL, start_new_session=True)
