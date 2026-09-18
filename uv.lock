@@ -231,21 +231,12 @@ wheels = [
 [[package]]
 name = "lmd-catalog"
 version = "0.1.0"
-source = { editable = "../lmd-data-versioning" }
+source = { git = "https://github.com/AI-HHMI/lmd-catalog?branch=main#6f7f9da837f38d2799ad5ad7f17f61eb00f26f13" }
 dependencies = [
     { name = "miao-io" },
     { name = "pydantic" },
     { name = "rich" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "miao-io", specifier = ">=0.4.0" },
-    { name = "pydantic", specifier = ">=2.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
-    { name = "rich" },
-]
-provides-extras = ["dev"]
 
 [[package]]
 name = "markdown-it-py"
@@ -356,7 +347,7 @@ wheels = [
 [[package]]
 name = "miao-io"
 version = "0.4.1"
-source = { editable = "../miao" }
+source = { git = "https://github.com/AI-HHMI/miao.git?branch=master#f936a1d46e1fb7731e22e892fedc573df7df4ebf" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
@@ -367,19 +358,6 @@ dependencies = [
     { name = "tensorstore", version = "0.1.85", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "torch" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "numpy", specifier = ">=1.24" },
-    { name = "pydantic", specifier = ">=2.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
-    { name = "pyyaml", specifier = ">=6.0" },
-    { name = "scipy", marker = "extra == 'dev'", specifier = ">=1.10" },
-    { name = "tensorstore", specifier = ">=0.1.60" },
-    { name = "torch", specifier = ">=2.0" },
-    { name = "zarr", marker = "extra == 'dev'", specifier = ">=2.16" },
-]
-provides-extras = ["dev"]
 
 [[package]]
 name = "ml-dtypes"
@@ -1292,8 +1270,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "einops", specifier = ">=0.7.0" },
-    { name = "lmd-catalog", editable = "../lmd-data-versioning" },
-    { name = "miao-io", editable = "../miao" },
+    { name = "lmd-catalog", git = "https://github.com/AI-HHMI/lmd-catalog?branch=main" },
+    { name = "miao-io", git = "https://github.com/AI-HHMI/miao.git?branch=master" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "rich", specifier = ">=13.0" },
