@@ -54,8 +54,7 @@ def run():
         print(f"finished epoch {ep+1}/{100}, loss={out.loss.detach():4f},", end='\n',flush=True)
 
 
-
-if __name__=="__main__":
+def rungpu():
     import subprocess
     RUN_NAME = "e00_basic"
     NUM_GPUS = 1
@@ -71,3 +70,10 @@ if __name__=="__main__":
         """
     subprocess.Popen(cmd, shell=True, stdin=subprocess.DEVNULL, start_new_session=True)
     print(f"Submitted {RUN_NAME} to LSF.")
+
+if __name__=="__main__":
+    import sys
+    if sys.argv[1] == 'gpu':
+        rungpu()
+    else:
+        run()
