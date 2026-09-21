@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from lib.models import Lejepa, LejepaConfig
 import lmd_catalog as lmd
@@ -15,19 +15,22 @@ import time
 @dataclass(slots=True)
 class Params:
     savedir: str = "outdir/e00/main/basic/"
-    patch_size: tuple[int,int,int] = (104, 232, 232)
+    # patch_size: list[int] = [104, 232, 232]
+    patch_size: list[int] = field(default_factory=lambda: [104, 232, 232])
+    batch_size: int = 42
+    n_epoch: int = 1000
     
 def allparams():
     params = []
     ps = [
-        (2**3  , 2**3*3, 2**3*3),
-        (2**2*3, 2**2*9, 2**2*9),
-        (2**4  , 2**4*3, 2**4*3),
-        (2**3*3, 2**3*9, 2**3*9),
-        (2**5  , 2**5*3, 2**5*3),
-        (2**4*3, 2**4*9, 2**4*9),
-        (2**6  , 2**6*3, 2**6*3),
-        (2**5*3, 2**5*9, 2**5*9),
+        [2**3  , 2**3*3, 2**3*3],
+        [2**2*3, 2**2*9, 2**2*9],
+        [2**4  , 2**4*3, 2**4*3],
+        [2**3*3, 2**3*9, 2**3*9],
+        [2**5  , 2**5*3, 2**5*3],
+        [2**4*3, 2**4*9, 2**4*9],
+        [2**6  , 2**6*3, 2**6*3],
+        [2**5*3, 2**5*9, 2**5*9],
     ]
     for i, _p in enumerate(ps):
         p = Params()
@@ -37,7 +40,7 @@ def allparams():
     return params
 
 def run(n:int):
-    par = allparams()[n]
+    par : Params = allparams()[n]
     # lmd.set_data_root("/Volumes/miaai/lmd-v0.0.1/data")
     # volumes = [x.to_miao() for x in lmd.all() if "flyliconn" in x.name]
     volumes = [x.to_miao() for x in lmd.all() if x.name == "exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001"]
@@ -63,6 +66,7 @@ def run(n:int):
         width = 512,
         views = 'basic',
         profile=par.savedir + 'profile.out', ## Turn on profiling, which uses pytorch profiler and writes to this file
+        lamb = 0.1,
     )
     model = Lejepa(cfg)
     pprint(model)
@@ -72,14 +76,14 @@ def run(n:int):
     model = model.to(device)
     opt = torch.optim.Adam(model.parameters(), lr = 1e-4)
     # init_weights(net)
-    n_epoch = 1_000
+    # n_epoch = 1_000
 
     def batch(ep):
-        stack = [dl[42*ep + i] for i in range(42)]
-        b = torch.cat([x['img'] for x in stack])
+        stack = [dl[par.batch_size*ep + i] for i in range(par.batch_size)]
+        b = torch.stack([x['img'] for x in stack])
         return b
 
-    for ep in range(n_epoch):
+    for ep in range(par.n_epoch):
         x = batch(ep)
         out = model(x)
         out.loss.backwards()
@@ -92,7 +96,7 @@ def run(n:int):
 
         print("\033[F",end='') ## move cursor UP one line 
         # print(f"finished epoch {ep+1}/{100}, loss={torch.rand():4f}, dt={dt:4f}, rate={N_pix/dt:5f} Mpix/s", end='\n',flush=True)
-        print(f"finished epoch {ep+1}/{n_epoch}, loss={out.loss.detach():4f},", end='\n',flush=True)
+        print(f"finished epoch {ep+1}/{par.n_epoch}, loss={out.loss.detach():4f},", end='\n',flush=True)
 
 
 def runlsf(n:int):
