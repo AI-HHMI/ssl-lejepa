@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PyTorch Profiling & Perfetto Throughput Optimization Guide</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --card-bg: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --text-muted: #8b949e;
+      --primary: #58a6ff;
+      --success: #3fb950;
+      --warning: #d29922;
+      --danger: #f85149;
+      --code-bg: #1f242c;
+      --tag-bg: #21262d;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      margin: 0;
+      padding: 32px 20px;
+      display: flex;
+      justify-content: center;
+    }
+    .container {
+      max-width: 900px;
+      width: 100%;
+    }
+    h1 {
+      font-size: 2rem;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 12px;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    h2 {
+      font-size: 1.4rem;
+      margin-top: 36px;
+      color: var(--primary);
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 8px;
+    }
+    h3 {
+      font-size: 1.15rem;
+      margin-top: 24px;
+      color: #fff;
+    }
+    p, li {
+      color: #c9d1d9;
+    }
+    .badge {
+      display: inline-block;
+      padding: 3px 8px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      border-radius: 6px;
+      text-transform: uppercase;
+    }
+    .badge-primary { background: rgba(88, 166, 255, 0.15); color: var(--primary); }
+    .badge-success { background: rgba(63, 185, 80, 0.15); color: var(--success); }
+    .badge-warning { background: rgba(210, 153, 34, 0.15); color: var(--warning); }
+    .badge-danger { background: rgba(248, 81, 73, 0.15); color: var(--danger); }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      margin: 18px 0;
+    }
+    .callout {
+      border-left: 4px solid var(--primary);
+      background: rgba(88, 166, 255, 0.08);
+      padding: 16px;
+      border-radius: 0 8px 8px 0;
+      margin: 20px 0;
+    }
+    .callout-warning {
+      border-left-color: var(--warning);
+      background: rgba(210, 153, 34, 0.08);
+    }
+    .funnel-step {
+      display: flex;
+      align-items: flex-start;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    .step-number {
+      background: var(--primary);
+      color: #000;
+      font-weight: bold;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 20px 0;
+      background: var(--card-bg);
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+    }
+    th, td {
+      padding: 12px 16px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.95rem;
+    }
+    th {
+      background: var(--tag-bg);
+      color: #fff;
+      font-weight: 600;
+    }
+    tr:last-child td {
+      border-bottom: none;
+    }
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      padding: 16px;
+      border-radius: 8px;
+      overflow-x: auto;
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 0.88rem;
+      color: #f0f6fc;
+    }
+    code {
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      background: rgba(110, 118, 129, 0.2);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 0.88em;
+      color: #79c0ff;
+    }
+    pre code {
+      background: transparent;
+      padding: 0;
+      color: inherit;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>PyTorch Profiling & Perfetto Throughput Guide</h1>
+    <p>A rigorous engineering framework for identifying and eliminating <strong>CPU, GPU, and I/O bottlenecks</strong> to maximize training throughput.</p>
+
+    <div class="callout">
+      <strong>Core Verdict:</strong> Yes, <code>torch.profiler</code> exported to Perfetto (Chrome Trace format) is the gold standard for timeline inspection. 
+      However, <strong>profiling can distort your results</strong> unless structured as a multi-stage funnel with zero-overhead baseline benchmarking and warm step isolation.
+    </div>
+
+    <h2>1. The 3-Step Throughput Funnel</h2>
+    
+    <div class="card">
+      <div class="funnel-step">
+        <div class="step-number">1</div>
+        <div>
+          <strong>Step 1: Macro Baseline (Zero Overhead)</strong>
+          <p>Measure steady-state <code>Mpix/sec</code> or <code>samples/sec</code> over 50–100 steps with the profiler turned <em>off</em>. Monitor GPU utilization with <code>watch -n 0.5 nvidia-smi</code>.</p>
+          <ul>
+            <li><strong>GPU at 95–100%:</strong> You are already GPU compute bound. Profiling won't find I/O bubbles; focus on <code>bfloat16</code> and <code>torch.compile</code>.</li>
+            <li><strong>GPU &lt; 80% or fluctuating:</strong> You have CPU, Disk I/O, or PCIe bottlenecks. Proceed to Step 2.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="funnel-step">
+        <div class="step-number">2</div>
+        <div>
+          <strong>Step 2: Surgical Trace in Perfetto</strong>
+          <p>Profile <strong>exactly 1 warm step</strong> (e.g. step 4) using macro annotations (<code>record_function</code>) and low-overhead flags.</p>
+        </div>
+      </div>
+
+      <div class="funnel-step">
+        <div class="step-number">3</div>
+        <div>
+          <strong>Step 3: Eliminate "GPU Bubbles"</strong>
+          <p>Inspect the GPU stream track in <a href="https://ui.perfetto.dev" target="_blank" style="color: var(--primary);">ui.perfetto.dev</a>. Any white space on the GPU track indicates where the GPU is starved.</p>
+        </div>
+      </div>
+    </div>
+
+    <h2>2. The 3 Golden Rules for Accurate Profiling</h2>
+    
+    <div class="callout callout-warning">
+      <strong>Rule 1: Warmup is Mandatory (Never profile Step 0 or 1)</strong><br>
+      Step 0 includes cuDNN auto-tuning, CUDA context creation, memory allocator initialization, and page faults. 80% of what you see on Step 0 is one-off initialization noise that distorts steady-state throughput.
+    </div>
+
+    <h3>Rule 2: Strip Profiler Overhead</h3>
+    <ul>
+      <li><code>profile_memory=False</code>: Unless diagnosing an OOM error, memory tracking intercepts every tensor allocation and heavily slows down CPU dispatch.</li>
+      <li><code>with_stack=False</code>: Frame inspection examines the Python call stack on every single ATen op, artificially inflating CPU time by 20–50%.</li>
+    </ul>
+
+    <h3>Rule 3: Label Macro Boundaries with <code>record_function</code></h3>
+    <p>Raw traces contain tens of thousands of tiny C++ kernels (<code>aten::empty</code>, <code>aten::slice</code>). Wrapping major phases in <code>torch.profiler.record_function</code> creates visible macro blocks on the timeline.</p>
+
+    <h2>3. The Clean Profiling Recipe</h2>
+    <pre><code>import torch
+from contextlib import nullcontext
+
+PROFILE_STEP = 4  # Warm up 3 steps, profile step 4, then exit
+
+for ep in range(100):
+    do_profile = (ep == PROFILE_STEP)
+
+    profiler_ctx = torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            *( [torch.profiler.ProfilerActivity.CUDA] if torch.cuda.is_available() else [] ),
+        ],
+        record_shapes=True,
+        profile_memory=False,  # Zero allocator overhead
+        with_stack=False,      # Zero frame inspection overhead
+    ) if do_profile else nullcontext()
+
+    with profiler_ctx as prof:
+        # Phase 1: Disk / Network I/O
+        with torch.profiler.record_function("01_DATA_IO"):
+            batch = dl[ep]
+
+        # Phase 2: Host -> GPU Transfer
+        with torch.profiler.record_function("02_H2D_TRANSFER"):
+            img = batch['img'].to(device, non_blocking=True)
+
+        # Phase 3: Model Forward Pass
+        with torch.profiler.record_function("03_FORWARD"):
+            out = model(img)
+
+        # Phase 4: Loss & Backward Pass
+        with torch.profiler.record_function("04_BACKWARD"):
+            out.loss.backwards()
+
+        # Phase 5: Optimizer
+        with torch.profiler.record_function("05_OPTIMIZER"):
+            opt.step()
+            opt.zero_grad()
+
+    if do_profile:
+        prof.export_chrome_trace(f"{savedir}/trace_step{ep}.json")
+        print(f"--> Perfetto trace exported for step {ep}!")
+        break  # Exit early to inspect trace</code></pre>
+
+    <h2>4. Diagnosing Bottlenecks in Perfetto (ui.perfetto.dev)</h2>
+    <p>Drop <code>trace_step4.json</code> into <a href="https://ui.perfetto.dev" target="_blank" style="color: var(--primary);">ui.perfetto.dev</a> and examine the <strong>CUDA stream track</strong>:</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Visual Pattern in Perfetto</th>
+          <th>Diagnosis</th>
+          <th>Recommended Solution</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>
+            <span class="badge badge-danger">I/O Bubble</span><br>
+            Wide empty gap on GPU stream; Main Thread is blocked inside <code>01_DATA_IO</code>.
+          </td>
+          <td><strong>Disk / Network I/O Bound</strong></td>
+          <td>GPU is starving waiting for Zarr chunks. Use multi-process <code>DataLoader(num_workers=4, pin_memory=True, prefetch_factor=2)</code>.</td>
+        </tr>
+        <tr>
+          <td>
+            <span class="badge badge-warning">PCIe Staging</span><br>
+            Large blue block labeled <code>Memcpy HtoD</code> blocking GPU execution.
+          </td>
+          <td><strong>PCIe Host-to-Device Bound</strong></td>
+          <td>Host tensor is in pageable memory. Use <code>pin_memory=True</code> on host tensors and <code>.to(device, non_blocking=True)</code>.</td>
+        </tr>
+        <tr>
+          <td>
+            <span class="badge badge-warning">CPU Stalls</span><br>
+            GPU kernels are small with frequent micro-gaps; CPU Main Thread is at 100%.
+          </td>
+          <td><strong>CPU Dispatch Bound</strong></td>
+          <td>CPU cannot enqueue CUDA kernels fast enough. Use <code>torch.compile(model)</code> to fuse kernels into CUDA Graphs, or increase patch size.</td>
+        </tr>
+        <tr>
+          <td>
+            <span class="badge badge-success">Saturated</span><br>
+            GPU stream is a continuous solid block of compute with zero gaps (99%+ occupancy).
+          </td>
+          <td><strong>GPU Compute Bound (Optimal)</strong></td>
+          <td>Pipeline is fully saturated. Accelerate math using <code>torch.autocast('cuda', dtype=torch.bfloat16)</code> or FlashAttention-2.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="card" style="margin-top: 30px;">
+      <h3 style="margin-top: 0;">Summary Workflow</h3>
+      <ol style="margin-bottom: 0;">
+        <li>Calculate steady-state <strong>Mpix/sec</strong> with profiler OFF.</li>
+        <li>Check <code>nvidia-smi</code>: if &lt;80% utilization, run the warm step-4 recipe above.</li>
+        <li>Open the trace in Perfetto, find the source of the white gap, and apply the corresponding fix from the table.</li>
+        <li>Re-verify with Step 1 (confirm Mpix/sec increased).</li>
+      </ol>
+    </div>
+  </div>
+</body>
+</html>

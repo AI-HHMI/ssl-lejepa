@@ -53,7 +53,7 @@ def run(n:int):
     )
     dl = VolumeDataset(mcfg)
     # pprint(mcfg)
-    # pprint(dl[0])
+    # pprint(dl[0]['img'].shape)
 
     os.makedirs(par.savedir, exist_ok=True)
     metrics_file = open(par.savedir + "metrics.jsonl", 'a')
@@ -74,10 +74,14 @@ def run(n:int):
     # init_weights(net)
     n_epoch = 1_000
 
+    def batch(ep):
+        stack = [dl[42*ep + i] for i in range(42)]
+        b = torch.cat([x['img'] for x in stack])
+        return b
+
     for ep in range(n_epoch):
-        # x = torch.rand(mcfg.patch_size)
-        x = dl[ep]
-        out = model(x['img'])
+        x = batch(ep)
+        out = model(x)
         out.loss.backwards()
         opt.step()
         opt.zero_grad()
@@ -114,7 +118,7 @@ def runmany():
         runlsf(i)
 
 def test():
-    x = allparams()
+    x = lmd.all()
     for xi in x:
         pprint(xi)
 
