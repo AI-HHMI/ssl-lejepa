@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import reduce
 
 from lib.models import Lejepa, LejepaConfig
 import lmd_catalog as lmd
@@ -121,6 +122,16 @@ def runmany():
     for i in range(len(allparams())):
         runlsf(i)
 
+def analysis():
+    def loadAndFuse(par:Params):
+        metr = json.load(open(par.savedir + "metrics.json", "r"))
+        tabl = [{**m, **par.__dict__} for m in metr]
+        return tabl
+    params = [loadAndFuse(p) for p in allparams()]
+    res = list(reduce(lambda a,b: a+b, params))
+    pprint(res)
+    return res
+
 def test():
     x = lmd.all()
     for xi in x:
@@ -137,5 +148,7 @@ if __name__=="__main__":
         runlsf(int(sys.argv[2]))
     elif sys.argv[1] == 'test':
         test()
+    elif sys.argv[1] == 'anl':
+        analysis()
     else:
         run(int(sys.argv[1]))
