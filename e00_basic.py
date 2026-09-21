@@ -12,8 +12,6 @@ import torch
 import json
 import time
 
-# savedir = "outdir/e00/main/basic/"
-
 @dataclass(slots=True)
 class Params:
     savedir: str = "outdir/e00/main/basic/"
@@ -104,7 +102,7 @@ def runlsf(n:int):
         -n {NUM_GPUS} \
         -R "span[hosts=1]" \
         -gpu "num={NUM_GPUS}:mode=exclusive_process" \
-        -q gpu_h100 \
+        -q gpu_a100 \
         -o {par.savedir}/job_%J.log \
         uv run python e00_basic.py {n}
         """
