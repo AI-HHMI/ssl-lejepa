@@ -74,8 +74,9 @@ def run(n:int):
     model = model.to(device)
     opt = torch.optim.Adam(model.parameters(), lr = 1e-4)
     # init_weights(net)
+    n_epoch = 1_000
 
-    for ep in range(100):
+    for ep in range(n_epoch):
         # x = torch.rand(mcfg.patch_size)
         x = dl[ep]
         out = model(x['img'])
@@ -83,12 +84,13 @@ def run(n:int):
         opt.step()
         opt.zero_grad()
 
-        metrics_file.write(json.dumps({"tbl":"metrics", "epoch":ep, "time":time.time(), "loss":float(out.loss.detach().item())}) + '\n')
-        metrics_file.flush()
+        if ep%10==0:
+            metrics_file.write(json.dumps({"tbl":"metrics", "epoch":ep, "time":time.time(), "loss":float(out.loss.detach().item())}) + '\n')
+            metrics_file.flush()
 
         print("\033[F",end='') ## move cursor UP one line 
         # print(f"finished epoch {ep+1}/{100}, loss={torch.rand():4f}, dt={dt:4f}, rate={N_pix/dt:5f} Mpix/s", end='\n',flush=True)
-        print(f"finished epoch {ep+1}/{100}, loss={out.loss.detach():4f},", end='\n',flush=True)
+        print(f"finished epoch {ep+1}/{n_epoch}, loss={out.loss.detach():4f},", end='\n',flush=True)
 
 
 def runlsf(n:int):
@@ -106,7 +108,7 @@ def runlsf(n:int):
         -o {par.savedir}/job_%J.log \
         uv run python e00_basic.py {n}
         """
-    # subprocess.Popen(cmd, shell=True, stdin=subprocess.DEVNULL, start_new_session=True)
+    subprocess.Popen(cmd, shell=True, stdin=subprocess.DEVNULL, start_new_session=True)
     print(f"Submitted {RUN_NAME} {n} to LSF.")
 
 def runmany():
