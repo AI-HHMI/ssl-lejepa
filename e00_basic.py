@@ -4,6 +4,7 @@ from dataclasses import dataclass, field, asdict
 from functools import reduce
 
 from lib.models import Lejepa, LejepaConfig
+from lib.util import pick_entrypoint
 import lmd_catalog as lmd
 from miao.config import MiaoConfig
 from miao import VolumeDataset
@@ -154,46 +155,6 @@ def test():
     x = lmd.all()
     for xi in x:
         pprint(xi)
-
-def pick_entrypoint():
-    import inspect
-    import subprocess
-
-    functions = {
-        name: fn for name, fn in globals().items()
-        if inspect.isfunction(fn) and fn.__module__ == __name__
-        and fn.__qualname__ == name and fn is not pick_entrypoint
-    }
-    try:
-        choice = subprocess.run(
-            ["fzf", "--prompt=Entry point> ", "--height=40%", "--reverse"],
-            input="\n".join(sorted(functions)), capture_output=True, text=True,
-        )
-    except FileNotFoundError:
-        raise SystemExit("Install fzf to use the entrypoint picker.")
-    if choice.returncode in (1, 130):
-        return  # No match or cancelled.
-    choice.check_returncode()
-    fn = functions[choice.stdout.strip()]
-    signature = inspect.signature(fn)
-    args = []
-    if signature.parameters:
-        try:
-            value = input(f"{fn.__name__}{signature} argument (blank to omit): ")
-        except (EOFError, KeyboardInterrupt):
-            return
-        if value:
-            annotation = next(iter(signature.parameters.values())).annotation
-            try:
-                value = value if annotation in (str, "str") else int(value)
-            except ValueError:
-                pass
-            args.append(value)
-    try:
-        signature.bind(*args)
-    except TypeError as exc:
-        raise SystemExit(f"{fn.__name__}{signature}: {exc}")
-    return fn(*args)
 
 if __name__ == "__main__":
     import sys
