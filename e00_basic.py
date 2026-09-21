@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from functools import reduce
 
 from lib.models import Lejepa, LejepaConfig
@@ -9,9 +9,9 @@ from miao.config import MiaoConfig
 from miao import VolumeDataset
 from rich import print as pprint
 import os, sys
-import torch
 import json
 import time
+
 
 @dataclass(slots=True)
 class Params:
@@ -41,6 +41,8 @@ def allparams():
     return params
 
 def run(n:int):
+    import torch
+
     par : Params = allparams()[n]
     # lmd.set_data_root("/Volumes/miaai/lmd-v0.0.1/data")
     # volumes = [x.to_miao() for x in lmd.all() if "flyliconn" in x.name]
@@ -122,27 +124,83 @@ def runmany():
     for i in range(len(allparams())):
         runlsf(i)
 
+def runmany_sequential():
+    for i in range(len(allparams())):
+        run(i)
+
 def analysis():
+    import pandas
+    import plotly.express as px
     def loadAndFuse(par:Params):
-        metr = json.load(open(par.savedir + "metrics.json", "r"))
-        tabl = [{**m, **par.__dict__} for m in metr]
-        return tabl
+        # metr = json.load(open(par.savedir + "metrics.jsonl", "r"))
+        try:
+            with open(par.savedir + "metrics.jsonl") as f:
+                metr = [json.loads(line) for line in f if line.strip()]
+            tabl = [{**m, **asdict(par)} for m in metr]
+            return tabl
+        except:
+            return []
     params = [loadAndFuse(p) for p in allparams()]
     res = list(reduce(lambda a,b: a+b, params))
-    pprint(res)
-    return res
+
+    for r in res:
+        r['patch_size'] = tuple(r['patch_size'])
+    res = pandas.DataFrame(res)
+    pl = px.scatter(res, x="epoch", y="loss", color="patch_size")
+    pl.show()
+    print(res)
 
 def test():
     x = lmd.all()
     for xi in x:
         pprint(xi)
 
-if __name__=="__main__":
+def pick_entrypoint():
+    import inspect
+    import subprocess
+
+    functions = {
+        name: fn for name, fn in globals().items()
+        if inspect.isfunction(fn) and fn.__module__ == __name__
+        and fn.__qualname__ == name and fn is not pick_entrypoint
+    }
+    try:
+        choice = subprocess.run(
+            ["fzf", "--prompt=Entry point> ", "--height=40%", "--reverse"],
+            input="\n".join(sorted(functions)), capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        raise SystemExit("Install fzf to use the entrypoint picker.")
+    if choice.returncode in (1, 130):
+        return  # No match or cancelled.
+    choice.check_returncode()
+    fn = functions[choice.stdout.strip()]
+    signature = inspect.signature(fn)
+    args = []
+    if signature.parameters:
+        try:
+            value = input(f"{fn.__name__}{signature} argument (blank to omit): ")
+        except (EOFError, KeyboardInterrupt):
+            return
+        if value:
+            annotation = next(iter(signature.parameters.values())).annotation
+            try:
+                value = value if annotation in (str, "str") else int(value)
+            except ValueError:
+                pass
+            args.append(value)
+    try:
+        signature.bind(*args)
+    except TypeError as exc:
+        raise SystemExit(f"{fn.__name__}{signature}: {exc}")
+    return fn(*args)
+
+if __name__ == "__main__":
     import sys
     print(sys.argv)
     if len(sys.argv) == 1:
-        assert False, "we need cmdline args"
-    if sys.argv[1] == 'many':
+        pick_entrypoint()
+    elif sys.argv[1] == 'many':
         runmany()
     elif sys.argv[1] == 'lsf':
         runlsf(int(sys.argv[2]))
@@ -150,5 +208,7 @@ if __name__=="__main__":
         test()
     elif sys.argv[1] == 'anl':
         analysis()
+    elif sys.argv[1] == 'seq':
+        runmany_sequential()
     else:
         run(int(sys.argv[1]))

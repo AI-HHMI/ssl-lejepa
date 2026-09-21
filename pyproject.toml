@@ -15,6 +15,8 @@ dependencies = [
     "miao-io>=0.4.0",
     "lmd-catalog",
     "zarr>=2.16",
+    "pandas",
+    "plotly",
 ]
 
 [project.optional-dependencies]
