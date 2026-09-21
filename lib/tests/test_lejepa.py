@@ -1,12 +1,12 @@
-"""Unit tests for llm package modules."""
+"""Unit tests for lib package modules."""
 
 import pytest
 import torch
 
-from llm.encoders import ViT3DEncoder, get_3d_sincos_pos_embed
-from llm.losses import SIGReg, lejepa_loss
-from llm.models import Lejepa, LejepaConfig
-from llm.views import ViewMaker
+from lib.encoders import ViT3DEncoder, get_3d_sincos_pos_embed
+from lib.losses import SIGReg, lejepa_loss
+from lib.models import Lejepa, LejepaConfig
+from lib.views import ViewMaker
 
 
 def test_lejepa_config():
@@ -112,6 +112,6 @@ def test_profiler(tmp_path):
     assert "CPU Compute" in content
     assert "Primary Bottleneck" in content
 
-    from llm import analyze_and_format
+    from lib import analyze_and_format
     report_json = analyze_and_format(tmp_path / "profile.json")
     assert "BOTTLENECK ANALYSIS SUMMARY" in report_json

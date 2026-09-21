@@ -1,4 +1,8 @@
-from llm.models import Lejepa, LejepaConfig
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from lib.models import Lejepa, LejepaConfig
 import lmd_catalog as lmd
 from miao.config import MiaoConfig
 from miao import VolumeDataset
@@ -8,9 +12,34 @@ import torch
 import json
 import time
 
-savedir = "outdir/e00/main/basic/"
+# savedir = "outdir/e00/main/basic/"
 
-def run():
+@dataclass(slots=True)
+class Params:
+    savedir: str = "outdir/e00/main/basic/"
+    patch_size: tuple[int,int,int] = (104, 232, 232)
+    
+def allparams():
+    params = []
+    ps = [
+        (2**3  , 2**3*3, 2**3*3),
+        (2**2*3, 2**2*9, 2**2*9),
+        (2**4  , 2**4*3, 2**4*3),
+        (2**3*3, 2**3*9, 2**3*9),
+        (2**5  , 2**5*3, 2**5*3),
+        (2**4*3, 2**4*9, 2**4*9),
+        (2**6  , 2**6*3, 2**6*3),
+        (2**5*3, 2**5*9, 2**5*9),
+    ]
+    for i, _p in enumerate(ps):
+        p = Params()
+        p.patch_size = _p
+        p.savedir = f"outdir/e00/main/basic/d{i}/"
+        params.append(p)
+    return params
+
+def run(n:int):
+    par = allparams()[n]
     # lmd.set_data_root("/Volumes/miaai/lmd-v0.0.1/data")
     # volumes = [x.to_miao() for x in lmd.all() if "flyliconn" in x.name]
     volumes = [x.to_miao() for x in lmd.all() if x.name == "exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001"]
@@ -18,7 +47,7 @@ def run():
 
     mcfg = MiaoConfig(
         volumes=volumes,
-        patch_size=[104, 232, 232],
+        patch_size=par.patch_size,
         resolutions=[[25.0, 10.0, 10.0]],
         samples_per_epoch=1000,
         sampling="random",
@@ -28,15 +57,14 @@ def run():
     # pprint(mcfg)
     # pprint(dl[0])
 
-    savedir = "outdir/e00/main/basic/"
-    os.makedirs(savedir, exist_ok=True)
-    metrics_file = open(savedir + "metrics.jsonl", 'a')
+    os.makedirs(par.savedir, exist_ok=True)
+    metrics_file = open(par.savedir + "metrics.jsonl", 'a')
 
     cfg = LejepaConfig(
         n_layers = 12,
         width = 512,
         views = 'basic',
-        profile=savedir + 'profile.out', ## Turn on profiling, which uses pytorch profiler and writes to this file
+        profile=par.savedir + 'profile.out', ## Turn on profiling, which uses pytorch profiler and writes to this file
     )
     model = Lejepa(cfg)
     pprint(model)
@@ -63,8 +91,9 @@ def run():
         print(f"finished epoch {ep+1}/{100}, loss={out.loss.detach():4f},", end='\n',flush=True)
 
 
-def rungpu():
+def runlsf(n:int):
     import subprocess
+    par = allparams()[n]
     RUN_NAME = "e00_basic"
     NUM_GPUS = 1
     cmd = f""" bsub -J {RUN_NAME} \
@@ -74,16 +103,31 @@ def rungpu():
         -R "span[hosts=1]" \
         -gpu "num={NUM_GPUS}:mode=exclusive_process" \
         -q gpu_h100 \
-        -o {savedir}/job_%J.log \
-        uv run python e00_basic.py
+        -o {par.savedir}/job_%J.log \
+        uv run python e00_basic.py {n}
         """
-    subprocess.Popen(cmd, shell=True, stdin=subprocess.DEVNULL, start_new_session=True)
-    print(f"Submitted {RUN_NAME} to LSF.")
+    # subprocess.Popen(cmd, shell=True, stdin=subprocess.DEVNULL, start_new_session=True)
+    print(f"Submitted {RUN_NAME} {n} to LSF.")
+
+def runmany():
+    for i in range(len(allparams())):
+        runlsf(i)
+
+def test():
+    x = allparams()
+    for xi in x:
+        pprint(xi)
 
 if __name__=="__main__":
     import sys
     print(sys.argv)
-    if len(sys.argv) > 1 and sys.argv[1] == 'gpu':
-        rungpu()
+    if len(sys.argv) == 1:
+        assert False, "we need cmdline args"
+    if sys.argv[1] == 'many':
+        runmany()
+    elif sys.argv[1] == 'lsf':
+        runlsf(int(sys.argv[2]))
+    elif sys.argv[1] == 'test':
+        test()
     else:
-        run()
+        run(int(sys.argv[1]))

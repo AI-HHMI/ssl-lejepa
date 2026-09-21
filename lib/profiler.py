@@ -296,7 +296,7 @@ def analyze_and_format(target: Union[str, Path, Any]) -> str:
 
 
 def main() -> None:
-    """CLI entrypoint: python -m llm.profiler [file_path]"""
+    """CLI entrypoint: python -m lib.profiler [file_path]"""
     args = sys.argv[1:]
     path = Path(args[0]) if args else Path("outdir/e00/main/basic/profile.out")
     if not path.exists():

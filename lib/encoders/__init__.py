@@ -1,6 +1,6 @@
 """Encoders for 3D microscopy representation learning."""
 
-from llm.encoders.vit3d import (
+from lib.encoders.vit3d import (
     Attention,
     PatchEmbed3d,
     TransformerBlock,

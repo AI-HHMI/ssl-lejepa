@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "ssl-lejepa"
 version = "0.1.0"
-description = "Large Microscopy Models (LLM) with LeJEPA Self-Supervised Learning"
+description = "LeJEPA SSL for microsocopy"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
@@ -23,7 +23,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["llm"]
+packages = ["lib"]
 
 [tool.uv.sources]
 lmd-catalog = { git = "https://github.com/AI-HHMI/lmd-catalog", branch = "main" }
@@ -32,13 +32,13 @@ miao-io = { git = "https://github.com/AI-HHMI/miao.git", branch = "master" }
 # miao-io = { path = "../miao", editable = true }
 
 [tool.pytest.ini_options]
-testpaths = ["llm/tests"]
+testpaths = ["lib/tests"]
 
 [tool.mypy]
 ignore_missing_imports = true
 
 [tool.pyright]
-include = ["llm"]
+include = ["lib"]
 venvPath = "."
 venv = ".venv"
 

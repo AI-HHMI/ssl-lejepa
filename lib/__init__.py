@@ -4,8 +4,8 @@ Self-Supervised Learning with LeJEPA (Invariance + SIGReg) on 3D microscopy volu
 """
 
 import torch
-from llm.losses import LejepaOutput
-from llm.models import Lejepa, LejepaConfig
+from lib.losses import LejepaOutput
+from lib.models import Lejepa, LejepaConfig
 
 # Compatibility patch for out.loss.backwards()
 if not hasattr(torch.Tensor, "backwards"):
@@ -23,7 +23,7 @@ def _safe_rand(*args, **kwargs):
 
 torch.rand = _safe_rand
 
-from llm.profiler import analyze_and_format, format_bottleneck_report
+from lib.profiler import analyze_and_format, format_bottleneck_report
 
 __version__ = "0.1.0"
 __all__ = [

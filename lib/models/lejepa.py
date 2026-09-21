@@ -12,9 +12,9 @@ import torch.nn as nn
 import torch.profiler
 from torch import Tensor
 
-from llm.encoders import ViT3DEncoder
-from llm.losses import LejepaOutput, SIGReg, lejepa_loss
-from llm.views import ViewMaker
+from lib.encoders import ViT3DEncoder
+from lib.losses import LejepaOutput, SIGReg, lejepa_loss
+from lib.views import ViewMaker
 
 
 def _norm1d(norm: str, dim: int) -> nn.Module:
@@ -378,7 +378,7 @@ class Lejepa(nn.Module):
         table_str = prof.key_averages().table(sort_by=sort_by, row_limit=100)
 
         try:
-            from llm.profiler import format_bottleneck_report, analyze_key_averages
+            from lib.profiler import format_bottleneck_report, analyze_key_averages
             bottleneck_summary = format_bottleneck_report(analyze_key_averages(prof.key_averages()))
             full_report = bottleneck_summary + "\n" + table_str
         except Exception:
