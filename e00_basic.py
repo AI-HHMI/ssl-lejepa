@@ -7,7 +7,7 @@ from math import prod
 from pathlib import Path
 
 from lib.models import Lejepa, LejepaConfig
-from lib.util import pick_entrypoint
+from lib.util import call_entrypoint, pick_entrypoint
 import lmd_catalog as lmd
 from miao.config import MiaoConfig
 from miao import VolumeDataset
@@ -45,7 +45,7 @@ def allparams():
     for i, _p in enumerate(ps):
         p = Params()
         p.patch_size = _p
-        p.savedir = f"outdir/e00/main/basic/d{i}/"
+        p.savedir = f"outdir/e00/main/basic/local/d{i}/"
         params.append(p)
     return params
 
@@ -126,7 +126,7 @@ def run(n:int):
 
     prof = None
     benchmark_started = None
-    with open(savedir / "metrics.jsonl", "a") as metrics_file, ExitStack() as profile_scope:
+    with open(savedir / "metrics.json", "a") as metrics_file, ExitStack() as profile_scope:
         for ep in range(par.n_epoch):
             if ep == par.warmup_steps and ep < benchmark_stop:
                 synchronize()
@@ -175,7 +175,7 @@ def run(n:int):
                     "samples_per_second": samples_per_second,
                     "input_mvox_per_second": samples_per_second * prod(par.patch_size) / 1e6,
                 }
-                with open(savedir / "performance.jsonl", "a") as f:
+                with open(savedir / "performance.json", "a") as f:
                     f.write(json.dumps(result) + "\n")
                 print(f"Unprofiled: {seconds / steps:.3f} s/step, {samples_per_second:.2f} samples/s")
             if prof is not None:
@@ -198,7 +198,7 @@ def runlsf(n:int):
         -gpu "num={NUM_GPUS}:mode=exclusive_process" \
         -q gpu_a100 \
         -o {par.savedir}/job_%J.log \
-        uv run python e00_basic.py {n}
+        uv run python e00_basic.py run {n}
         """
     subprocess.Popen(cmd, shell=True, stdin=subprocess.DEVNULL, start_new_session=True)
     print(f"Submitted {RUN_NAME} {n} to LSF.")
@@ -215,9 +215,8 @@ def analysis():
     import pandas
     import plotly.express as px
     def loadAndFuse(par:Params):
-        # metr = json.load(open(par.savedir + "metrics.jsonl", "r"))
         try:
-            with open(par.savedir + "metrics.jsonl") as f:
+            with open(par.savedir + "metrics.json") as f:
                 metr = [json.loads(line) for line in f if line.strip()]
             tabl = [{**m, **asdict(par)} for m in metr]
             return tabl
@@ -243,15 +242,5 @@ if __name__ == "__main__":
     print(sys.argv)
     if len(sys.argv) == 1:
         pick_entrypoint()
-    elif sys.argv[1] == 'many':
-        runmany()
-    elif sys.argv[1] == 'lsf':
-        runlsf(int(sys.argv[2]))
-    elif sys.argv[1] == 'test':
-        test()
-    elif sys.argv[1] == 'anl':
-        analysis()
-    elif sys.argv[1] == 'seq':
-        runmany_sequential()
     else:
-        run(int(sys.argv[1]))
+        call_entrypoint(sys.argv[1], *sys.argv[2:])
