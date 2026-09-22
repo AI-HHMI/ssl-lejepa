@@ -1,27 +1,26 @@
 """Small helpers for experiment scripts."""
 
 import inspect
+from hashlib import sha256
 import subprocess
 import sys
-
-
 import numpy as np
 
-def funnylog(base, factors, N):
-    base = np.array(base, dtype='float32')
-    res = []
-    res.append(base.copy())
-    for i in range(N+1):
-        j = i % len(factors)
-        res.append(base * factors[j])
-        if j==len(factors)-1:
-            base *= factors[0]
 
-    res = [list(int(xi) for xi in x) for x in res]
-    return res
-    
+def git_provenance(repo="."):
+    """Return HEAD, tracked working-copy diff, and its SHA-256 (Spearmint format).
 
-def funnylog2(base, factors, N):
+    Includes staged and unstaged changes; excludes untracked files. Does not log.
+    """
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
+
+    commit_id = git("rev-parse", "HEAD")
+    diff = git("diff", "HEAD")
+    return {"commit_id": commit_id, "diff_hash": sha256(diff.encode()).hexdigest(), "diff": diff}
+
+
+def logish_samples(base, factors, final, N):
     base = np.array(base, dtype='int32')
     res = []
     res.append(base.copy())
@@ -29,11 +28,9 @@ def funnylog2(base, factors, N):
         j = i % len(factors)
         res.append(base * factors[j])
         if j==len(factors)-1:
-            base = base * factors[j]
-
+            base = base * final
     res = [list(int(xi) for xi in x) for x in res]
     return res
-    
 
 def _entrypoints(namespace):
     return {

@@ -7,7 +7,7 @@ from math import prod
 from pathlib import Path
 
 from lib.models import Lejepa, LejepaConfig
-from lib.util import call_entrypoint, pick_entrypoint, funnylog, funnylog2
+from lib.util import call_entrypoint, pick_entrypoint, logish_samples, git_provenance
 import lmd_catalog as lmd
 from miao.config import MiaoConfig
 from miao import VolumeDataset
@@ -35,12 +35,13 @@ class Params:
 
 def allparams():
     params = []
-    ps = funnylog([4, 12, 12], [2,3], 7)[1:]
+    ps = logish_samples([4, 12, 12], [2,3], 2, 7)[1:]
     pprint(ps)
     for i, _p in enumerate(ps):
         p = Params()
         p.patch_size = _p
-        p.savedir = f"outdir/e00/main/basic/d{i}/"
+        # p.savedir = f"outdir/e00/main/basic/d{i}/"
+        p.savedir = f"outdir/e00/temp/"
         params.append(p)
     return params
 
@@ -68,6 +69,12 @@ def run(n:int):
     # pprint(dl[0]['img'].shape)
 
     os.makedirs(par.savedir, exist_ok=True)
+    savedir = Path(par.savedir)
+
+    with open(savedir / "runs.json", 'a') as rfile, open("./_diffs/diffs.json", "a") as difflog:
+        gp = git_provenance()
+        rfile.write(json.dumps({k:gp[k] for k in ['commit_id', 'diff_hash']}) + "\n")
+        difflog.write(json.dumps({gp['diff_hash']:gp['diff']}) + "\n")
 
     cfg = LejepaConfig(
         n_layers = 12,
@@ -83,7 +90,6 @@ def run(n:int):
     print(f"We're using torch device {device} .")
     model = model.to(device)
     opt = torch.optim.Adam(model.parameters(), lr = 1e-4)
-    savedir = Path(par.savedir)
     use_cuda = device.type == "cuda"
     activities = [torch.profiler.ProfilerActivity.CPU]
     if use_cuda:
