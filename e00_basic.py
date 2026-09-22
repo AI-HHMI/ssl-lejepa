@@ -45,7 +45,7 @@ def allparams():
     for i, _p in enumerate(ps):
         p = Params()
         p.patch_size = _p
-        p.savedir = f"outdir/e00/main/basic/local/d{i}/"
+        p.savedir = f"outdir/e00/main/basic/d{i}/"
         params.append(p)
     return params
 
@@ -196,7 +196,7 @@ def runlsf(n:int):
         -n {NUM_GPUS} \
         -R "span[hosts=1]" \
         -gpu "num={NUM_GPUS}:mode=exclusive_process" \
-        -q gpu_a100 \
+        -q gpu_b300 \
         -o {par.savedir}/job_%J.log \
         uv run python e00_basic.py run {n}
         """
