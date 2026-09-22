@@ -56,9 +56,8 @@ def run(n:int):
         raise ValueError("Profiling and benchmark step counts must be nonnegative")
     # lmd.set_data_root("/Volumes/miaai/lmd-v0.0.1/data")
     # volumes = [x.to_miao() for x in lmd.all() if "flyliconn" in x.name]
-    volumes = [x.to_miao() for x in lmd.all() if x.name == "exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001"]
-    pprint(volumes)
 
+    volumes = [x.to_miao() for x in lmd.all() if x.name == "exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001"]
     mcfg = MiaoConfig(
         volumes=volumes,
         patch_size=par.patch_size,
@@ -68,6 +67,8 @@ def run(n:int):
         output_axes="lzyx",
     )
     dl = VolumeDataset(mcfg)
+
+    # pprint(volumes)
     # pprint(mcfg)
     # pprint(dl[0]['img'].shape)
 
@@ -226,26 +227,20 @@ def loadJsonTable(filename):
             return []
     params = [loadAndFuse(p) for p in allparams()]
     res = list(reduce(lambda a,b: a+b, params))
+    for r in res:
+        r['patch_size'] = tuple(r['patch_size'])
     pprint(res)
+    res = pandas.DataFrame(res)
     return res
 
 def plot1():
     res = loadJsonTable("metrics.json")
-    for r in res:
-        r['patch_size'] = tuple(r['patch_size'])
-    res = pandas.DataFrame(res)
-    px.scatter(res, x="epoch", y="loss", color="savedir").show()
-    # px.scatter(res, x="epoch", y="loss", color="patch_size").show()
+    px.line(res, x="epoch", y="loss", color="n_layers", markers=True).show()
 
 def plot2():
     res = loadJsonTable("performance.json")
-    for r in res:
-        r['patch_size'] = tuple(r['patch_size'])
-    res = [{k:r[k] for k in ['savedir', 'patch_size', 'samples_per_second', 'input_mvox_per_second']} for r in res]
-    res = pandas.DataFrame(res)
     res['vox'] = res.patch_size.apply(prod)
-    px.scatter(res, x="vox", y="input_mvox_per_second", color="patch_size").show()
-    pprint(res)
+    px.bar(res, x="n_layers", y="input_mvox_per_second", color="n_layers").show()
 
 def test():
     x = lmd.all()
