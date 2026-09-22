@@ -229,10 +229,12 @@ def plot1():
 
 def plot2():
     res = loadJsonTable("performance.json")
+    for r in res:
+        r['patch_size'] = tuple(r['patch_size'])
     res = [{k:r[k] for k in ['savedir', 'patch_size', 'samples_per_second', 'input_mvox_per_second']} for r in res]
     res = pandas.DataFrame(res)
     res['vox'] = res.patch_size.apply(prod)
-    px.scatter(res, x="vox", y="input_mvox_per_second", ).show()
+    px.scatter(res, x="vox", y="input_mvox_per_second", color="patch_size").show()
     pprint(res)
 
 def test():
