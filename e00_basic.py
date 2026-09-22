@@ -211,12 +211,10 @@ def runmany_sequential():
     for i in range(len(allparams())):
         run(i)
 
-def analysis():
-    import pandas
-    import plotly.express as px
+def loadJsonTable(filename):
     def loadAndFuse(par:Params):
         try:
-            with open(par.savedir + "metrics.json") as f:
+            with open(par.savedir + filename) as f:
                 metr = [json.loads(line) for line in f if line.strip()]
             tabl = [{**m, **asdict(par)} for m in metr]
             return tabl
@@ -224,13 +222,30 @@ def analysis():
             return []
     params = [loadAndFuse(p) for p in allparams()]
     res = list(reduce(lambda a,b: a+b, params))
+    pprint(res)
+    return res
 
+def plot1():
+    import pandas
+    import plotly.express as px
+
+    res = loadJsonTable("metrics.json")
     for r in res:
         r['patch_size'] = tuple(r['patch_size'])
     res = pandas.DataFrame(res)
-    pl = px.scatter(res, x="epoch", y="loss", color="patch_size")
-    pl.show()
-    print(res)
+    px.scatter(res, x="epoch", y="loss", color="patch_size").show()
+    # print(res)
+
+def plot2():
+    import pandas
+    import plotly.express as px
+
+    res = loadJsonTable("performance.json")
+    res = [{k:r[k] for k in ['savedir', 'patch_size', 'samples_per_second', 'input_mvox_per_second']} for r in res]
+    res = pandas.DataFrame(res)
+    res['vox'] = res.patch_size.apply(prod)
+    px.scatter(res, x="vox", y="input_mvox_per_second", ).show()
+    pprint(res)
 
 def test():
     x = lmd.all()
