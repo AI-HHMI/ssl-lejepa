@@ -42,7 +42,7 @@ def allparams():
     for i in range(len(nl)):
         p = Params()
         p.patch_size = ps[5]
-        p.savedir = f"outdir/e00/n_layers/basic/d{i}/"
+        p.savedir = f"outdir/e00/n_layers/f32high/d{i}/"
         p.n_layers = nl[i]
         # p.savedir = f"outdir/e00/temp/"
         params.append(p)
@@ -50,6 +50,7 @@ def allparams():
 
 def run(n:int):
     import torch
+    torch.set_float32_matmul_precision("high")
 
     par : Params = allparams()[n]
     if min(par.warmup_steps, par.benchmark_steps, par.profile_steps) < 0:
