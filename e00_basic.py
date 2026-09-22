@@ -26,7 +26,8 @@ class Params:
     # patch_size: list[int] = [104, 232, 232]
     patch_size: list[int] = field(default_factory=lambda: [104, 232, 232])
     batch_size: int = 42
-    n_epoch: int = 10_000
+    n_epoch: int = 100
+    n_layers: int = 12
 
     # profiling params
     warmup_steps: int = 10
@@ -36,11 +37,13 @@ class Params:
 def allparams():
     params = []
     ps = logish_samples([4, 12, 12], [2,3], 2, 7)[1:]
+    nl = [8,10,12,14,16,18]
     pprint(ps)
-    for i  in range(3):
+    for i in range(len(nl)):
         p = Params()
         p.patch_size = ps[5]
-        p.savedir = f"outdir/e00/r02/basic/d{i}/"
+        p.savedir = f"outdir/e00/n_layers/basic/d{i}/"
+        p.n_layers = nl[i]
         # p.savedir = f"outdir/e00/temp/"
         params.append(p)
     return params
@@ -77,7 +80,7 @@ def run(n:int):
         difflog.write(json.dumps({gp['diff_hash']:gp['diff']}) + "\n")
 
     cfg = LejepaConfig(
-        n_layers = 12,
+        n_layers = par.n_layers,
         width = 512,
         views = 'basic',
         profile=False,  # The training loop owns profiling, including backward and I/O.
@@ -231,7 +234,8 @@ def plot1():
     for r in res:
         r['patch_size'] = tuple(r['patch_size'])
     res = pandas.DataFrame(res)
-    px.scatter(res, x="epoch", y="loss", color="patch_size").show()
+    px.scatter(res, x="epoch", y="loss", color="savedir").show()
+    # px.scatter(res, x="epoch", y="loss", color="patch_size").show()
 
 def plot2():
     res = loadJsonTable("performance.json")
