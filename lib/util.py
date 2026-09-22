@@ -5,6 +5,36 @@ import subprocess
 import sys
 
 
+import numpy as np
+
+def funnylog(base, factors, N):
+    base = np.array(base, dtype='float32')
+    res = []
+    res.append(base.copy())
+    for i in range(N+1):
+        j = i % len(factors)
+        res.append(base * factors[j])
+        if j==len(factors)-1:
+            base *= factors[0]
+
+    res = [list(int(xi) for xi in x) for x in res]
+    return res
+    
+
+def funnylog2(base, factors, N):
+    base = np.array(base, dtype='int32')
+    res = []
+    res.append(base.copy())
+    for i in range(N+1):
+        j = i % len(factors)
+        res.append(base * factors[j])
+        if j==len(factors)-1:
+            base = base * factors[j]
+
+    res = [list(int(xi) for xi in x) for x in res]
+    return res
+    
+
 def _entrypoints(namespace):
     return {
         name: fn for name, fn in namespace.items()

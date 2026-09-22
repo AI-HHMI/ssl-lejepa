@@ -7,7 +7,7 @@ from math import prod
 from pathlib import Path
 
 from lib.models import Lejepa, LejepaConfig
-from lib.util import call_entrypoint, pick_entrypoint
+from lib.util import call_entrypoint, pick_entrypoint, funnylog, funnylog2
 import lmd_catalog as lmd
 from miao.config import MiaoConfig
 from miao import VolumeDataset
@@ -15,6 +15,9 @@ from rich import print as pprint
 import os, sys
 import json
 import time
+
+import pandas
+import plotly.express as px
 
 
 @dataclass(slots=True)
@@ -29,19 +32,11 @@ class Params:
     warmup_steps: int = 10
     benchmark_steps: int = 50
     profile_steps: int = 3  # Set to zero to disable trace collection.
-    
+
 def allparams():
     params = []
-    ps = [
-        [2**3  , 2**3*3, 2**3*3],
-        [2**2*3, 2**2*9, 2**2*9],
-        [2**4  , 2**4*3, 2**4*3],
-        [2**3*3, 2**3*9, 2**3*9],
-        [2**5  , 2**5*3, 2**5*3],
-        [2**4*3, 2**4*9, 2**4*9],
-        [2**6  , 2**6*3, 2**6*3],
-        [2**5*3, 2**5*9, 2**5*9],
-    ]
+    ps = funnylog([4, 12, 12], [2,3], 7)[1:]
+    pprint(ps)
     for i, _p in enumerate(ps):
         p = Params()
         p.patch_size = _p
@@ -226,20 +221,13 @@ def loadJsonTable(filename):
     return res
 
 def plot1():
-    import pandas
-    import plotly.express as px
-
     res = loadJsonTable("metrics.json")
     for r in res:
         r['patch_size'] = tuple(r['patch_size'])
     res = pandas.DataFrame(res)
     px.scatter(res, x="epoch", y="loss", color="patch_size").show()
-    # print(res)
 
 def plot2():
-    import pandas
-    import plotly.express as px
-
     res = loadJsonTable("performance.json")
     res = [{k:r[k] for k in ['savedir', 'patch_size', 'samples_per_second', 'input_mvox_per_second']} for r in res]
     res = pandas.DataFrame(res)
