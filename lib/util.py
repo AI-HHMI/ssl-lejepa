@@ -2,9 +2,17 @@
 
 import inspect
 from hashlib import sha256
+from pathlib import Path
 import subprocess
 import sys
 import numpy as np
+
+
+def repo_root(path=".") -> Path:
+    """Return the absolute Git repository root containing the given directory."""
+    return Path(subprocess.check_output(
+        ["git", "-C", str(path), "rev-parse", "--show-toplevel"], text=True,
+    ).strip())
 
 
 def git_provenance(repo="."):

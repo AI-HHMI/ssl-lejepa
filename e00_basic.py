@@ -7,7 +7,7 @@ from math import prod
 from pathlib import Path
 
 from lib.models import Lejepa, LejepaConfig
-from lib.util import call_entrypoint, pick_entrypoint, logish_samples, git_provenance
+from lib.util import call_entrypoint, pick_entrypoint, logish_samples, git_provenance, repo_root
 import lmd_catalog as lmd
 from miao.config import MiaoConfig
 from miao import VolumeDataset
@@ -26,7 +26,7 @@ class Params:
     # patch_size: list[int] = [104, 232, 232]
     patch_size: list[int] = field(default_factory=lambda: [104, 232, 232])
     batch_size: int = 42
-    n_epoch: int = 1000
+    n_epoch: int = 10_000
 
     # profiling params
     warmup_steps: int = 10
@@ -37,11 +37,11 @@ def allparams():
     params = []
     ps = logish_samples([4, 12, 12], [2,3], 2, 7)[1:]
     pprint(ps)
-    for i, _p in enumerate(ps):
+    for i  in range(3):
         p = Params()
-        p.patch_size = _p
-        # p.savedir = f"outdir/e00/main/basic/d{i}/"
-        p.savedir = f"outdir/e00/temp/"
+        p.patch_size = ps[5]
+        p.savedir = f"outdir/e00/r02/basic/d{i}/"
+        # p.savedir = f"outdir/e00/temp/"
         params.append(p)
     return params
 
@@ -71,7 +71,7 @@ def run(n:int):
     os.makedirs(par.savedir, exist_ok=True)
     savedir = Path(par.savedir)
 
-    with open(savedir / "runs.json", 'a') as rfile, open("./_diffs/diffs.json", "a") as difflog:
+    with open(savedir / "runs.json", 'a') as rfile, open(repo_root() / "_diffs/diffs.json", "a") as difflog:
         gp = git_provenance()
         rfile.write(json.dumps({k:gp[k] for k in ['commit_id', 'diff_hash']}) + "\n")
         difflog.write(json.dumps({gp['diff_hash']:gp['diff']}) + "\n")
@@ -192,7 +192,7 @@ def runlsf(n:int):
     RUN_NAME = "e00_basic"
     NUM_GPUS = 1
     cmd = f""" bsub -J {RUN_NAME} \
-        -W 46:00 \
+        -W 4:00 \
         -P miaai \
         -n {NUM_GPUS} \
         -R "span[hosts=1]" \
