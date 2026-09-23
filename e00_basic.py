@@ -8,7 +8,6 @@ import time
 from pathlib import Path
 from contextlib import ExitStack, nullcontext
 
-from functools import reduce
 from math import prod
 from itertools import product
 
@@ -49,12 +48,11 @@ class Params:
 def allparams():
     params = []
     patchsize = logish_samples([4, 12, 12], [2,3], 2, 7)[1:]
-    # layers = [8,10,12,14,16,18]
     batchsize = [16,42]
     workers = [1,2,4,8,16]
     modes : list[F32Mode] = ["medium", "high", "highest"]
-    # pprint(ps)
     for i, (mo, nw, bs) in enumerate(product(modes, workers, batchsize)):
+        # if nw==16: continue
         p = Params()
         p.patch_size = patchsize[5]
         p.n_layers = 12
@@ -62,7 +60,6 @@ def allparams():
         p.batch_size = bs
         p.f32mode = mo
         p.n_workers = nw
-        # p.savedir = f"outdir/e00/temp/"
         params.append(p)
     return params
 
@@ -249,20 +246,25 @@ def runmany_sequential():
         run(i)
 
 def loadJsonTable(filename):
-    def loadAndFuse(par:Params):
-        try:
-            with open(par.savedir + filename) as f:
-                metr = [json.loads(line) for line in f if line.strip()]
-            tabl = [{**m, **asdict(par)} for m in metr]
-            return tabl
-        except:
-            return []
-    params = [loadAndFuse(p) for p in allparams()]
-    res = list(reduce(lambda a,b: a+b, params))
-    for r in res:
-        r['patch_size'] = tuple(r['patch_size'])
+    rows = []
+    for par in allparams():
+        params = asdict(par)
+        path = Path(par.savedir) / filename
+        if not path.is_file():
+            continue
+        for line in path.read_text().splitlines():
+            if line.strip():
+                record = json.loads(line)
+                if "params" in record:
+                    assert record["params"] == params, (
+                        f"Parameter mismatch in {path}:\n"
+                        f"current: {params}\nsaved: {record['params']}"
+                    )
+                row = {**params, **record}
+                row["patch_size"] = tuple(row["patch_size"])
+                rows.append(row)
+    res = pandas.DataFrame(rows)
     pprint(res)
-    res = pandas.DataFrame(res)
     return res
 
 def plot1():
