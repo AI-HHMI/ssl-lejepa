@@ -33,33 +33,31 @@ F32Mode = Literal["highest", "high", "medium"]
 class Params:
     savedir: str = "outdir/e00/main/basic/"
     # patch_size: list[int] = [104, 232, 232]
-    patch_size: list[int] = field(default_factory=lambda: [104, 232, 232])
+    # patch_size: list[int] = field(default_factory=lambda: [104, 232, 232])
+    patch_size: list[int] = field(default_factory=lambda: [48, 144, 144])
     batch_size: int = 42
     steps_per_epoch: int = 100
     n_layers: int = 12
+    f32mode: F32Mode = "high"
+    n_workers: int = 2
+    prefetch_factor: int = 2
 
     # profiling params
     warmup_steps: int = 10
     benchmark_steps: int = 50
     profile_steps: int = 3  # Set to zero to disable trace collection.
-    f32mode: F32Mode = "high"
-    n_workers: int = 1
 
 def allparams():
     params = []
-    patchsize = logish_samples([4, 12, 12], [2,3], 2, 7)[1:]
-    batchsize = [16,42]
-    workers = [1,2,4,8,16]
-    modes : list[F32Mode] = ["medium", "high", "highest"]
-    for i, (mo, nw, bs) in enumerate(product(modes, workers, batchsize)):
+    # patchsize = logish_samples([4, 12, 12], [2,3], 2, 7)[1:]
+    prefetch_factor = [1,2,4,8]
+    workers = [2,4]
+    for i, (pf, nw) in enumerate(product(prefetch_factor, workers)):
         # if nw==16: continue
         p = Params()
-        p.patch_size = patchsize[5]
-        p.n_layers = 12
-        p.savedir = f"outdir/e00/modesWorkers/d{i}/"
-        p.batch_size = bs
-        p.f32mode = mo
+        p.savedir = f"outdir/e00/prefetch/d{i}/"
         p.n_workers = nw
+        p.prefetch_factor = pf
         params.append(p)
     return params
 
@@ -93,7 +91,7 @@ def run(n:int):
       batch_size=par.batch_size,
       num_workers=par.n_workers,
       collate_fn=collate_images,
-      prefetch_factor=1,
+      prefetch_factor=par.prefetch_factor,
       pin_memory=torch.cuda.is_available(),
       multiprocessing_context="spawn",
     )
@@ -269,12 +267,12 @@ def loadJsonTable(filename):
 
 def plot1():
     res = loadJsonTable("metrics.json")
-    px.line(res, x="idx_step", y="loss", color="f32mode", facet_col="batch_size", line_group="n_workers", markers=True).show()
+    px.line(res, x="idx_step", y="loss", color="prefetch_factor", facet_col="n_workers", markers=True).show()
 
 def plot2():
     res = loadJsonTable("performance.json")
     res['vox'] = res.patch_size.apply(prod)
-    px.bar(res, x="n_workers", y="input_mvox_per_second", facet_col="batch_size", color="f32mode", barmode="group").show()
+    px.bar(res, x="prefetch_factor", y="input_mvox_per_second", facet_col="n_workers", color="n_workers", barmode="group").show()
 
 def test():
     x = lmd.all()
