@@ -43,6 +43,7 @@ class Params:
     prefetch_factor: int = 2
     amp: bool = False  # bf16 autocast for forward + loss
     compile: bool = False  # torch.compile(dynamic=True) the encoder
+    n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); batch_size and n_workers are per GPU
 
     # profiling params
     warmup_steps: int = 10
@@ -52,15 +53,16 @@ class Params:
 def allparams():
     params = []
     # patchsize = logish_samples([4, 12, 12], [2,3], 2, 7)[1:]
-    n_workers = [4, 8, 16]
-    for i, nw in enumerate(n_workers):
+    n_gpus = [1, 2, 4, 8]
+    for i, ng in enumerate(n_gpus):
         p = Params()
-        p.savedir = f"outdir/e00/workers/d{i}/"
-        p.n_workers = nw
+        p.savedir = f"outdir/e00/ddp/d{i}/"
+        p.n_gpus = ng
+        p.n_workers = 8
         p.amp = True
         p.compile = True
         p.batch_size = 84
-        print(i, nw)
+        print(i, ng)
         params.append(p)
     # pprint(params)
     return params
@@ -91,7 +93,20 @@ def run(n:int):
     # volumes = [x.to_miao() for x in lmd.all() if "flyliconn" in x.name]
 
     import torch
+    import torch.distributed as dist
     torch.set_float32_matmul_precision(par.f32mode)
+
+    # Set by torchrun. Unset (plain `python`, tests) means a single process.
+    # Don't seed torch identically across ranks: DataLoader workers derive miao's numpy seed from it.
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    assert world_size == par.n_gpus, f"launched {world_size} ranks but par.n_gpus={par.n_gpus}"
+    rank0 = rank == 0
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    if world_size > 1:
+        dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo")
 
     volumes = [x.to_miao() for x in lmd.all() if x.name == "exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001"]
     mcfg = MiaoConfig(
@@ -120,10 +135,11 @@ def run(n:int):
 
     savedir = Path(par.savedir)
 
-    with open(savedir / "runs.json", 'a') as rfile, open(repo_root() / "_diffs/diffs.json", "a") as difflog:
-        gp = git_provenance()
-        rfile.write(json.dumps({k:gp[k] for k in ['commit_id', 'diff_hash']}) + "\n")
-        difflog.write(json.dumps({gp['diff_hash']:gp['diff']}) + "\n")
+    if rank0:
+        with open(savedir / "runs.json", 'a') as rfile, open(repo_root() / "_diffs/diffs.json", "a") as difflog:
+            gp = git_provenance()
+            rfile.write(json.dumps({k:gp[k] for k in ['commit_id', 'diff_hash']}) + "\n")
+            difflog.write(json.dumps({gp['diff_hash']:gp['diff']}) + "\n")
 
     cfg = LejepaConfig(
         n_layers = par.n_layers,
@@ -132,14 +148,17 @@ def run(n:int):
         lamb = 0.1,
     )
     model = Lejepa(cfg)
-    pprint(model)
+    if rank0: pprint(model)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"We're using torch device {device} .")
+    device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
+    print(f"Rank {rank}/{world_size} is using torch device {device} .")
     model = model.to(device)
     if par.compile:
         torch._logging.set_logs(recompiles=True)  # recompiles show up in job_*.log
         model.encoder.compile(dynamic=True)  # Views change shape every step.
+    if world_size > 1:
+        # SIGReg and projector BatchNorm statistics stay per-rank (local batch) for now.
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank] if device.type == "cuda" else None)
     opt = torch.optim.Adam(model.parameters(), lr = 1e-4)
     use_cuda = device.type == "cuda"
     activities = [torch.profiler.ProfilerActivity.CPU]
@@ -180,12 +199,13 @@ def run(n:int):
     prof = None
     benchmark_started = None
     n_tokens = 0  # encoder tokens since benchmark start
-    with open(savedir / "metrics.json", "a") as metrics_file, ExitStack() as profile_scope:
+    # Only rank 0 writes results and profiles.
+    with open(savedir / "metrics.json" if rank0 else os.devnull, "a") as metrics_file, ExitStack() as profile_scope:
         for idx_step in range(par.steps_per_epoch):
             if idx_step == par.warmup_steps and idx_step < benchmark_stop:
                 synchronize()
                 benchmark_started = time.perf_counter()
-            if par.profile_steps and idx_step == profile_start and idx_step + 1 < profile_stop:
+            if rank0 and par.profile_steps and idx_step == profile_start and idx_step + 1 < profile_stop:
                 synchronize()
                 prof = profile_scope.enter_context(torch.profiler.profile(
                     activities=activities,
@@ -211,17 +231,21 @@ def run(n:int):
                 opt.step()
                 opt.zero_grad()
             with phase("07_LOGGING"):
-                if idx_step % 10 == 0 or idx_step + 1 == par.steps_per_epoch:
+                if rank0 and (idx_step % 10 == 0 or idx_step + 1 == par.steps_per_epoch):
                     loss = out.loss.detach().item()
                     metrics_file.write(json.dumps({"tbl": "metrics", "idx_step": idx_step, "time": time.time() - start_time, "loss": loss}) + "\n")
                     metrics_file.flush()
                     print(f"finished step {idx_step + 1}/{par.steps_per_epoch}, loss={loss:.4f}", flush=True)
 
             if benchmark_started is not None and idx_step + 1 == benchmark_stop:
+                if world_size > 1:  # Tokens summed over ranks; every rank reaches this step.
+                    total = torch.tensor(n_tokens, device=device)
+                    dist.all_reduce(total)
+                    n_tokens = int(total.item())
                 synchronize()  # Only window boundaries synchronize; phases remain asynchronous.
                 seconds = time.perf_counter() - benchmark_started
                 steps = benchmark_stop - par.warmup_steps
-                samples_per_second = steps * par.batch_size / seconds
+                samples_per_second = steps * par.batch_size * world_size / seconds
                 result = {
                     "tbl": "throughput", "time": time.time(), "device": str(device),
                     "torch_version": torch.__version__, "params": asdict(par),
@@ -229,16 +253,20 @@ def run(n:int):
                     "samples_per_second": samples_per_second,
                     "input_mvox_per_second": samples_per_second * prod(par.patch_size) / 1e6,
                     "tokens_per_second": n_tokens / seconds,
-                    "tokens_per_sample": n_tokens / (steps * par.batch_size),
+                    "tokens_per_sample": n_tokens / (steps * par.batch_size * world_size),
+                    "world_size": world_size,
                 }
-                with open(savedir / "performance.json", "a") as f:
-                    f.write(json.dumps(result) + "\n")
+                if rank0:
+                    with open(savedir / "performance.json", "a") as f:
+                        f.write(json.dumps(result) + "\n")
                 print(f"Unprofiled: {seconds / steps:.3f} s/step, {samples_per_second:.2f} samples/s, {n_tokens / seconds:.0f} tokens/s")
             if prof is not None:
                 prof.step()
                 if idx_step + 1 == profile_stop:
                     profile_scope.close()
                     prof = None
+    if world_size > 1:
+        dist.destroy_process_group()
 
 
 def runlsf(n:int):
@@ -246,16 +274,15 @@ def runlsf(n:int):
     par:Params = allparams()[n]
     wipedir(par.savedir)
     RUN_NAME = "e00_basic"
-    NUM_GPUS = 1
     cmd = f""" bsub -J {RUN_NAME} \
         -W 4:00 \
         -P miaai \
-        -n {par.n_workers + 1} \
+        -n {par.n_gpus * (par.n_workers + 1)} \
         -R "span[hosts=1]" \
-        -gpu "num={NUM_GPUS}:mode=exclusive_process" \
+        -gpu "num={par.n_gpus}:mode=exclusive_process" \
         -q gpu_b300 \
         -o {par.savedir}/job_%J.log \
-        uv run python e00_basic.py run {n}
+        uv run torchrun --standalone --nproc_per_node={par.n_gpus} e00_basic.py run {n}
         """
     subprocess.Popen(cmd, shell=True, stdin=subprocess.DEVNULL, start_new_session=True)
     print(f"Submitted {RUN_NAME} {n} to LSF.")
@@ -309,7 +336,7 @@ def table():
     for k in ["gpu_busy", "step_ms", *phases]:
         res[k] = res.savedir.map(dict(zip(trace.savedir, trace[k]))) if k in trace else float("nan")
     cols = {
-        "savedir": "run", "compile": "compile", "batch_size": "batch", "n_workers": "workers",
+        "savedir": "run", "compile": "compile", "n_gpus": "gpus", "batch_size": "batch", "n_workers": "workers",
         "gpu_busy": "gpu busy %", "samples_per_second": "samples/s",
         "tokens_per_second": "tok/s", "input_mvox_per_second": "Mvox/s",
         "step_ms": "prof step ms", **phases,
@@ -317,6 +344,7 @@ def table():
     res = res[list(cols)].rename(columns=cols) # type: ignore
     res["gpu busy %"] *= 100
     res["tok/s"] /= 1e3
+    res.insert(res.columns.get_loc("tok/s") + 1, "ktok/s/gpu", res["tok/s"] / res["gpus"])
     res = res.rename(columns={"tok/s": "ktok/s"}).round(1)
     print(res.to_string(index=False))
     return res
