@@ -56,7 +56,7 @@ def allparams():
     batch_size = [42, 84]
     for i, (c, bs) in enumerate(product(compile, batch_size)):
         p = Params()
-        p.savedir = f"outdir/e00/compile/d{i}/"
+        p.savedir = f"outdir/e00/compile-tok_s/d{i}/"
         p.n_workers = 4
         p.amp = True
         p.compile = c
@@ -167,6 +167,7 @@ def run(n:int):
 
     prof = None
     benchmark_started = None
+    n_tokens = 0  # encoder tokens since benchmark start
     with open(savedir / "metrics.json", "a") as metrics_file, ExitStack() as profile_scope:
         for idx_step in range(par.steps_per_epoch):
             if idx_step == par.warmup_steps and idx_step < benchmark_stop:
@@ -190,6 +191,8 @@ def run(n:int):
                 x = x.to(device, non_blocking=True)
             with phase("04_FORWARD_AND_LOSS"), torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.amp):
                 out = model(x)
+            if benchmark_started is not None:
+                n_tokens += out.n_tokens
             with phase("05_BACKWARD"):
                 out.loss.backward()
             with phase("06_OPTIMIZER"):
@@ -213,10 +216,12 @@ def run(n:int):
                     "steps": steps, "seconds": seconds, "seconds_per_step": seconds / steps,
                     "samples_per_second": samples_per_second,
                     "input_mvox_per_second": samples_per_second * prod(par.patch_size) / 1e6,
+                    "tokens_per_second": n_tokens / seconds,
+                    "tokens_per_sample": n_tokens / (steps * par.batch_size),
                 }
                 with open(savedir / "performance.json", "a") as f:
                     f.write(json.dumps(result) + "\n")
-                print(f"Unprofiled: {seconds / steps:.3f} s/step, {samples_per_second:.2f} samples/s")
+                print(f"Unprofiled: {seconds / steps:.3f} s/step, {samples_per_second:.2f} samples/s, {n_tokens / seconds:.0f} tokens/s")
             if prof is not None:
                 prof.step()
                 if idx_step + 1 == profile_stop:
@@ -280,7 +285,7 @@ def plot1():
 def plot2():
     res = loadJsonTable("performance.json")
     res['vox'] = res.patch_size.apply(prod)
-    px.bar(res, x="compile", y="input_mvox_per_second", facet_col="batch_size", color="compile", barmode="group").show()
+    px.bar(res, x="compile", y="tokens_per_second", facet_col="batch_size", color="compile", barmode="group").show()
 
 def test():
     x = lmd.all()

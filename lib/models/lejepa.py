@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from math import prod
 from pathlib import Path
 from typing import Any, Iterator, Optional, Tuple, Union
 
@@ -465,12 +466,16 @@ class Lejepa(nn.Module):
 
         # SIGReg's cos/sin statistics are precision sensitive, so keep the loss in fp32 under autocast.
         with torch.autocast(vol.device.type, enabled=False):
-            return lejepa_loss(
+            out = lejepa_loss(
                 globals=proj_globals.float(),
                 views=proj_all.float(),
                 sigreg=self.sigreg,
                 lamb=self.cfg.lamb,
             )
+        # Encoder tokens this step, summed over views and batch (python int, no device sync).
+        patch_vol = prod(self.encoder.patch_embed.patch_size)
+        out.n_tokens = sum(v.shape[0] * prod(v.shape[2:]) // patch_vol for v in [*g_views, *l_views])
+        return out
 
     def forward(
         self,
