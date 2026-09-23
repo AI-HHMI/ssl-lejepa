@@ -290,6 +290,22 @@ def plot2():
     px.bar(res, x="compile", y="tokens_per_second", color="compile", facet_col="batch_size", facet_row="amp", barmode="group").show()
     px.bar(res, x="compile", y="input_mvox_per_second", color="compile", facet_col="batch_size", facet_row="amp", barmode="group").show()
 
+def table():
+    res = loadJsonTable("performance.json")
+    busy = loadJsonTable("gpu_busy.json")
+    res["gpu_busy"] = res.savedir.map(dict(zip(busy.savedir, busy.gpu_busy))) if len(busy) else float("nan")
+    cols = {
+        "savedir": "run", "compile": "compile", "batch_size": "batch", "n_workers": "workers",
+        "gpu_busy": "gpu busy %", "samples_per_second": "samples/s",
+        "tokens_per_second": "tok/s", "input_mvox_per_second": "Mvox/s",
+    }
+    res = res[list(cols)].rename(columns=cols) # type: ignore
+    res["gpu busy %"] *= 100
+    res["tok/s"] /= 1e3
+    res = res.rename(columns={"tok/s": "ktok/s"}).round(1)
+    print(res.to_string(index=False))
+    return res
+
 def test():
     x = lmd.all()
     for xi in x:
