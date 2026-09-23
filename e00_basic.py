@@ -58,7 +58,9 @@ def allparams():
         p.savedir = f"outdir/e00/prefetch/d{i}/"
         p.n_workers = nw
         p.prefetch_factor = pf
+        print(i, pf, nw)
         params.append(p)
+    # pprint(params)
     return params
 
 def collate_images(samples):
@@ -278,6 +280,18 @@ def test():
     x = lmd.all()
     for xi in x:
         pprint(xi)
+
+def size():
+  import zarr
+  from typing import Any, cast
+  v = lmd.get("exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001")
+  g = zarr.open_group(v.path, mode="r")[v.image_key]
+  assert isinstance(g, zarr.Group)
+  meta = cast(dict[str, Any], g.attrs.get("ome", g.attrs))
+  a = g[meta["multiscales"][0]["datasets"][0]["path"]]
+  assert isinstance(a, zarr.Array)
+  print(a.size)
+  print(a.shape)
 
 if __name__ == "__main__":
     import sys

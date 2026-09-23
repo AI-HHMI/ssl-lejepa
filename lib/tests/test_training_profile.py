@@ -75,7 +75,7 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
 
     assert consumed == list(range(n_steps * params.batch_size))
     metrics = [json.loads(line) for line in (tmp_path / "metrics.json").read_text().splitlines()]
-    assert metrics[-1]["epoch"] == n_steps - 1  # Training continues beyond capture.
+    assert metrics[-1]["idx_step"] == n_steps - 1  # Training continues beyond capture.
     assert all(torch.isfinite(torch.tensor(row["loss"])) for row in metrics)
     performance = json.loads((tmp_path / "performance.json").read_text())
     assert performance["steps"] == 2
