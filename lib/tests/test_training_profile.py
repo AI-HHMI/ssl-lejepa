@@ -94,3 +94,6 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
         ):
             assert sum(event.get("name") == phase for event in trace["traceEvents"]) == recorded_steps
         assert "SELF CPU TIME" in (tmp_path / "profile.out").read_text()
+        summary = json.loads((tmp_path / "trace_summary.json").read_text())
+        assert summary["step_ms"] > 0 and summary["gpu_busy"] == 0  # CPU run: no GPU kernels.
+        assert summary["04_FORWARD_AND_LOSS_ms"] > 0

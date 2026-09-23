@@ -211,8 +211,13 @@ def analyze_chrome_trace(json_data: Union[dict, list, str, Path]) -> Dict[str, A
     return _build_result(cat_times, top_ops)
 
 
-def gpu_busy(trace_path: Union[str, Path]) -> float:
-    """Fraction of profiled-step wall time covered by GPU kernels/memcpys (overlaps merged)."""
+def trace_summary(trace_path: Union[str, Path]) -> Dict[str, float]:
+    """Averages over the profiled steps of a chrome trace.
+
+    step_ms: wall time per ProfilerStep. gpu_busy: fraction of that wall time covered by GPU
+    kernels/memcpys (overlaps merged). NN_PHASE_ms: host time per step in each `NN_` record_function
+    phase; forward/backward host time is launch time unless the host blocks on the GPU.
+    """
     events = json.loads(Path(trace_path).read_text())["traceEvents"]
     steps = [e for e in events if e.get("ph") == "X" and e.get("name", "").startswith("ProfilerStep#")]
     assert steps, f"no ProfilerStep# spans in {trace_path}"
@@ -228,7 +233,18 @@ def gpu_busy(trace_path: Union[str, Path]) -> float:
         if b > a:
             busy += b - a
             end = b
-    return busy / (t1 - t0)
+    phases: Dict[str, float] = {}
+    for e in events:
+        b1 = e.get("ph") == "X" and e.get("cat") == "user_annotation"
+        b2 = re.match(r"\d\d_", e.get("name", "")) is not None
+        if b1 and b2 and t0 <= e["ts"] < t1:
+            phases[e["name"]] = phases.get(e["name"], 0.0) + e["dur"]
+    n = len(steps)
+    return {
+        "step_ms": (t1 - t0) / n / 1e3,
+        "gpu_busy": busy / (t1 - t0),
+        **{f"{k}_ms": v / n / 1e3 for k, v in sorted(phases.items())},
+    }
 
 
 def _build_result(

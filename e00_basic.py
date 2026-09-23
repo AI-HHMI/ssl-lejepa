@@ -15,7 +15,7 @@ from itertools import product
 
 from lib.models import Lejepa, LejepaConfig
 from lib.util import *
-from lib.profiler import gpu_busy
+from lib.profiler import trace_summary
 
 # external 
 
@@ -37,7 +37,7 @@ class Params:
     # patch_size: list[int] = field(default_factory=lambda: [104, 232, 232])
     patch_size: list[int] = field(default_factory=lambda: [48, 144, 144])
     batch_size: int = 42
-    steps_per_epoch: int = 100
+    steps_per_epoch: int = 71  # warmup + benchmark + 1 profiler warmup + profile steps: stop right after profiling
     n_layers: int = 12
     f32mode: F32Mode = "high"
     n_workers: int = 2
@@ -48,7 +48,7 @@ class Params:
     # profiling params
     warmup_steps: int = 10
     benchmark_steps: int = 50
-    profile_steps: int = 3  # Set to zero to disable trace collection.
+    profile_steps: int = 10  # Set to zero to disable trace collection.
 
 def allparams():
     params = []
@@ -66,18 +66,18 @@ def allparams():
     # pprint(params)
     return params
 
-def write_gpu_busy(savedir):
-    busy = gpu_busy(Path(savedir) / "profile.json")
-    (Path(savedir) / "gpu_busy.json").write_text(json.dumps({"tbl": "gpu_busy", "gpu_busy": busy}) + "\n")
-    print(f"{savedir}: GPU busy during profiled steps {100 * busy:.0f}%")
+def write_trace_summary(savedir):
+    summary = trace_summary(Path(savedir) / "profile.json")
+    (Path(savedir) / "trace_summary.json").write_text(json.dumps({"tbl": "trace_summary", **summary}) + "\n")
+    print(f"{savedir}: GPU busy during profiled steps {100 * summary['gpu_busy']:.0f}%")
 
 # def backfill_gpu_busy():
 #     """Write gpu_busy.json from profile.json for runs that predate it. Run on the cluster (traces aren't pulled)."""
 #     for par in allparams():
 #         b1 = (Path(par.savedir) / "profile.json").is_file()
-#         b2 = (Path(par.savedir) / "gpu_busy.json").is_file()
+#         b2 = (Path(par.savedir) / "trace_summary.json").is_file()
 #         if b1 and not b2:
-#             write_gpu_busy(par.savedir)
+#             write_trace_summary(par.savedir)
 
 def collate_images(samples):
     import torch
@@ -157,8 +157,7 @@ def run(n:int):
 
     def save_trace(prof):
         prof.export_chrome_trace(str(savedir / "profile.json"))
-        if use_cuda:
-            write_gpu_busy(savedir)
+        write_trace_summary(savedir)
         averages = prof.key_averages()
         report = (
             f"Device: {device}; recorded steps (zero-based): "
@@ -306,12 +305,16 @@ def plot2():
 
 def table():
     res = loadJsonTable("performance.json")
-    busy = loadJsonTable("gpu_busy.json")
-    res["gpu_busy"] = res.savedir.map(dict(zip(busy.savedir, busy.gpu_busy))) if len(busy) else float("nan")
+    trace = loadJsonTable("trace_summary.json")
+    # Host ms per profiled step in each phase (see lib.profiler.trace_summary).
+    phases = {"01_DATA_IO_ms": "io ms", "04_FORWARD_AND_LOSS_ms": "fwd ms", "05_BACKWARD_ms": "bwd ms", "06_OPTIMIZER_ms": "opt ms"}
+    for k in ["gpu_busy", "step_ms", *phases]:
+        res[k] = res.savedir.map(dict(zip(trace.savedir, trace[k]))) if k in trace else float("nan")
     cols = {
         "savedir": "run", "compile": "compile", "batch_size": "batch", "n_workers": "workers",
         "gpu_busy": "gpu busy %", "samples_per_second": "samples/s",
         "tokens_per_second": "tok/s", "input_mvox_per_second": "Mvox/s",
+        "step_ms": "prof step ms", **phases,
     }
     res = res[list(cols)].rename(columns=cols) # type: ignore
     res["gpu busy %"] *= 100
