@@ -54,11 +54,12 @@ def allparams():
     # patchsize = logish_samples([4, 12, 12], [2,3], 2, 7)[1:]
     compile = [False, True]
     batch_size = [42, 84]
-    for i, (c, bs) in enumerate(product(compile, batch_size)):
+    amps = [False, True]
+    for i, (am, c, bs) in enumerate(product(amps, compile, batch_size)):
         p = Params()
-        p.savedir = f"outdir/e00/compile-tok_s/d{i}/"
+        p.savedir = f"outdir/e00/compile-amp-tok_s/d{i}/"
         p.n_workers = 4
-        p.amp = True
+        p.amp = am
         p.compile = c
         p.batch_size = bs
         print(i, c, bs)
@@ -280,17 +281,20 @@ def loadJsonTable(filename):
 
 def plot1():
     res = loadJsonTable("metrics.json")
-    px.line(res, x="idx_step", y="loss", color="compile", facet_col="batch_size", markers=True).show()
+    px.line(res, x="idx_step", y="loss", color="compile", facet_col="batch_size", facet_row="amp", markers=True).show()
 
 def plot2():
     res = loadJsonTable("performance.json")
     res['vox'] = res.patch_size.apply(prod)
-    px.bar(res, x="compile", y="tokens_per_second", facet_col="batch_size", color="compile", barmode="group").show()
+    pprint(res.columns)
+    px.bar(res, x="compile", y="tokens_per_second", color="compile", facet_col="batch_size", facet_row="amp", barmode="group").show()
+    px.bar(res, x="compile", y="input_mvox_per_second", color="compile", facet_col="batch_size", facet_row="amp", barmode="group").show()
 
 def test():
     x = lmd.all()
     for xi in x:
-        pprint(xi)
+        if xi.name.startswith("em-"):
+            pprint(xi)
 
 def size():
   import zarr
