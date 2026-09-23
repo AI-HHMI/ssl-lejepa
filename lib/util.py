@@ -6,6 +6,12 @@ from pathlib import Path
 import subprocess
 import sys
 import numpy as np
+import shutil
+
+def wipedir(path):
+  path = Path(path)
+  if path.exists(): shutil.rmtree(path)
+  path.mkdir(parents=True, exist_ok=True)
 
 
 def repo_root(path=".") -> Path:

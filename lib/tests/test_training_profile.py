@@ -7,7 +7,22 @@ import pytest
 import torch
 
 import e00_basic as experiment
-from lib.models import LejepaConfig
+from lib.models import Lejepa, LejepaConfig
+
+
+class SyntheticDataset:
+    """Picklable dataset for DataLoader workers, with an index marker per image."""
+
+    def __init__(self, config):
+        self.length = config.samples_per_epoch
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index):
+        image = torch.randn(1, 8, 8, 8)
+        image[0, 0, 0, 0] = index
+        return {"img": image}
 
 
 @pytest.mark.parametrize(
@@ -17,7 +32,8 @@ from lib.models import LejepaConfig
 def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorded_steps):
     params = experiment.Params(
         savedir=str(tmp_path), patch_size=[8, 8, 8], batch_size=2,
-        n_epoch=n_steps, warmup_steps=1, benchmark_steps=2, profile_steps=profile_steps,
+        steps_per_epoch=n_steps, warmup_steps=1, benchmark_steps=2, profile_steps=profile_steps,
+        n_workers=1,
     )
     monkeypatch.setattr(experiment, "allparams", lambda: [params])
     volume = SimpleNamespace(
@@ -25,16 +41,26 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
         to_miao=lambda: None,
     )
     monkeypatch.setattr(experiment.lmd, "all", lambda: [volume])
-    monkeypatch.setattr(experiment, "MiaoConfig", lambda **kwargs: None)
-    reads = []
-
-    class Dataset:
-        def __getitem__(self, index):
-            reads.append(index)
-            return {"img": torch.randn(1, 8, 8, 8)}
-
-    monkeypatch.setattr(experiment, "VolumeDataset", lambda config: Dataset())
+    monkeypatch.setattr(experiment, "MiaoConfig", SimpleNamespace)
+    monkeypatch.setattr(experiment, "VolumeDataset", SyntheticDataset)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    # Keep provenance writes in the test directory and independent of git state.
+    (tmp_path / "_diffs").mkdir()
+    monkeypatch.setattr(experiment, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(experiment, "git_provenance", lambda: {
+        "commit_id": "test-commit", "diff_hash": "test-diff", "diff": "",
+    })
+    consumed = []
+
+    def record_batch(model, args):
+        consumed.extend(args[0][:, 0, 0, 0, 0].tolist())
+
+    def small_model(config):
+        model = Lejepa(config)
+        model.register_forward_pre_hook(record_batch)
+        return model
+
+    monkeypatch.setattr(experiment, "Lejepa", small_model)
 
     def small_model_config(**kwargs):
         assert kwargs["profile"] is False  # No nested first-forward profiler.
@@ -47,11 +73,11 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
     monkeypatch.setattr(experiment, "LejepaConfig", small_model_config)
     experiment.run(0)
 
-    assert reads == list(range(n_steps * params.batch_size))
-    metrics = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
+    assert consumed == list(range(n_steps * params.batch_size))
+    metrics = [json.loads(line) for line in (tmp_path / "metrics.json").read_text().splitlines()]
     assert metrics[-1]["epoch"] == n_steps - 1  # Training continues beyond capture.
     assert all(torch.isfinite(torch.tensor(row["loss"])) for row in metrics)
-    performance = json.loads((tmp_path / "performance.jsonl").read_text())
+    performance = json.loads((tmp_path / "performance.json").read_text())
     assert performance["steps"] == 2
     assert performance["samples_per_second"] > 0
     assert performance["seconds_per_step"] == performance["seconds"] / 2
@@ -61,7 +87,7 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
     if recorded_steps:
         trace = json.loads(trace_path.read_text())
         for phase in (
-            "01_DATA_IO", "02_CPU_BATCH", "03_H2D_TRANSFER", "04_FORWARD_AND_LOSS",
+            "01_DATA_IO", "03_H2D_TRANSFER", "04_FORWARD_AND_LOSS",
             "05_BACKWARD", "06_OPTIMIZER", "07_LOGGING",
         ):
             assert sum(event.get("name") == phase for event in trace["traceEvents"]) == recorded_steps

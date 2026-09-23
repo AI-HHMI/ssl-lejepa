@@ -1,24 +1,34 @@
 from __future__ import annotations
 
+from typing import Literal
 from dataclasses import dataclass, field, asdict
-from contextlib import ExitStack, nullcontext
-from functools import reduce
-from math import prod
-from pathlib import Path
-
-from lib.models import Lejepa, LejepaConfig
-from lib.util import call_entrypoint, pick_entrypoint, logish_samples, git_provenance, repo_root
-import lmd_catalog as lmd
-from miao.config import MiaoConfig
-from miao import VolumeDataset
-from rich import print as pprint
 import os, sys
 import json
 import time
+from pathlib import Path
+from contextlib import ExitStack, nullcontext
 
+from functools import reduce
+from math import prod
+from itertools import product
+
+# local
+
+from lib.models import Lejepa, LejepaConfig
+from lib.util import *
+
+# external 
+
+import lmd_catalog as lmd
+from miao.config import MiaoConfig
+from miao import VolumeDataset
+
+from rich import print as pprint
 import pandas
 import plotly.express as px
 
+
+F32Mode = Literal["highest", "high", "medium"]
 
 @dataclass(slots=True)
 class Params:
@@ -26,54 +36,76 @@ class Params:
     # patch_size: list[int] = [104, 232, 232]
     patch_size: list[int] = field(default_factory=lambda: [104, 232, 232])
     batch_size: int = 42
-    n_epoch: int = 100
+    steps_per_epoch: int = 100
     n_layers: int = 12
 
     # profiling params
     warmup_steps: int = 10
     benchmark_steps: int = 50
     profile_steps: int = 3  # Set to zero to disable trace collection.
+    f32mode: F32Mode = "high"
+    n_workers: int = 1
 
 def allparams():
     params = []
-    ps = logish_samples([4, 12, 12], [2,3], 2, 7)[1:]
-    nl = [8,10,12,14,16,18]
-    pprint(ps)
-    for i in range(len(nl)):
+    patchsize = logish_samples([4, 12, 12], [2,3], 2, 7)[1:]
+    # layers = [8,10,12,14,16,18]
+    batchsize = [16,42]
+    workers = [1,2,4,8,16]
+    modes : list[F32Mode] = ["medium", "high", "highest"]
+    # pprint(ps)
+    for i, (mo, nw, bs) in enumerate(product(modes, workers, batchsize)):
         p = Params()
-        p.patch_size = ps[5]
-        p.savedir = f"outdir/e00/n_layers/f32high/d{i}/"
-        p.n_layers = nl[i]
+        p.patch_size = patchsize[5]
+        p.n_layers = 12
+        p.savedir = f"outdir/e00/modesWorkers/d{i}/"
+        p.batch_size = bs
+        p.f32mode = mo
+        p.n_workers = nw
         # p.savedir = f"outdir/e00/temp/"
         params.append(p)
     return params
 
-def run(n:int):
+def collate_images(samples):
     import torch
-    torch.set_float32_matmul_precision("high")
+    return torch.stack([s["img"] for s in samples])
 
+def run(n:int):
+    start_time = time.time()
     par : Params = allparams()[n]
     if min(par.warmup_steps, par.benchmark_steps, par.profile_steps) < 0:
         raise ValueError("Profiling and benchmark step counts must be nonnegative")
     # lmd.set_data_root("/Volumes/miaai/lmd-v0.0.1/data")
     # volumes = [x.to_miao() for x in lmd.all() if "flyliconn" in x.name]
 
+    import torch
+    torch.set_float32_matmul_precision(par.f32mode)
+
     volumes = [x.to_miao() for x in lmd.all() if x.name == "exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001"]
     mcfg = MiaoConfig(
         volumes=volumes,
         patch_size=par.patch_size,
         resolutions=[[25.0, 10.0, 10.0]],
-        samples_per_epoch=1000,
+        samples_per_epoch=par.batch_size * par.steps_per_epoch,
         sampling="random",
         output_axes="lzyx",
     )
     dl = VolumeDataset(mcfg)
+    loader = torch.utils.data.DataLoader(
+      dl,
+      batch_size=par.batch_size,
+      num_workers=par.n_workers,
+      collate_fn=collate_images,
+      prefetch_factor=1,
+      pin_memory=torch.cuda.is_available(),
+      multiprocessing_context="spawn",
+    )
+    batches = iter(loader)
 
     # pprint(volumes)
     # pprint(mcfg)
     # pprint(dl[0]['img'].shape)
 
-    os.makedirs(par.savedir, exist_ok=True)
     savedir = Path(par.savedir)
 
     with open(savedir / "runs.json", 'a') as rfile, open(repo_root() / "_diffs/diffs.json", "a") as difflog:
@@ -100,8 +132,8 @@ def run(n:int):
     if use_cuda:
         activities.append(torch.profiler.ProfilerActivity.CUDA)
     profile_start = par.warmup_steps + par.benchmark_steps
-    profile_stop = min(profile_start + 1 + par.profile_steps, par.n_epoch)
-    benchmark_stop = min(profile_start, par.n_epoch)
+    profile_stop = min(profile_start + 1 + par.profile_steps, par.steps_per_epoch)
+    benchmark_stop = min(profile_start, par.steps_per_epoch)
 
     def synchronize():
         if use_cuda:
@@ -133,11 +165,11 @@ def run(n:int):
     prof = None
     benchmark_started = None
     with open(savedir / "metrics.json", "a") as metrics_file, ExitStack() as profile_scope:
-        for ep in range(par.n_epoch):
-            if ep == par.warmup_steps and ep < benchmark_stop:
+        for idx_step in range(par.steps_per_epoch):
+            if idx_step == par.warmup_steps and idx_step < benchmark_stop:
                 synchronize()
                 benchmark_started = time.perf_counter()
-            if par.profile_steps and ep == profile_start and ep + 1 < profile_stop:
+            if par.profile_steps and idx_step == profile_start and idx_step + 1 < profile_stop:
                 synchronize()
                 prof = profile_scope.enter_context(torch.profiler.profile(
                     activities=activities,
@@ -150,11 +182,9 @@ def run(n:int):
             # No annotation hooks or profiler are active during the throughput baseline.
             phase = torch.profiler.record_function if prof is not None else lambda name: nullcontext()
             with phase("01_DATA_IO"):
-                samples = [dl[par.batch_size * ep + i] for i in range(par.batch_size)]
-            with phase("02_CPU_BATCH"):
-                x = torch.stack([sample["img"] for sample in samples])
+                x = next(batches)
             with phase("03_H2D_TRANSFER"):
-                x = x.to(device)
+                x = x.to(device, non_blocking=True)
             with phase("04_FORWARD_AND_LOSS"):
                 out = model(x)
             with phase("05_BACKWARD"):
@@ -163,13 +193,13 @@ def run(n:int):
                 opt.step()
                 opt.zero_grad()
             with phase("07_LOGGING"):
-                if ep % 10 == 0 or ep + 1 == par.n_epoch:
+                if idx_step % 10 == 0 or idx_step + 1 == par.steps_per_epoch:
                     loss = out.loss.detach().item()
-                    metrics_file.write(json.dumps({"tbl": "metrics", "epoch": ep, "time": time.time(), "loss": loss}) + "\n")
+                    metrics_file.write(json.dumps({"tbl": "metrics", "idx_step": idx_step, "time": time.time() - start_time, "loss": loss}) + "\n")
                     metrics_file.flush()
-                    print(f"finished step {ep + 1}/{par.n_epoch}, loss={loss:.4f}", flush=True)
+                    print(f"finished step {idx_step + 1}/{par.steps_per_epoch}, loss={loss:.4f}", flush=True)
 
-            if benchmark_started is not None and ep + 1 == benchmark_stop:
+            if benchmark_started is not None and idx_step + 1 == benchmark_stop:
                 synchronize()  # Only window boundaries synchronize; phases remain asynchronous.
                 seconds = time.perf_counter() - benchmark_started
                 steps = benchmark_stop - par.warmup_steps
@@ -186,20 +216,21 @@ def run(n:int):
                 print(f"Unprofiled: {seconds / steps:.3f} s/step, {samples_per_second:.2f} samples/s")
             if prof is not None:
                 prof.step()
-                if ep + 1 == profile_stop:
+                if idx_step + 1 == profile_stop:
                     profile_scope.close()
                     prof = None
 
 
 def runlsf(n:int):
     import subprocess
-    par = allparams()[n]
+    par:Params = allparams()[n]
+    wipedir(par.savedir)
     RUN_NAME = "e00_basic"
     NUM_GPUS = 1
     cmd = f""" bsub -J {RUN_NAME} \
         -W 4:00 \
         -P miaai \
-        -n {NUM_GPUS} \
+        -n {par.n_workers + 1} \
         -R "span[hosts=1]" \
         -gpu "num={NUM_GPUS}:mode=exclusive_process" \
         -q gpu_b300 \
@@ -236,12 +267,12 @@ def loadJsonTable(filename):
 
 def plot1():
     res = loadJsonTable("metrics.json")
-    px.line(res, x="epoch", y="loss", color="n_layers", markers=True).show()
+    px.line(res, x="idx_step", y="loss", color="f32mode", facet_col="batch_size", line_group="n_workers", markers=True).show()
 
 def plot2():
     res = loadJsonTable("performance.json")
     res['vox'] = res.patch_size.apply(prod)
-    px.bar(res, x="n_layers", y="input_mvox_per_second", color="n_layers").show()
+    px.bar(res, x="n_workers", y="input_mvox_per_second", facet_col="batch_size", color="f32mode", barmode="group").show()
 
 def test():
     x = lmd.all()

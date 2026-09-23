@@ -3,6 +3,7 @@ mkdir -p outdir/
 oc-rsync -avz \
   --include='*/' \
   --include='**/profile.out' \
+  --exclude='**/profile.json' \
   --include='*.json' \
   --include='*.log' \
   --exclude='*' \
