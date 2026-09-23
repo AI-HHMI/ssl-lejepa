@@ -1,6 +1,6 @@
 set -e
 mkdir -p outdir/
-oc-rsync -avz \
+oc-rsync -avz --delete \
   --include='*/' \
   --include='**/profile.out' \
   --exclude='**/profile.json' \
