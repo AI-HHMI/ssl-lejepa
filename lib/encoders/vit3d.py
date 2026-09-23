@@ -95,8 +95,9 @@ class PatchEmbed3d(nn.Module):
             tokens: (B, N, embed_dim) where N = G_z * G_y * G_x
             grid_size: (G_z, G_y, G_x)
         """
-        assert all(s >= p for s, p in zip(x.shape[2:], self.patch_size)), f"input {tuple(x.shape)} smaller than patch {self.patch_size}"
-        # No padding: the stride=kernel conv drops the <patch remainder. Avoids torch.compile recompiles per divisibility pattern.
+        assert all(s % p == 0 for s, p in zip(x.shape[2:], self.patch_size)), (
+            f"input {tuple(x.shape)} must be a multiple of patch size {self.patch_size}"
+        )
         feat = self.proj(x)  # (B, embed_dim, G_z, G_y, G_x)
         grid_size = (feat.shape[2], feat.shape[3], feat.shape[4])
         tokens = feat.flatten(2).transpose(1, 2)  # (B, N, embed_dim)

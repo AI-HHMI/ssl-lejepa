@@ -318,6 +318,7 @@ class Lejepa(nn.Module):
                 global_scale=self.cfg.global_scale,
                 local_scale=self.cfg.local_scale,
                 flip=self.cfg.flip,
+                patch_size=self.encoder.patch_embed.patch_size,
             )
         else:
             self.view_maker = None

@@ -35,6 +35,7 @@ class ViewMaker:
         local_scale: Tuple[float, float] = (0.15, 0.5),
         flip: bool = True,
         generator: Optional[torch.Generator] = None,
+        patch_size: Tuple[int, int, int] = (1, 1, 1),
     ):
         self.n_global = n_global
         self.n_local = n_local
@@ -42,9 +43,18 @@ class ViewMaker:
         self.local_scale = local_scale
         self.flip = flip
         self.generator = generator
+        self.patch_size = patch_size  # crop sizes are rounded to multiples of this
 
     def _rand_uniform(self, low: float, high: float) -> float:
         return low + (high - low) * torch.rand((), generator=self.generator).item()
+
+    def _crop_shape(self, scale: float, spatial_shape: Tuple[int, int, int]) -> Tuple[int, ...]:
+        """Crop with volume fraction `scale`, each side rounded to a whole number of patches."""
+        linear_scale = scale ** (1.0 / 3.0)
+        return tuple(
+            p * max(1, min(s // p, round(s * linear_scale / p)))
+            for s, p in zip(spatial_shape, self.patch_size)
+        )
 
     def _maybe_flip(self, crop: Tensor) -> Tensor:
         """Random per-axis flip along spatial dimensions."""
@@ -65,15 +75,14 @@ class ViewMaker:
 
         B, C, Z, Y, X_dim = x.shape
         spatial_shape = (Z, Y, X_dim)
+        assert all(s % p == 0 for s, p in zip(spatial_shape, self.patch_size)), (
+            f"input spatial shape {spatial_shape} must be a multiple of patch size {self.patch_size}"
+        )
 
         globals_: list[Tensor] = []
         for _ in range(self.n_global):
             scale = self._rand_uniform(*self.global_scale)
-            linear_scale = scale ** (1.0 / 3.0)
-            crop_shape = tuple(
-                max(4, min(s, int(round(s * linear_scale))))
-                for s in spatial_shape
-            )
+            crop_shape = self._crop_shape(scale, spatial_shape)
             view_batch: list[Tensor] = []
             for b in range(B):
                 origins = [
@@ -91,11 +100,7 @@ class ViewMaker:
         if self.n_local > 0:
             for _ in range(self.n_local):
                 scale = self._rand_uniform(*self.local_scale)
-                linear_scale = scale ** (1.0 / 3.0)
-                crop_shape = tuple(
-                    max(4, min(s, int(round(s * linear_scale))))
-                    for s in spatial_shape
-                )
+                crop_shape = self._crop_shape(scale, spatial_shape)
                 view_batch = []
                 for b in range(B):
                     origins = [
