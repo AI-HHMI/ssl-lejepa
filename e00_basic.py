@@ -41,6 +41,7 @@ class Params:
     f32mode: F32Mode = "high"
     n_workers: int = 2
     prefetch_factor: int = 2
+    amp: bool = False  # bf16 autocast for forward + loss
 
     # profiling params
     warmup_steps: int = 10
@@ -50,15 +51,15 @@ class Params:
 def allparams():
     params = []
     # patchsize = logish_samples([4, 12, 12], [2,3], 2, 7)[1:]
-    prefetch_factor = [1,2,4,8]
-    workers = [2,4]
-    for i, (pf, nw) in enumerate(product(prefetch_factor, workers)):
-        # if nw==16: continue
+    amp = [False, True]
+    batch_size = [42, 84]
+    for i, (a, bs) in enumerate(product(amp, batch_size)):
         p = Params()
-        p.savedir = f"outdir/e00/prefetch/d{i}/"
-        p.n_workers = nw
-        p.prefetch_factor = pf
-        print(i, pf, nw)
+        p.savedir = f"outdir/e00/amp/d{i}/"
+        p.n_workers = 4
+        p.amp = a
+        p.batch_size = bs
+        print(i, a, bs)
         params.append(p)
     # pprint(params)
     return params
@@ -182,7 +183,7 @@ def run(n:int):
                 x = next(batches)
             with phase("03_H2D_TRANSFER"):
                 x = x.to(device, non_blocking=True)
-            with phase("04_FORWARD_AND_LOSS"):
+            with phase("04_FORWARD_AND_LOSS"), torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.amp):
                 out = model(x)
             with phase("05_BACKWARD"):
                 out.loss.backward()
@@ -269,12 +270,13 @@ def loadJsonTable(filename):
 
 def plot1():
     res = loadJsonTable("metrics.json")
-    px.line(res, x="idx_step", y="loss", color="prefetch_factor", facet_col="n_workers", markers=True).show()
+    pprint(res)
+    px.line(res, x="idx_step", y="loss", color="amp", facet_col="batch_size", markers=True).show()
 
 def plot2():
     res = loadJsonTable("performance.json")
     res['vox'] = res.patch_size.apply(prod)
-    px.bar(res, x="prefetch_factor", y="input_mvox_per_second", facet_col="n_workers", color="n_workers", barmode="group").show()
+    px.bar(res, x="amp", y="input_mvox_per_second", facet_col="batch_size", color="amp", barmode="group").show()
 
 def test():
     x = lmd.all()

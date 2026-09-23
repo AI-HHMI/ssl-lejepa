@@ -462,12 +462,14 @@ class Lejepa(nn.Module):
         else:
             proj_all = proj_globals
 
-        return lejepa_loss(
-            globals=proj_globals,
-            views=proj_all,
-            sigreg=self.sigreg,
-            lamb=self.cfg.lamb,
-        )
+        # SIGReg's cos/sin statistics are precision sensitive, so keep the loss in fp32 under autocast.
+        with torch.autocast(vol.device.type, enabled=False):
+            return lejepa_loss(
+                globals=proj_globals.float(),
+                views=proj_all.float(),
+                sigreg=self.sigreg,
+                lamb=self.cfg.lamb,
+            )
 
     def forward(
         self,
