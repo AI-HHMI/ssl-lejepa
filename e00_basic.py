@@ -66,6 +66,19 @@ def allparams():
     # pprint(params)
     return params
 
+def write_gpu_busy(savedir):
+    busy = gpu_busy(Path(savedir) / "profile.json")
+    (Path(savedir) / "gpu_busy.json").write_text(json.dumps({"tbl": "gpu_busy", "gpu_busy": busy}) + "\n")
+    print(f"{savedir}: GPU busy during profiled steps {100 * busy:.0f}%")
+
+# def backfill_gpu_busy():
+#     """Write gpu_busy.json from profile.json for runs that predate it. Run on the cluster (traces aren't pulled)."""
+#     for par in allparams():
+#         b1 = (Path(par.savedir) / "profile.json").is_file()
+#         b2 = (Path(par.savedir) / "gpu_busy.json").is_file()
+#         if b1 and not b2:
+#             write_gpu_busy(par.savedir)
+
 def collate_images(samples):
     import torch
     return torch.stack([s["img"] for s in samples])
@@ -145,9 +158,7 @@ def run(n:int):
     def save_trace(prof):
         prof.export_chrome_trace(str(savedir / "profile.json"))
         if use_cuda:
-            busy = gpu_busy(savedir / "profile.json")
-            (savedir / "gpu_busy.json").write_text(json.dumps({"tbl": "gpu_busy", "gpu_busy": busy}) + "\n")
-            print(f"GPU busy during profiled steps: {100 * busy:.0f}%")
+            write_gpu_busy(savedir)
         averages = prof.key_averages()
         report = (
             f"Device: {device}; recorded steps (zero-based): "
