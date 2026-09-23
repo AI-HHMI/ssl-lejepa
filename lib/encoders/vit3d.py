@@ -95,17 +95,8 @@ class PatchEmbed3d(nn.Module):
             tokens: (B, N, embed_dim) where N = G_z * G_y * G_x
             grid_size: (G_z, G_y, G_x)
         """
-        pz, py, px = self.patch_size
-        _, _, z, y, x_dim = x.shape
-
-        # Dynamic padding if dimensions are not divisible by patch size
-        pad_z = (pz - z % pz) % pz
-        pad_y = (py - y % py) % py
-        pad_x = (px - x_dim % px) % px
-
-        if pad_z or pad_y or pad_x:
-            x = F.pad(x, (0, pad_x, 0, pad_y, 0, pad_z), mode="replicate")
-
+        assert all(s >= p for s, p in zip(x.shape[2:], self.patch_size)), f"input {tuple(x.shape)} smaller than patch {self.patch_size}"
+        # No padding: the stride=kernel conv drops the <patch remainder. Avoids torch.compile recompiles per divisibility pattern.
         feat = self.proj(x)  # (B, embed_dim, G_z, G_y, G_x)
         grid_size = (feat.shape[2], feat.shape[3], feat.shape[4])
         tokens = feat.flatten(2).transpose(1, 2)  # (B, N, embed_dim)

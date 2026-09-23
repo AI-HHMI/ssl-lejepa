@@ -42,6 +42,7 @@ class Params:
     n_workers: int = 2
     prefetch_factor: int = 2
     amp: bool = False  # bf16 autocast for forward + loss
+    compile: bool = False  # torch.compile(dynamic=True) the encoder
 
     # profiling params
     warmup_steps: int = 10
@@ -51,15 +52,16 @@ class Params:
 def allparams():
     params = []
     # patchsize = logish_samples([4, 12, 12], [2,3], 2, 7)[1:]
-    amp = [False, True]
+    compile = [False, True]
     batch_size = [42, 84]
-    for i, (a, bs) in enumerate(product(amp, batch_size)):
+    for i, (c, bs) in enumerate(product(compile, batch_size)):
         p = Params()
-        p.savedir = f"outdir/e00/amp/d{i}/"
+        p.savedir = f"outdir/e00/compile/d{i}/"
         p.n_workers = 4
-        p.amp = a
+        p.amp = True
+        p.compile = c
         p.batch_size = bs
-        print(i, a, bs)
+        print(i, c, bs)
         params.append(p)
     # pprint(params)
     return params
@@ -124,6 +126,9 @@ def run(n:int):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"We're using torch device {device} .")
     model = model.to(device)
+    if par.compile:
+        torch._logging.set_logs(recompiles=True)  # recompiles show up in job_*.log
+        model.encoder.compile(dynamic=True)  # Views change shape every step.
     opt = torch.optim.Adam(model.parameters(), lr = 1e-4)
     use_cuda = device.type == "cuda"
     activities = [torch.profiler.ProfilerActivity.CPU]
@@ -270,13 +275,12 @@ def loadJsonTable(filename):
 
 def plot1():
     res = loadJsonTable("metrics.json")
-    pprint(res)
-    px.line(res, x="idx_step", y="loss", color="amp", facet_col="batch_size", markers=True).show()
+    px.line(res, x="idx_step", y="loss", color="compile", facet_col="batch_size", markers=True).show()
 
 def plot2():
     res = loadJsonTable("performance.json")
     res['vox'] = res.patch_size.apply(prod)
-    px.bar(res, x="amp", y="input_mvox_per_second", facet_col="batch_size", color="amp", barmode="group").show()
+    px.bar(res, x="compile", y="input_mvox_per_second", facet_col="batch_size", color="compile", barmode="group").show()
 
 def test():
     x = lmd.all()
