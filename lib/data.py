@@ -9,8 +9,8 @@ from typing import Optional, Tuple
 import numpy as np
 import zarr
 from zarr.storage import LocalStore
-from miao.config import VolumeConfig
-
+from miao.config import MiaoConfig, VolumeConfig
+import lmd_catalog as lmd
 
 def create_mock_ome_zarr(
     root_path: Path | str,
@@ -92,4 +92,28 @@ def get_mock_volume_config(
         path=str(path),
         image_key="raw",
         zarr_version="zarr2",
+    )
+
+# FlyEM hemibrain Ellipsoid Body splits from orhane's gary_comparison runs.
+HEMIBRAIN_EB = "em-drosophila-flyem-hemibrain/crop-001_EllipsoidBody_x24000_y23000_z17000"
+HEMIBRAIN_EB_BOXES = {  # [lo, hi) level-0 voxels, x y z
+    "train": [[0, 5000], [0, 5000], [0, 3000]],
+    "val": [[0, 5000], [0, 5000], [3000, 4000]],
+    "test": [[4000, 5000], [4000, 5000], [4000, 5000]],
+}
+
+def hemibrain_eb_config(split: str) -> MiaoConfig:
+    """MiaoConfig equivalent to gary_comparison's hemibrain_eb_{split}.yaml (minus defer_image_ops)."""
+    assert split in HEMIBRAIN_EB_BOXES, f"split must be one of {list(HEMIBRAIN_EB_BOXES)}, got {split!r}"
+    vol = lmd.get(HEMIBRAIN_EB).to_miao(
+        spatial_axes="xyz",
+        label_key="labels/proofread-cell-hemibrain-v1.2",
+        bounding_box=HEMIBRAIN_EB_BOXES[split],
+    )
+    return MiaoConfig(
+        volumes=[vol],
+        resolutions=[[8.0, 8.0, 8.0]],
+        patch_size=[256, 256, 256],
+        output_axes="lcxyz",
+        samples_per_epoch=100000 if split == "train" else 32,
     )
