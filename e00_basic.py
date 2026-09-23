@@ -32,12 +32,13 @@ F32Mode = Literal["highest", "high", "medium"]
 @dataclass(slots=True)
 class Params:
     savedir: str = "outdir/e00/main/basic/"
-    # patch_size: list[int] = [104, 232, 232]
     # patch_size: list[int] = field(default_factory=lambda: [104, 232, 232])
     patch_size: list[int] = field(default_factory=lambda: [48, 144, 144])
     batch_size: int = 42
     steps_per_epoch: int = 71  # warmup + benchmark + 1 profiler warmup + profile steps: stop right after profiling
     n_layers: int = 12
+
+    # optimizations
     f32mode: F32Mode = "high"
     n_workers: int = 2
     prefetch_factor: int = 2
