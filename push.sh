@@ -1,3 +1,4 @@
 set -e
-jj git push -b main
-ssh -o ConnectTimeout=15 login1.int.janelia.org "cd ~/proj/ssl-lejepa/ && jj git fetch && jj new main@origin"
+jj git push --remote janelia -b main
+ssh -o ConnectTimeout=15 login1.int.janelia.org \
+    "cd ~/proj/ssl-lejepa/ && jj new main"
