@@ -54,12 +54,11 @@ def allparams():
     # patchsize = logish_samples([4, 12, 12], [2,3], 2, 7)[1:]
     compile = [False, True]
     batch_size = [42, 84]
-    amps = [False, True]
-    for i, (am, c, bs) in enumerate(product(amps, compile, batch_size)):
+    for i, (c, bs) in enumerate(product(compile, batch_size)):
         p = Params()
-        p.savedir = f"outdir/e00/compile-amp-tok_s/d{i}/"
+        p.savedir = f"outdir/e00/viewvec/d{i}/"
         p.n_workers = 4
-        p.amp = am
+        p.amp = True
         p.compile = c
         p.batch_size = bs
         print(i, c, bs)

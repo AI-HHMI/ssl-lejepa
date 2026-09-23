@@ -115,3 +115,22 @@ def test_profiler(tmp_path):
     from lib import analyze_and_format
     report_json = analyze_and_format(tmp_path / "profile.json")
     assert "BOTTLENECK ANALYSIS SUMMARY" in report_json
+
+
+def test_view_maker_crops_are_flipped_subblocks():
+    B, Z, Y, X = 3, 16, 24, 24
+    x = torch.arange(B * Z * Y * X, dtype=torch.float32).view(B, 1, Z, Y, X)
+    maker = ViewMaker(n_global=2, n_local=2, patch_size=(8, 8, 8), generator=torch.Generator().manual_seed(0))
+    globals_, locals_ = maker(x)
+    for v in globals_ + locals_:
+        assert all(s % 8 == 0 for s in v.shape[2:])
+        for b in range(B):
+            crop = v[b, 0]
+            # Undo flips: values increase along every axis of an unflipped crop of an arange volume.
+            for d in range(3):
+                if crop.select(d, 0).min() > crop.select(d, -1).min():
+                    crop = crop.flip(d)
+            z0, rem = divmod(int(crop.min()) - b * Z * Y * X, Y * X)
+            y0, x0 = divmod(rem, X)
+            cz, cy, cx = crop.shape
+            assert torch.equal(crop, x[b, 0, z0:z0 + cz, y0:y0 + cy, x0:x0 + cx])

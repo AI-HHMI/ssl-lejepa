@@ -56,62 +56,45 @@ class ViewMaker:
             for s, p in zip(spatial_shape, self.patch_size)
         )
 
-    def _maybe_flip(self, crop: Tensor) -> Tensor:
-        """Random per-axis flip along spatial dimensions."""
-        if not self.flip:
-            return crop
-        for dim in (-3, -2, -1):
-            if self._rand_uniform(0.0, 1.0) < 0.5:
-                crop = crop.flip(dim)
-        return crop
+    def _view(self, x: Tensor, scale_range: Tuple[float, float]) -> Tensor:
+        """One view: a random-origin, randomly flipped crop per sample, gathered in a single indexing op.
+
+        x: Batch C Z Y X -> Batch C cZ cY cX, with the crop shape shared across the batch.
+        """
+        B, C = x.shape[:2]
+        spatial_shape = tuple(x.shape[2:])
+        assert len(spatial_shape)==3
+        crop_shape = self._crop_shape(self._rand_uniform(*scale_range), spatial_shape)
+        # Per-sample, per-axis indices; built on CPU (seeded by self.generator), then one small copy to device.
+        idx = []
+        for s, cs in zip(spatial_shape, crop_shape):
+            origin = torch.randint(0, s - cs + 1, (B, 1), generator=self.generator)  # Batch 1
+            offset = torch.arange(cs).expand(B, cs)  # Batch cs
+            if self.flip:
+                flip = torch.rand((B, 1), generator=self.generator) < 0.5
+                offset = torch.where(flip, cs - 1 - offset, offset)
+            idx.append((origin + offset).to(x.device, non_blocking=True))
+        iz, iy, ix = idx
+        b = torch.arange(B, device=x.device)
+        c = torch.arange(C, device=x.device)
+        # Adjacent advanced indices broadcast to Batch C cZ cY cX directly.
+        return x[
+            b[:, None, None, None, None],
+            c[None, :, None, None, None],
+            iz[:, None, :, None, None],
+            iy[:, None, None, :, None],
+            ix[:, None, None, None, :],
+        ]
 
     def __call__(self, x: Tensor) -> Tuple[list[Tensor], list[Tensor]]:
         """Generate (globals, locals) from (B, C, Z, Y, X) or (C, Z, Y, X)."""
-        is_4d = x.dim() == 4
-        if is_4d:
+        if x.dim() == 4:
             x = x.unsqueeze(0)
         elif x.dim() != 5:
             raise ValueError(f"Expected 4D or 5D input tensor, got shape {tuple(x.shape)}")
-
-        B, C, Z, Y, X_dim = x.shape
-        spatial_shape = (Z, Y, X_dim)
-        assert all(s % p == 0 for s, p in zip(spatial_shape, self.patch_size)), (
-            f"input spatial shape {spatial_shape} must be a multiple of patch size {self.patch_size}"
+        assert all(s % p == 0 for s, p in zip(x.shape[2:], self.patch_size)), (
+            f"input spatial shape {tuple(x.shape[2:])} must be a multiple of patch size {self.patch_size}"
         )
-
-        globals_: list[Tensor] = []
-        for _ in range(self.n_global):
-            scale = self._rand_uniform(*self.global_scale)
-            crop_shape = self._crop_shape(scale, spatial_shape)
-            view_batch: list[Tensor] = []
-            for b in range(B):
-                origins = [
-                    int(torch.randint(0, max(1, s - cs + 1), (), generator=self.generator).item())
-                    for s, cs in zip(spatial_shape, crop_shape)
-                ]
-                slices = (slice(None),) + tuple(
-                    slice(o, o + cs) for o, cs in zip(origins, crop_shape)
-                )
-                crop = self._maybe_flip(x[b][slices])
-                view_batch.append(crop)
-            globals_.append(torch.stack(view_batch, dim=0))
-
-        locals_: list[Tensor] = []
-        if self.n_local > 0:
-            for _ in range(self.n_local):
-                scale = self._rand_uniform(*self.local_scale)
-                crop_shape = self._crop_shape(scale, spatial_shape)
-                view_batch = []
-                for b in range(B):
-                    origins = [
-                        int(torch.randint(0, max(1, s - cs + 1), (), generator=self.generator).item())
-                        for s, cs in zip(spatial_shape, crop_shape)
-                    ]
-                    slices = (slice(None),) + tuple(
-                        slice(o, o + cs) for o, cs in zip(origins, crop_shape)
-                    )
-                    crop = self._maybe_flip(x[b][slices])
-                    view_batch.append(crop)
-                locals_.append(torch.stack(view_batch, dim=0))
-
+        globals_ = [self._view(x, self.global_scale) for _ in range(self.n_global)]
+        locals_ = [self._view(x, self.local_scale) for _ in range(self.n_local)]
         return globals_, locals_
