@@ -1,6 +1,8 @@
 """Small helpers for experiment scripts."""
 
 import inspect
+import json
+import re
 from hashlib import sha256
 from pathlib import Path
 import subprocess
@@ -45,6 +47,42 @@ def logish_samples(base, factors, final, N):
             base = base * final
     res = [list(int(xi) for xi in x) for x in res]
     return res
+
+def trace_summary(trace_path: str | Path) -> dict[str, float]:
+    """Averages over the profiled steps of a chrome trace.
+
+    step_ms: wall time per ProfilerStep. gpu_busy: fraction of that wall time covered by GPU
+    kernels/memcpys (overlaps merged). NN_PHASE_ms: host time per step in each `NN_` record_function
+    phase; forward/backward host time is launch time unless the host blocks on the GPU.
+    """
+    events = json.loads(Path(trace_path).read_text())["traceEvents"]
+    steps = [e for e in events if e.get("ph") == "X" and e.get("name", "").startswith("ProfilerStep#")]
+    assert steps, f"no ProfilerStep# spans in {trace_path}"
+    t0 = min(e["ts"] for e in steps)
+    t1 = max(e["ts"] + e["dur"] for e in steps)
+    intervals = sorted(
+        (e["ts"], e["ts"] + e["dur"]) for e in events
+        if e.get("ph") == "X" and e.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset")
+    )
+    busy, end = 0.0, t0
+    for a, b in intervals:
+        a, b = max(a, end), min(b, t1)
+        if b > a:
+            busy += b - a
+            end = b
+    phases: dict[str, float] = {}
+    for e in events:
+        b1 = e.get("ph") == "X" and e.get("cat") == "user_annotation"
+        b2 = re.match(r"\d\d_", e.get("name", "")) is not None
+        if b1 and b2 and t0 <= e["ts"] < t1:
+            phases[e["name"]] = phases.get(e["name"], 0.0) + e["dur"]
+    n = len(steps)
+    return {
+        "step_ms": (t1 - t0) / n / 1e3,
+        "gpu_busy": busy / (t1 - t0),
+        **{f"{k}_ms": v / n / 1e3 for k, v in sorted(phases.items())},
+    }
+
 
 def _entrypoints(namespace):
     return {

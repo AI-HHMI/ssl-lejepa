@@ -63,11 +63,10 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
     monkeypatch.setattr(experiment, "Lejepa", small_model)
 
     def small_model_config(**kwargs):
-        assert kwargs["profile"] is False  # No nested first-forward profiler.
         return LejepaConfig(
             n_layers=1, width=16, num_heads=2, patch_size=(4, 4, 4),
             proj_hidden=16, proj_dim=8, num_slices=4, sigreg_knots=3,
-            n_global=2, n_local=1, profile=False,
+            n_global=2, n_local=1,
         )
 
     monkeypatch.setattr(experiment, "LejepaConfig", small_model_config)

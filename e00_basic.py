@@ -15,7 +15,6 @@ from itertools import product
 
 from lib.models import Lejepa, LejepaConfig
 from lib.util import *
-from lib.profiler import trace_summary
 
 # external 
 
@@ -130,7 +129,6 @@ def run(n:int):
         n_layers = par.n_layers,
         width = 512,
         views = 'basic',
-        profile=False,  # The training loop owns profiling, including backward and I/O.
         lamb = 0.1,
     )
     model = Lejepa(cfg)
@@ -306,7 +304,7 @@ def plot2():
 def table():
     res = loadJsonTable("performance.json")
     trace = loadJsonTable("trace_summary.json")
-    # Host ms per profiled step in each phase (see lib.profiler.trace_summary).
+    # Host ms per profiled step in each phase (see lib.util.trace_summary).
     phases = {"01_DATA_IO_ms": "io ms", "04_FORWARD_AND_LOSS_ms": "fwd ms", "05_BACKWARD_ms": "bwd ms", "06_OPTIMIZER_ms": "opt ms"}
     for k in ["gpu_busy", "step_ms", *phases]:
         res[k] = res.savedir.map(dict(zip(trace.savedir, trace[k]))) if k in trace else float("nan")

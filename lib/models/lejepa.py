@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from math import prod
-from pathlib import Path
-from typing import Any, Iterator, Optional, Tuple, Union
+from typing import Any, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-import torch.profiler
 from torch import Tensor
 
 from lib.encoders import ViT3DEncoder
@@ -106,9 +103,6 @@ class LejepaConfig:
     sigreg_knots: int = 17
     sigreg_tmax: float = 3.0
 
-    # Profiling
-    profile: Optional[Union[str, Path, bool]] = None
-
     # Extra options bag
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -139,7 +133,6 @@ class LejepaConfig:
         num_slices: int = 256,
         sigreg_knots: int = 17,
         sigreg_tmax: float = 3.0,
-        profile: Optional[Union[str, Path, bool]] = None,
         **kwargs: Any,
     ):
         # Resolve aliases
@@ -191,7 +184,6 @@ class LejepaConfig:
         self.num_slices = num_slices
         self.sigreg_knots = sigreg_knots
         self.sigreg_tmax = sigreg_tmax
-        self.profile = profile
         self.extra = kwargs
 
         # Sync kwargs onto self.__dict__ for direct access
@@ -257,8 +249,6 @@ class LejepaConfig:
         ]
         if self.use_projector:
             parts.append(f"proj_dim={self.proj_dim}")
-        if self.profile:
-            parts.append(f"profile={str(self.profile)!r}")
         return f"LejepaConfig({', '.join(parts)})"
 
 
@@ -324,77 +314,6 @@ class Lejepa(nn.Module):
         else:
             self.view_maker = None
 
-        # Profiler configuration
-        if isinstance(self.cfg.profile, (str, Path)):
-            self.profile_path: Optional[Path] = Path(self.cfg.profile)
-        elif self.cfg.profile is True:
-            self.profile_path = Path("profile.out")
-        else:
-            self.profile_path = None
-        self._is_profiling: bool = False
-        self._profile_done: bool = False
-
-    def reset_profile(self) -> None:
-        """Reset the profile_done flag so the next forward pass is profiled."""
-        self._profile_done = False
-
-    def extra_repr(self) -> str:
-        if self.profile_path:
-            return f"profile={str(self.profile_path)!r}"
-        return ""
-
-    @contextmanager
-    def profile_context(
-        self,
-        path: Optional[Union[str, Path]] = None,
-        activities: Optional[list[torch.profiler.ProfilerActivity]] = None,
-        record_shapes: bool = True,
-        profile_memory: bool = True,
-        with_stack: bool = False,
-    ) -> Iterator[Optional[torch.profiler.profile]]:
-        """Context manager that profiles execution with torch.profiler and writes to path."""
-        target_path = Path(path) if path is not None else self.profile_path
-        if target_path is None:
-            yield None
-            return
-
-        if activities is None:
-            activities = [torch.profiler.ProfilerActivity.CPU]
-            if torch.cuda.is_available():
-                activities.append(torch.profiler.ProfilerActivity.CUDA)
-
-        self._is_profiling = True
-        try:
-            with torch.profiler.profile(
-                activities=activities,
-                record_shapes=record_shapes,
-                profile_memory=profile_memory,
-                with_stack=with_stack,
-            ) as prof:
-                yield prof
-        finally:
-            self._is_profiling = False
-
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        sort_by = "cuda_time_total" if torch.cuda.is_available() else "cpu_time_total"
-        table_str = prof.key_averages().table(sort_by=sort_by, row_limit=100)
-
-        try:
-            from lib.profiler import format_bottleneck_report, analyze_key_averages
-            bottleneck_summary = format_bottleneck_report(analyze_key_averages(prof.key_averages()))
-            full_report = bottleneck_summary + "\n" + table_str
-        except Exception:
-            full_report = table_str
-
-        if target_path.suffix == ".json":
-            prof.export_chrome_trace(str(target_path))
-        else:
-            target_path.write_text(full_report)
-            try:
-                prof.export_chrome_trace(str(target_path.with_suffix(".json")))
-            except Exception:
-                pass
-
     def encode(self, x: Tensor) -> Tensor:
         """Encode input volume directly to embedding representations (B, width)."""
         return self.encoder(x)
@@ -410,7 +329,7 @@ class Lejepa(nn.Module):
         emb = self.encode(x)
         return self.project(emb)
 
-    def _forward_impl(
+    def forward(
         self,
         x: Union[Tensor, dict[str, Any]],
         views: Optional[Tuple[list[Tensor], list[Tensor]]] = None,
@@ -476,25 +395,3 @@ class Lejepa(nn.Module):
         patch_vol = prod(self.encoder.patch_embed.patch_size)
         out.n_tokens = sum(v.shape[0] * prod(v.shape[2:]) // patch_vol for v in [*g_views, *l_views])
         return out
-
-    def forward(
-        self,
-        x: Union[Tensor, dict[str, Any]],
-        views: Optional[Tuple[list[Tensor], list[Tensor]]] = None,
-        return_loss: bool = True,
-        **kwargs: Any,
-    ) -> Union[Tensor, LejepaOutput]:
-        """Forward pass through LeJEPA. Automatically profiles if profile path is set."""
-        should_profile = (
-            self.profile_path is not None
-            and not self._is_profiling
-            and (not self._profile_done or self.cfg.extra.get("profile_all_steps", False))
-        )
-        if should_profile:
-            with self.profile_context(self.profile_path):
-                out = self._forward_impl(x, views=views, return_loss=return_loss, **kwargs)
-            self._profile_done = True
-            return out
-        return self._forward_impl(x, views=views, return_loss=return_loss, **kwargs)
-
-

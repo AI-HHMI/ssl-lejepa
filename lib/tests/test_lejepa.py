@@ -86,37 +86,6 @@ def test_model_forward_and_backward():
     assert all(g is not None for g in grads)
 
 
-def test_profiler(tmp_path):
-    prof_file = tmp_path / "profile.out"
-    cfg = LejepaConfig(
-        n_layers=2,
-        width=64,
-        num_heads=2,
-        patch_size=(8, 8, 8),
-        views="basic",
-        profile=str(prof_file),
-    )
-    assert cfg.profile == str(prof_file)
-    model = Lejepa(cfg)
-    assert model.profile_path == prof_file
-
-    x = torch.randn(1, 1, 32, 32, 32)
-    res = model(x)
-    assert "loss" in res
-    assert prof_file.exists()
-    assert prof_file.stat().st_size > 0
-    assert (tmp_path / "profile.json").exists()
-
-    content = prof_file.read_text()
-    assert "BOTTLENECK ANALYSIS SUMMARY" in content
-    assert "CPU Compute" in content
-    assert "Primary Bottleneck" in content
-
-    from lib import analyze_and_format
-    report_json = analyze_and_format(tmp_path / "profile.json")
-    assert "BOTTLENECK ANALYSIS SUMMARY" in report_json
-
-
 def test_view_maker_crops_are_flipped_subblocks():
     B, Z, Y, X = 3, 16, 24, 24
     x = torch.arange(B * Z * Y * X, dtype=torch.float32).view(B, 1, Z, Y, X)
