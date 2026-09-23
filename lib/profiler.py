@@ -211,6 +211,26 @@ def analyze_chrome_trace(json_data: Union[dict, list, str, Path]) -> Dict[str, A
     return _build_result(cat_times, top_ops)
 
 
+def gpu_busy(trace_path: Union[str, Path]) -> float:
+    """Fraction of profiled-step wall time covered by GPU kernels/memcpys (overlaps merged)."""
+    events = json.loads(Path(trace_path).read_text())["traceEvents"]
+    steps = [e for e in events if e.get("ph") == "X" and e.get("name", "").startswith("ProfilerStep#")]
+    assert steps, f"no ProfilerStep# spans in {trace_path}"
+    t0 = min(e["ts"] for e in steps)
+    t1 = max(e["ts"] + e["dur"] for e in steps)
+    intervals = sorted(
+        (e["ts"], e["ts"] + e["dur"]) for e in events
+        if e.get("ph") == "X" and e.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset")
+    )
+    busy, end = 0.0, t0
+    for a, b in intervals:
+        a, b = max(a, end), min(b, t1)
+        if b > a:
+            busy += b - a
+            end = b
+    return busy / (t1 - t0)
+
+
 def _build_result(
     cat_times: Dict[str, float], top_ops: Dict[str, Dict[str, float]]
 ) -> Dict[str, Any]:

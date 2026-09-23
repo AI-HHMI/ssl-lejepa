@@ -15,6 +15,7 @@ from itertools import product
 
 from lib.models import Lejepa, LejepaConfig
 from lib.util import *
+from lib.profiler import gpu_busy
 
 # external 
 
@@ -52,16 +53,15 @@ class Params:
 def allparams():
     params = []
     # patchsize = logish_samples([4, 12, 12], [2,3], 2, 7)[1:]
-    compile = [False, True]
-    batch_size = [42, 84]
-    for i, (c, bs) in enumerate(product(compile, batch_size)):
+    n_workers = [4, 8, 16]
+    for i, nw in enumerate(n_workers):
         p = Params()
-        p.savedir = f"outdir/e00/viewvec/d{i}/"
-        p.n_workers = 4
+        p.savedir = f"outdir/e00/workers/d{i}/"
+        p.n_workers = nw
         p.amp = True
-        p.compile = c
-        p.batch_size = bs
-        print(i, c, bs)
+        p.compile = True
+        p.batch_size = 84
+        print(i, nw)
         params.append(p)
     # pprint(params)
     return params
@@ -144,6 +144,10 @@ def run(n:int):
 
     def save_trace(prof):
         prof.export_chrome_trace(str(savedir / "profile.json"))
+        if use_cuda:
+            busy = gpu_busy(savedir / "profile.json")
+            (savedir / "gpu_busy.json").write_text(json.dumps({"tbl": "gpu_busy", "gpu_busy": busy}) + "\n")
+            print(f"GPU busy during profiled steps: {100 * busy:.0f}%")
         averages = prof.key_averages()
         report = (
             f"Device: {device}; recorded steps (zero-based): "
@@ -280,13 +284,13 @@ def loadJsonTable(filename):
 
 def plot1():
     res = loadJsonTable("metrics.json")
-    px.line(res, x="idx_step", y="loss", color="compile", facet_col="batch_size", facet_row="amp", markers=True).show()
+    px.line(res, x="idx_step", y="loss", color="n_workers", markers=True).show()
 
 def plot2():
     res = loadJsonTable("performance.json")
     res['vox'] = res.patch_size.apply(prod)
     pprint(res.columns)
-    px.bar(res, x="compile", y="tokens_per_second", color="compile", facet_col="batch_size", facet_row="amp", barmode="group").show()
+    px.bar(res, x="n_workers", y="tokens_per_second", color="n_workers", barmode="group").show()
     px.bar(res, x="compile", y="input_mvox_per_second", color="compile", facet_col="batch_size", facet_row="amp", barmode="group").show()
 
 def table():
