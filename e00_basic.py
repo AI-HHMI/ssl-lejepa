@@ -74,7 +74,7 @@ def allparams():
     # d0 trains on the EB train split (~850x coverage per voxel); d1 adds hemibrain crops 002 + 003 (~30x).
     for i, data in enumerate(["hemibrain_eb", "hemibrain_wide"]):
         p = Params()
-        p.savedir = f"outdir/e00/train6h_hemi/d{i}/"
+        p.savedir = f"outdir/e00/train6h_hemi_coslr/d{i}/"
         p.data = data
         p.views = "displace"
         p.patch_size = (128, 128, 128)
@@ -560,14 +560,14 @@ def table():
         # "local_size": "local",
         # "compile": "compile",
         # "cudagraphs": "cudagraphs",
-        "width": "width",
-        "defer_image_ops": "defer",
+        # "width": "width",
+        # "defer_image_ops": "defer",
         # "compile_blocks": "blocks",
         # "grad_compress": "compress",
         # "batch_views": "batch views",
         "n_gpus": "gpus",
-        "batch_size": "batch",
-        "n_workers": "workers",
+        # "batch_size": "batch",
+        # "n_workers": "workers",
         "gpu_busy": "gpu busy %",
         "samples_per_second": "samples/s",
         "tokens_per_second": "tok/s",
