@@ -277,7 +277,7 @@ def runlsf(n:int):
     wipedir(par.savedir)
     RUN_NAME = "e00_basic"
     cmd = f""" bsub -J {RUN_NAME} \
-        -W 4:00 \
+        -W 0:15 \
         -P miaai \
         -n {par.n_gpus * (par.n_workers + 1)} \
         -R "span[hosts=1]" \
