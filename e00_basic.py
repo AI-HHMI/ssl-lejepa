@@ -36,6 +36,9 @@ class Params:
     batch_size: int = 42
     steps_per_epoch: int = 71  # warmup + benchmark + 1 profiler warmup + profile steps: stop right after profiling
     n_layers: int = 12
+    views: Views = "basic"  # 'basic' (random scales) or 'displace' (fixed sizes below, locals inside globals)
+    global_size: Tup3Int = (40, 128, 128)  # displace only
+    local_size: Tup3Int = (32, 96, 96)  # displace only
 
     # optimizations
     f32mode: F32Mode = "high"
@@ -43,9 +46,6 @@ class Params:
     prefetch_factor: int = 2
     amp: bool = False  # bf16 autocast for forward + loss
     compile: bool = False  # torch.compile(dynamic=True) the encoder
-    views: Views = "basic"  # 'basic' (random scales) or 'displace' (fixed sizes below, locals inside globals)
-    global_size: Tup3Int = (40, 128, 128)  # displace only
-    local_size: Tup3Int = (32, 96, 96)  # displace only
     n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); batch_size and n_workers are per GPU
 
     # profiling params
@@ -56,16 +56,18 @@ class Params:
 def allparams():
     params = []
     # patchsize = logish_samples([4, 12, 12], [2,3], 2, 7)[1:]
+    views: list[Views] = ["basic", "displace"]
     n_gpus = [1, 2, 4, 8]
-    for i, ng in enumerate(n_gpus):
+    for i, (v, ng) in enumerate(product(views, n_gpus)):
         p = Params()
-        p.savedir = f"outdir/e00/ddp/d{i}/"
+        p.savedir = f"outdir/e00/views/d{i}/"
+        p.views = v
         p.n_gpus = ng
         p.n_workers = 8
         p.amp = True
         p.compile = True
         p.batch_size = 84
-        print(i, ng)
+        print(i, v, ng)
         params.append(p)
     # pprint(params)
     return params
@@ -329,13 +331,14 @@ def loadJsonTable(filename):
 
 def plot1():
     res = loadJsonTable("metrics.json")
-    px.line(res, x="idx_step", y="loss", color="n_workers", markers=True).show()
+    px.line(res, x="idx_step", y="loss", color="views", facet_col="n_gpus", markers=True).show()
 
 def plot2():
     res = loadJsonTable("performance.json")
     res['vox'] = res.patch_size.apply(prod)
     pprint(res.columns)
-    px.bar(res, x="n_workers", y="tokens_per_second", color="n_workers", barmode="group").show()
+    res["tokens_per_second_per_gpu"] = res.tokens_per_second / res.n_gpus
+    px.line(res, x="n_gpus", y="tokens_per_second_per_gpu", color="views", markers=True).show()
     px.bar(res, x="compile", y="input_mvox_per_second", color="compile", facet_col="batch_size", facet_row="amp", barmode="group").show()
 
 def table():
@@ -346,7 +349,7 @@ def table():
     for k in ["gpu_busy", "step_ms", *phases]:
         res[k] = res.savedir.map(dict(zip(trace.savedir, trace[k]))) if k in trace else float("nan")
     cols = {
-        "savedir": "run", "compile": "compile", "n_gpus": "gpus", "batch_size": "batch", "n_workers": "workers",
+        "savedir": "run", "views": "views", "compile": "compile", "n_gpus": "gpus", "batch_size": "batch", "n_workers": "workers",
         "gpu_busy": "gpu busy %", "samples_per_second": "samples/s",
         "tokens_per_second": "tok/s", "input_mvox_per_second": "Mvox/s",
         "step_ms": "prof step ms", **phases,
