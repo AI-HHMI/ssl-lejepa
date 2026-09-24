@@ -324,18 +324,30 @@ def loadJsonTable(filename):
     # pprint(res)
     return res
 
+def short_runs(savedirs):
+    """savedir relative to the sweep's common prefix, e.g. 'outdir/e00/x/d3/' -> 'd3'."""
+    prefix = os.path.commonpath(list(savedirs))
+    return savedirs.str[len(prefix):].str.strip("/")
+
 def plot1():
+    """Loss curves, one line per run (and per repeat of a run), faceted by n_gpus."""
     res = loadJsonTable("metrics.json")
-    px.line(res, x="idx_step", y="loss", color="views", facet_col="n_gpus", markers=True).show()
+    assert len(res), "no metrics.json rows for allparams(); run ./pull.sh?"
+    # Repeats append to the same metrics.json; each restarts at idx_step 0.
+    repeat = (res.idx_step == 0).groupby(res.savedir).cumsum() - 1
+    res["run"] = short_runs(res.savedir) + repeat.map(lambda k: f".{k}" if k else "")
+    res["sizes"] = res.patch_size.astype(str) + " " + res.global_size.astype(str) + " " + res.local_size.astype(str)
+    px.line(res, x="idx_step", y="loss", color="run", line_dash="views", facet_col="n_gpus",
+            hover_data=["sizes", "n_workers"], markers=True).show()
 
 def plot2():
     """ktok/s per GPU: one bar per result row, bars grouped by n_gpus with gaps between groups, colored by views."""
     res = loadJsonTable("performance.json")
     res["ktok_s_per_gpu"] = res.tokens_per_second / res.n_gpus / 1e3
-    # Bar label: savedir relative to the sweep's common prefix, plus a suffix for repeated rows in one run.
-    prefix = os.path.commonpath(list(res.savedir))
+    assert len(res), "no performance.json rows for allparams(); run ./pull.sh?"
+    # Bar label: short run name, plus a suffix for repeated rows in one run.
     repeat = res.groupby("savedir").cumcount()
-    res["run"] = res.savedir.str[len(prefix):].str.strip("/") + repeat.map(lambda k: f".{k}" if k else "")
+    res["run"] = short_runs(res.savedir) + repeat.map(lambda k: f".{k}" if k else "")
     res = res.sort_values(["n_gpus", "n_workers", "run"]).reset_index(drop=True)
     # x positions: consecutive within a group, GROUP_GAP extra slots between groups.
     GROUP_GAP = 0.8
