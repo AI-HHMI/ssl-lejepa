@@ -48,6 +48,8 @@ class Params:
     amp: bool = True  # bf16 autocast for forward + loss
     compile: bool = True  # torch.compile(dynamic=True) the encoder
     cudagraphs: bool = False  # instead compile static with CUDA graphs (mode="reduce-overhead"); needs compile + displace views
+    compile_blocks: bool = False  # compile each transformer block separately so DDP can overlap all-reduce with backward
+    grad_compress: bool = False  # DDP bf16_compress_hook: all-reduce gradients in bf16 (half the bytes)
     n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); batch_size and n_workers are per GPU
 
     # profiling params
@@ -57,18 +59,20 @@ class Params:
 
 def allparams():
     params = []
-    # Does removing CPU launch overhead (CUDA graphs) fix DDP scaling under data-worker CPU contention?
-    # cudagraphs x n_gpus at 8 workers, plus 4 workers at 8 GPUs (fewer competing processes).
-    runs = [(cg, ng, 8) for cg in [False, True] for ng in [1, 2, 4, 8]] + [(cg, 8, 4) for cg in [False, True]]
-    for i, (cg, ng, nw) in enumerate(runs):
+    # 8-GPU all-reduce cost: bf16 gradient compression x per-block compile (overlap with backward),
+    # with 1-GPU baselines. All jobs now get 12 cores per GPU (full node at 8 GPUs).
+    runs = [(1, False, False), (1, True, False)] + [(8, b, c) for b in [False, True] for c in [False, True]]
+    for i, (ng, blocks, compress) in enumerate(runs):
         p = Params()
-        p.savedir = f"outdir/e00/cudagraphs/d{i}/"
+        p.savedir = f"outdir/e00/allreduce/d{i}/"
         p.views = "displace"
         p.patch_size = (128, 128, 128)
         p.global_size = (96, 96, 96)
         p.local_size = (64, 64, 64)
-        p.cudagraphs = cg
-        p.n_workers = nw  # 8 GPUs x (8 + 1) = 72 CPU slots fits a 96-core node
+        p.cudagraphs = True
+        p.compile_blocks = blocks
+        p.grad_compress = compress
+        p.n_workers = 8
         p.n_gpus = ng
         params.append(p)
     # pprint(params)
@@ -157,19 +161,26 @@ def run(n:int):
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
     print(f"Rank {rank}/{world_size} is using torch device {device} .")
     model = model.to(device)
-    assert par.compile or not par.cudagraphs, "cudagraphs requires compile"
+    assert par.compile or not (par.cudagraphs or par.compile_blocks), "cudagraphs / compile_blocks require compile"
     if par.compile:
         torch._logging.set_logs(recompiles=True)  # recompiles show up in job_*.log
         if par.cudagraphs:
             # CUDA graphs replay whole kernel sequences, removing per-kernel CPU launch cost.
             # They need static shapes: displace has exactly 2 view shapes, basic has ~9.
             assert par.views == "displace", "cudagraphs needs views='displace' (few static shapes)"
-            model.encoder.compile(mode="reduce-overhead", dynamic=False)
+            kwargs = dict(mode="reduce-overhead", dynamic=False)
         else:
-            model.encoder.compile(dynamic=True)  # Views change shape every step.
+            kwargs = dict(dynamic=True)  # Views change shape every step.
+        # A whole-encoder compile releases every gradient at the end of one fused backward, so DDP can't
+        # start all-reducing until backward is done. Per-block compile releases each block's grads as it finishes.
+        for m in (model.encoder.blocks if par.compile_blocks else [model.encoder]):
+            m.compile(**kwargs)
     if world_size > 1:
         # SIGReg and projector BatchNorm statistics stay per-rank (local batch) for now.
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank] if device.type == "cuda" else None)
+        if par.grad_compress:
+            from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
+            model.register_comm_hook(None, default_hooks.bf16_compress_hook)
     opt = torch.optim.Adam(model.parameters(), lr = 1e-4)
     use_cuda = device.type == "cuda"
     activities = [torch.profiler.ProfilerActivity.CPU]
@@ -287,10 +298,12 @@ def runlsf(n:int):
     par:Params = allparams()[n]
     wipedir(par.savedir)
     RUN_NAME = "e00_basic"
+    CPUS_PER_GPU = 12  # 8 GPUs -> all 96 cores; training processes need cores beyond the data workers
+    assert par.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={par.n_workers} leaves no core for the training process"
     cmd = f""" bsub -J {RUN_NAME} \
         -W 0:15 \
         -P miaai \
-        -n {par.n_gpus * (par.n_workers + 1)} \
+        -n {par.n_gpus * CPUS_PER_GPU} \
         -R "span[hosts=1]" \
         -gpu "num={par.n_gpus}:mode=exclusive_process" \
         -q gpu_h200 \
@@ -352,14 +365,14 @@ def plot1():
             hover_data=["sizes", "n_workers"], markers=True).show()
 
 def plot2():
-    """ktok/s per GPU: one bar per result row, bars grouped by n_gpus with gaps between groups, colored by cudagraphs + workers."""
+    """ktok/s per GPU: one bar per result row, bars grouped by n_gpus with gaps between groups, colored by compile_blocks + grad_compress."""
     res = loadJsonTable("performance.json")
     res["ktok_s_per_gpu"] = res.tokens_per_second / res.n_gpus / 1e3
     assert len(res), "no performance.json rows for allparams(); run ./pull.sh?"
     # Bar label: short run name, plus a suffix for repeated rows in one run.
     repeat = res.groupby("savedir").cumcount()
     res["run"] = short_runs(res.savedir) + repeat.map(lambda k: f".{k}" if k else "")
-    res["color"] = "cudagraphs=" + res.cudagraphs.astype(str) + ", workers=" + res.n_workers.astype(str)
+    res["color"] = "blocks=" + res.compile_blocks.astype(str) + ", compress=" + res.grad_compress.astype(str)
     res = res.sort_values(["n_gpus", "color", "run"]).reset_index(drop=True)
     # x positions: consecutive within a group, GROUP_GAP extra slots between groups.
     GROUP_GAP = 0.8
@@ -383,7 +396,7 @@ def table():
         res[k] = res.savedir.map(dict(zip(trace.savedir, trace[k]))) if k in trace else float("nan")
     cols = {
         "savedir": "run", "views": "views", "patch_size": "input", "global_size": "global", "local_size": "local",
-        "compile": "compile", "cudagraphs": "cudagraphs", "n_gpus": "gpus", "batch_size": "batch", "n_workers": "workers",
+        "compile": "compile", "cudagraphs": "cudagraphs", "compile_blocks": "blocks", "grad_compress": "compress", "n_gpus": "gpus", "batch_size": "batch", "n_workers": "workers",
         "gpu_busy": "gpu busy %", "samples_per_second": "samples/s",
         "tokens_per_second": "tok/s", "input_mvox_per_second": "Mvox/s",
         "step_ms": "prof step ms", **phases,
