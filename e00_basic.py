@@ -24,6 +24,7 @@ from miao.config import MiaoConfig
 from miao import VolumeDataset, collate_deferred, finish_images
 
 from rich import print as pprint
+import numpy as np
 import pandas
 import plotly.express as px
 import plotly.graph_objects as go
@@ -97,6 +98,17 @@ def collate_images(samples):
     import torch
     return torch.stack([s["img"] for s in samples])
 
+def lejepa_config(par: Params):
+    return LejepaConfig(
+        n_layers = par.n_layers,
+        width = par.width,
+        views = par.views,
+        global_size = par.global_size,
+        local_size = par.local_size,
+        batch_views = par.batch_views,
+        lamb = 0.1,
+    )
+
 def run(n:int):
     start_time = time.time()
     par : Params = allparams()[n]
@@ -159,16 +171,7 @@ def run(n:int):
             rfile.write(json.dumps({k:gp[k] for k in ['commit_id', 'diff_hash']}) + "\n")
             difflog.write(json.dumps({gp['diff_hash']:gp['diff']}) + "\n")
 
-    cfg = LejepaConfig(
-        n_layers = par.n_layers,
-        width = par.width,
-        views = par.views,
-        global_size = par.global_size,
-        local_size = par.local_size,
-        batch_views = par.batch_views,
-        lamb = 0.1,
-    )
-    model = Lejepa(cfg)
+    model = Lejepa(lejepa_config(par))
     if rank0: pprint(model)
 
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
