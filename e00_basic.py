@@ -15,6 +15,7 @@ from itertools import product
 
 from lib.data import HEMIBRAIN_EB, TRAIN_BOXES
 from lib.models import Lejepa, LejepaConfig
+from lib.views import ViewMaker
 from lib.util import *
 from lib.types import *
 
@@ -110,30 +111,31 @@ def lejepa_config(par: Params):
         lamb = 0.1,
     )
 
-def run(n:int):
-    start_time = time.time()
-    par : Params = allparams()[n]
-    if min(par.warmup_steps, par.benchmark_steps, par.profile_steps) < 0:
-        raise ValueError("Profiling and benchmark step counts must be nonnegative")
-    # lmd.set_data_root("/Volumes/miaai/lmd-v0.0.1/data")
-    # volumes = [x.to_miao() for x in lmd.all() if "flyliconn" in x.name]
-
+def save_view_pngs(par: Params, dataset, n_samples: int = 3):
+    """Save what the model sees: for n_samples fresh samples, the input and each of its views, as
+    center-z slices at native voxel size, left to right (input | globals | locals) -> savedir/views_{i}.png."""
     import torch
-    import torch.distributed as dist
-    torch.set_float32_matmul_precision(par.f32mode)
+    from PIL import Image
+    cfg = lejepa_config(par)
+    patch = (cfg.patch_size,) * 3 if isinstance(cfg.patch_size, int) else tuple(cfg.patch_size)
+    maker = ViewMaker(n_global=cfg.n_global, n_local=cfg.n_local, global_scale=cfg.global_scale, local_scale=cfg.local_scale,
+                      flip=cfg.flip, patch_size=patch, views=cfg.views, global_size=cfg.global_size, local_size=cfg.local_size)
+    samples = [dataset[i] for i in range(n_samples)]
+    x = finish_images(collate_deferred(samples))["img"] if par.defer_image_ops else collate_images(samples)  # Batch C Z Y X
+    globals_, locals_ = maker(x)
+    to_u8 = lambda v: (v[0, v.shape[1] // 2].clamp(0, 1) * 255).byte().numpy()  # C Z Y X -> Y X center slice
+    savedir = Path(par.savedir)
+    savedir.mkdir(parents=True, exist_ok=True)
+    for b in range(n_samples):
+        panels = [to_u8(v[b]) for v in [x, *globals_, *locals_]]
+        # Bottom-pad smaller views to the input height and separate panels with a white gap.
+        panels = [np.pad(p, ((0, x.shape[-2] - p.shape[0]), (0, 8)), constant_values=255) for p in panels]
+        Image.fromarray(np.concatenate(panels, axis=1)).save(savedir / f"views_{b}.png")
+    print(f"Saved {n_samples} input + view slices to {savedir}/views_*.png", flush=True)
 
-    # Set by torchrun. Unset (plain `python`, tests) means a single process.
-    # Don't seed torch identically across ranks: DataLoader workers derive miao's numpy seed from it.
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    rank = int(os.environ.get("RANK", 0))
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    assert world_size == par.n_gpus, f"launched {world_size} ranks but par.n_gpus={par.n_gpus}"
-    rank0 = rank == 0
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-    if world_size > 1:
-        dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo")
-
+def dataloader(n:int):
+    import torch
+    par: Params = allparams()[n]
     # volumes = [x.to_miao() for x in lmd.all() if x.name == "exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001"]
     # Training volumes (lib/data.py), images only. Boxes are x y z; output is z y x.
     # With several volumes miao samples each equally (size_weighting_exponent=0); the wide crops are ~equal size.
@@ -159,10 +161,38 @@ def run(n:int):
       multiprocessing_context="spawn",
     )
     batches = iter(loader)
+    if int(os.environ.get("RANK", 0)) == 0:
+        save_view_pngs(par, dl)
+    return batches
+
+def run(n:int):
+    start_time = time.time()
+    par : Params = allparams()[n]
+    if min(par.warmup_steps, par.benchmark_steps, par.profile_steps) < 0:
+        raise ValueError("Profiling and benchmark step counts must be nonnegative")
+    # lmd.set_data_root("/Volumes/miaai/lmd-v0.0.1/data")
+    # volumes = [x.to_miao() for x in lmd.all() if "flyliconn" in x.name]
+
+    import torch
+    import torch.distributed as dist
+    torch.set_float32_matmul_precision(par.f32mode)
+
+    # Set by torchrun. Unset (plain `python`, tests) means a single process.
+    # Don't seed torch identically across ranks: DataLoader workers derive miao's numpy seed from it.
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    assert world_size == par.n_gpus, f"launched {world_size} ranks but par.n_gpus={par.n_gpus}"
+    rank0 = rank == 0
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    if world_size > 1:
+        dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo")
 
     # pprint(volumes)
     # pprint(mcfg)
     # pprint(dl[0]['img'].shape)
+    batches = dataloader(n)
 
     savedir = Path(par.savedir)
 
