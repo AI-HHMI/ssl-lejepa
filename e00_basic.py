@@ -21,7 +21,7 @@ from lib.types import *
 
 import lmd_catalog as lmd
 from miao.config import MiaoConfig
-from miao import VolumeDataset
+from miao import VolumeDataset, collate_deferred, finish_images
 
 from rich import print as pprint
 import pandas
@@ -41,6 +41,7 @@ class Params:
     batch_size: int = 84
     steps_per_epoch: int = 71  # warmup + benchmark + 1 profiler warmup + profile steps: stop right after profiling
     n_layers: int = 12
+    width: int = 512  # encoder width; heads = width // 64
     views: Views = "basic"  # 'basic' (random scales) or 'displace' (fixed sizes below, locals inside globals)
     global_size: Tup3Int = (88, 88, 88)  # displace only
     local_size: Tup3Int = (56, 56, 56)  # displace only
@@ -53,6 +54,7 @@ class Params:
     compile: bool = True  # torch.compile(dynamic=True) the encoder
     cudagraphs: bool = False  # instead compile static with CUDA graphs (mode="reduce-overhead"); needs compile + displace views
     compile_blocks: bool = False  # compile each transformer block separately so DDP can overlap all-reduce with backward
+    defer_image_ops: bool = False  # workers ship uint8 crops; cast + normalize on the GPU (miao.finish_images)
     batch_views: bool = False  # one encoder call per group of same-shape views (2 per step with displace)
     grad_compress: bool = False  # DDP bf16_compress_hook: all-reduce gradients in bf16 (half the bytes)
     n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); batch_size and n_workers are per GPU
@@ -64,17 +66,19 @@ class Params:
 
 def allparams():
     params = []
-    # Batched encoder calls (2 per step: all globals, all locals) vs one call per view (6), at 1 and 8 GPUs.
-    runs = [(bv, ng) for ng in [1, 8] for bv in [False, True]]
-    for i, (bv, ng) in enumerate(runs):
+    # Wider encoders at 1 GPU (MFU vs width), and uint8 transfer (defer_image_ops) at 1 and 8 GPUs.
+    runs = [(w, False, 1) for w in [512, 768, 1024]] + [(512, True, 1)] + [(512, d, 8) for d in [False, True]]
+    for i, (w, defer, ng) in enumerate(runs):
         p = Params()
-        p.savedir = f"outdir/e00/batchviews/d{i}/"
+        p.savedir = f"outdir/e00/width-defer/d{i}/"
         p.views = "displace"
         p.patch_size = (128, 128, 128)
         p.global_size = (96, 96, 96)
         p.local_size = (64, 64, 64)
         p.cudagraphs = True
-        p.batch_views = bv
+        p.batch_views = True
+        p.width = w
+        p.defer_image_ops = defer
         p.n_workers = 8
         p.n_gpus = ng
         params.append(p)
@@ -125,13 +129,14 @@ def run(n:int):
         samples_per_epoch=par.batch_size * (par.steps_per_epoch + par.n_workers * par.prefetch_factor),
         sampling="random",
         output_axes="lzyx",
+        defer_image_ops=par.defer_image_ops,
     )
     dl = VolumeDataset(mcfg)
     loader = torch.utils.data.DataLoader(
       dl,
       batch_size=par.batch_size,
       num_workers=par.n_workers,
-      collate_fn=collate_images,
+      collate_fn=collate_deferred if par.defer_image_ops else collate_images,
       prefetch_factor=par.prefetch_factor,
       pin_memory=torch.cuda.is_available(),
       multiprocessing_context="spawn",
@@ -152,7 +157,7 @@ def run(n:int):
 
     cfg = LejepaConfig(
         n_layers = par.n_layers,
-        width = 512,
+        width = par.width,
         views = par.views,
         global_size = par.global_size,
         local_size = par.local_size,
@@ -249,7 +254,8 @@ def run(n:int):
             with phase("01_DATA_IO"):
                 x = next(batches)
             with phase("03_H2D_TRANSFER"):
-                x = x.to(device, non_blocking=True)
+                # Deferred batches are dicts of per-sample uint8 crops; finish_images copies and normalizes them.
+                x = finish_images(x, device)["img"] if par.defer_image_ops else x.to(device, non_blocking=True)
             with phase("04_FORWARD_AND_LOSS"), torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.amp):
                 out = model(x)
             if benchmark_started is not None:
@@ -293,6 +299,7 @@ def run(n:int):
                     assert len(peaks) == 1, f"add {gpu!r} to PEAK_BF16_TFLOPS"
                     result["gpu_name"] = gpu
                     result["mfu"] = result["tflops_per_second"] / world_size / peaks[0]
+                    result["max_mem_gb"] = torch.cuda.max_memory_allocated(device) / 1e9
                 if rank0:
                     with open(savedir / "performance.json", "a") as f:
                         f.write(json.dumps(result) + "\n")
@@ -379,14 +386,14 @@ def plot1():
             hover_data=["sizes", "n_workers"], markers=True).show()
 
 def plot2():
-    """ktok/s per GPU: one bar per result row, bars grouped by n_gpus with gaps between groups, colored by batch_views."""
+    """ktok/s per GPU: one bar per result row, bars grouped by n_gpus with gaps between groups, colored by width + defer_image_ops."""
     res = loadJsonTable("performance.json")
     res["ktok_s_per_gpu"] = res.tokens_per_second / res.n_gpus / 1e3
     assert len(res), "no performance.json rows for allparams(); run ./pull.sh?"
     # Bar label: short run name, plus a suffix for repeated rows in one run.
     repeat = res.groupby("savedir").cumcount()
     res["run"] = short_runs(res.savedir) + repeat.map(lambda k: f".{k}" if k else "")
-    res["color"] = "batch_views=" + res.batch_views.astype(str)
+    res["color"] = "width=" + res.width.astype(str) + ", defer=" + res.defer_image_ops.astype(str)
     res = res.sort_values(["n_gpus", "color", "run"]).reset_index(drop=True)
     # x positions: consecutive within a group, GROUP_GAP extra slots between groups.
     GROUP_GAP = 0.8
@@ -416,9 +423,11 @@ def table():
         # "local_size": "local",
         # "compile": "compile",
         # "cudagraphs": "cudagraphs",
+        "width": "width",
+        "defer_image_ops": "defer",
         # "compile_blocks": "blocks",
         # "grad_compress": "compress",
-        "batch_views": "batch views",
+        # "batch_views": "batch views",
         "n_gpus": "gpus",
         "batch_size": "batch",
         "n_workers": "workers",
@@ -427,6 +436,7 @@ def table():
         "tokens_per_second": "tok/s",
         "tflops_per_second": "TFLOP/s",
         "mfu": "mfu %",
+        "max_mem_gb": "mem GB",
         "input_mvox_per_second": "Mvox/s",
         "step_ms": "prof step ms",
         **phases,
