@@ -33,7 +33,7 @@ class Params:
     savedir: str = "outdir/e00/main/basic/"
     # patch_size: list[int] = field(default_factory=lambda: [104, 232, 232])
     patch_size: Tup3Int = (48, 144, 144)
-    batch_size: int = 42
+    batch_size: int = 84
     steps_per_epoch: int = 71  # warmup + benchmark + 1 profiler warmup + profile steps: stop right after profiling
     n_layers: int = 12
     views: Views = "basic"  # 'basic' (random scales) or 'displace' (fixed sizes below, locals inside globals)
@@ -42,10 +42,10 @@ class Params:
 
     # optimizations
     f32mode: F32Mode = "high"
-    n_workers: int = 2
+    n_workers: int = 8
     prefetch_factor: int = 2
-    amp: bool = False  # bf16 autocast for forward + loss
-    compile: bool = False  # torch.compile(dynamic=True) the encoder
+    amp: bool = True  # bf16 autocast for forward + loss
+    compile: bool = True  # torch.compile(dynamic=True) the encoder
     n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); batch_size and n_workers are per GPU
 
     # profiling params
@@ -55,7 +55,6 @@ class Params:
 
 def allparams():
     params = []
-    # patchsize = logish_samples([4, 12, 12], [2,3], 2, 7)[1:]
     views: list[Views] = ["basic", "displace"]
     n_gpus = [1, 2, 4, 8]
     for i, (v, ng) in enumerate(product(views, n_gpus)):
@@ -63,11 +62,6 @@ def allparams():
         p.savedir = f"outdir/e00/views/d{i}/"
         p.views = v
         p.n_gpus = ng
-        p.n_workers = 8
-        p.amp = True
-        p.compile = True
-        p.batch_size = 84
-        print(i, v, ng)
         params.append(p)
     # pprint(params)
     return params
