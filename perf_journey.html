@@ -71,17 +71,17 @@
 
   <div class="tiles">
     <div class="card tile"><div class="num">5.0×</div><div class="lbl">single-GPU speedup on B300</div><div class="note">267 → 1,333 ktok/s</div></div>
-    <div class="card tile"><div class="num">8.1M</div><div class="lbl">tokens/s on one 8×B300 node</div><div class="note">30× the fp32 single-GPU start</div></div>
-    <div class="card tile"><div class="num">6.5M</div><div class="lbl">tokens/s on one 8×H200 node</div><div class="note">hemibrain 128³, displace views, CUDA graphs</div></div>
-    <div class="card tile"><div class="num">~80%</div><div class="lbl">8-GPU scaling efficiency</div><div class="note">the remaining gap is ranks waiting on each other</div></div>
+    <div class="card tile"><div class="num">7.8M</div><div class="lbl">tokens/s on one 8×H200 node</div><div class="note">hemibrain 128³, displace views (8×B300 old setup: 8.1M)</div></div>
+    <div class="card tile"><div class="num">94%</div><div class="lbl">8-GPU scaling efficiency</div><div class="note">was 76–83% until we shipped uint8 instead of float32</div></div>
+    <div class="card tile"><div class="num">33%</div><div class="lbl">MFU on one H200</div><div class="note">GPU-bound, 99% busy; 38% at width 768</div></div>
   </div>
 
   <h2>Per-GPU throughput, one change at a time</h2>
   <div class="card">
     <p class="chart-title">Encoder tokens per second per GPU (thousands)</p>
-    <p class="chart-sub">Unprofiled 50-step benchmark window. Bars in each hardware phase share a setup and can be compared; the two phases can't (different GPU, dataset, crop sizes and view scheme). Hover a bar for details.</p>
+    <p class="chart-sub">Unprofiled 50-step benchmark window. Bars in each hardware phase share a setup and can be compared; the two phases can't (different GPU, dataset, crop sizes and view scheme). Within the H200 phase, the 1-GPU steps come first, then the same steps at 8 GPUs. Labels on 8-GPU bars are per-GPU throughput as a percentage of the best 1-GPU run at that point. Hover a bar for details.</p>
     <div class="legend"><span style="--c: var(--series-1)">B300 · flyliconn 48×144×144 · basic views</span><span style="--c: var(--series-2)">H200 · hemibrain EB 128³ · displace views</span></div>
-    <svg id="journey" viewBox="0 0 1000 470" role="img" aria-label="Bar chart of per-GPU throughput for each optimization step"></svg>
+    <svg id="journey" viewBox="0 0 1000 490" role="img" aria-label="Bar chart of per-GPU throughput for each optimization step"></svg>
     <details><summary>Table view</summary><table id="journey-table"></table></details>
   </div>
 
@@ -120,6 +120,15 @@
       <li style="--c: var(--series-2)"><div class="h">Give the 8-GPU job the whole node</div>
         Cutting to 4 workers per GPU was much worse, because LSF gives a job one core per requested slot, so fewer workers also meant fewer cores for the training processes. We now request 12 cores per GPU (all 96 at 8 GPUs), whatever the worker count.
         <div class="res">759 → 812 ktok/s per GPU at 8 GPUs, 6.5M tok/s per node, 83% scaling.</div></li>
+      <li style="--c: var(--series-2)"><div class="h">Batch the encoder calls</div>
+        Displace views share shapes, so all globals go through the encoder as one batch and all locals as another: 2 calls per step instead of 6. The projector's BatchNorm then pools statistics over each group. CPU-side forward time fell 40–55%, but the GPU was already ~99% busy.
+        <div class="res">+3% at 1 GPU (1,023 ktok/s) and at 8 GPUs (835 per GPU).</div></li>
+      <li style="--c: var(--series-2)"><div class="h">Ship uint8, normalize on the GPU</div>
+        Workers used to hand over float32 samples: ~705 MB per step per GPU through shared memory, a pinned-memory copy and the host-to-device copy, 8 times over on a full node. With miao's <code>defer_image_ops</code> they send the raw uint8 crops (4× smaller), and <code>finish_images</code> casts and normalizes on the GPU. CPU-side backward time at 8 GPUs fell from 460 to 200 ms per step, and ranks stopped waiting on each other at the all-reduce.
+        <div class="res">8 GPUs: 805 → 975 ktok/s per GPU, <b>7.8M tok/s per node, 94% scaling</b>. 1 GPU: +1.4% (1,036).</div></li>
+      <li style="--c: var(--series-2)"><div class="h">Count FLOPs: MFU, and wider models</div>
+        Each step now logs model training FLOPs from the actual view shapes (6 × params per token, plus attention), TFLOP/s, MFU against the GPU's dense bf16 peak, and peak memory. Width 512 runs at 33% MFU on one H200. Width 768 reaches 38% (larger matmuls) but peaks at 142 GB at batch 84, right at the H200's limit. Width 1024 ran out of memory at batch 84.
+        <div class="res">Wider is more efficient per FLOP but costs ~2× per token. The first 6 h training runs use width 512.</div></li>
     </ol>
   </div>
 
@@ -141,7 +150,8 @@
         <li><b>A profile is only as representative as the steps it covers.</b> Idle data workers made the node look healthier than it was.</li>
         <li><b>Normalize by work actually done.</b> Mvox/s hid a 27% token-count change caused by a padding tweak.</li>
         <li><b>Check the hardware before comparing.</b> One queue change (B300 → H200) looked like a 30% regression in the view scheme.</li>
-        <li><b>Run-to-run noise is about ±5–10%</b> across nodes. Anything smaller needs repeats.</li>
+        <li><b>Host memory traffic grows with the GPU count.</b> Float32 samples cost nothing on one GPU and 15% of throughput on eight. Ship the smallest dtype the GPU can finish.</li>
+        <li><b>Repeats agree to within ~1%</b> for the same config on the same GPU type. Earlier "±5–10%" came from comparing runs that differed in more than the knob under test.</li>
         <li><b>Throughput changes can change training.</b> Rounding crop sizes, dropping padding, and per-rank SIGReg all change what the model learns.</li>
       </ul></div>
     </div>
@@ -149,12 +159,12 @@
 
   <h2>Where the time still goes, and what's next</h2>
   <div class="card">
-    <p>At 8 H200s a step takes about 0.56 s vs 0.47 s on one GPU, so about 90 ms per step is lost. It shows up as NCCL all-reduce kernels waiting (about 130 ms/step), not bandwidth: the gradients are only about 175 MB. The leading suspect is CPU-side load that grows with the GPU count. Every sample reaches the training process as float32 (~705 MB per step per GPU), going through shared memory, a pinned-memory copy, and the host-to-device copy.</p>
+    <p>On one H200 we're GPU-bound: 99% busy at about 33% MFU. Matmuls and attention take only about 58% of GPU time; the rest is layernorm, GELU, casts and other memory-bound kernels, which a width-512 model can't hide. At 8 GPUs, scaling is 94% now that samples cross the host as uint8. The first two 6-hour training runs (<code>outdir/e00/train6h/</code>) use this setup: 8×H200, width 512, EB-only vs. hemibrain crops 002 + 003 (2 Tvox, with EB's validation and test regions cut out).</p>
     <ul>
-      <li><b>Send uint8, normalize on the GPU</b> (miao <code>defer_image_ops</code>, as Gary's configs do). That's 4× less host memory traffic.</li>
-      <li><b>Log per-rank step times</b> to confirm directly that ranks are waiting on each other.</li>
-      <li><b>Fewer, larger encoder calls:</b> batch all globals and all locals together (2 encoder calls instead of 6). This is now possible because displace views share shapes.</li>
-      <li><b>Before real training:</b> compute SIGReg statistics across all GPUs and use SyncBatchNorm in the projector.</li>
+      <li><b>Wider models</b> (768, batch 64 for memory headroom) for the next training run: higher MFU, and usually better SSL features.</li>
+      <li><b>Look at the non-matmul ~40%</b> of GPU time (patch-embed conv, layernorm, GELU) for poorly fused kernels.</li>
+      <li><b>Before relying on multi-GPU results:</b> compute SIGReg statistics across all GPUs and use SyncBatchNorm in the projector. Both are still per GPU.</li>
+      <li><b>Training recipe:</b> the runs use constant-lr Adam (1e-4) with no warmup, schedule or evaluation. That's fine for a sanity run, not for a final model.</li>
     </ul>
   </div>
 
@@ -164,21 +174,25 @@
 <script>
 const S1 = "var(--series-1)", S2 = "var(--series-2)";
 const steps = [
-  {k: "fp32", v: 267, hw: "B300", run: "compile-amp-tok_s/d0", d: "fp32, batch 42, 4 workers, eager. Attention on fp32 mem-efficient kernel."},
-  {k: "+ bf16", v: 822, hw: "B300", run: "compile-amp-tok_s/d5", d: "bf16 autocast (SIGReg fp32), batch 84. cuDNN flash attention.", x: "×3.1"},
-  {k: "+ compile", v: 935, hw: "B300", run: "compile-amp-tok_s/d7", d: "torch.compile(dynamic=True) on the encoder. Now data-loader bound (~170 samples/s).", x: "+14%"},
-  {k: "+ 8 workers", v: 1333, hw: "B300", run: "ddp/d0 (≈ workers/d1)", d: "8 DataLoader workers: data wait gone, 88% GPU busy.", x: "+43%"},
-  {k: "8-GPU DDP", v: 1014, hw: "B300", run: "ddp/d3", d: "8×B300, 8.1M tok/s total, 76% of 1-GPU rate per GPU.", x: "76%"},
-  {k: "new setup", v: 881, hw: "H200", run: "cudagraphs/d0", d: "H200, hemibrain EB 128³, displace 96³/64³, compile(dynamic), workers active through profile."},
-  {k: "+ CUDA graphs", v: 990, hw: "H200", run: "allreduce/d0 (≈ cudagraphs/d4)", d: "compile(mode='reduce-overhead'): replay recorded kernel sequences. 99% GPU busy.", x: "+12%"},
-  {k: "8-GPU DDP", v: 759, hw: "H200", run: "cudagraphs/d7", d: "8×H200, 72 cores. 6.07M tok/s total.", x: "77%"},
-  {k: "+ full node", v: 812, hw: "H200", run: "allreduce/d2", d: "12 cores/GPU → all 96 cores. 6.50M tok/s total. bf16 grad compression: no further gain.", x: "83%"},
+  {k: "fp32", g: 1, v: 267, hw: "B300", run: "compile-amp-tok_s/d0", d: "fp32, batch 42, 4 workers, eager. Attention on fp32 mem-efficient kernel."},
+  {k: "+ bf16", g: 1, v: 822, hw: "B300", run: "compile-amp-tok_s/d5", d: "bf16 autocast (SIGReg fp32), batch 84. cuDNN flash attention.", x: "×3.1"},
+  {k: "+ compile", g: 1, v: 935, hw: "B300", run: "compile-amp-tok_s/d7", d: "torch.compile(dynamic=True) on the encoder. Now data-loader bound (~170 samples/s).", x: "+14%"},
+  {k: "+ 8|workers", g: 1, v: 1333, hw: "B300", run: "ddp/d0 (≈ workers/d1)", d: "8 DataLoader workers: data wait gone, 88% GPU busy.", x: "+43%"},
+  {k: "DDP", g: 8, v: 1014, hw: "B300", run: "ddp/d3", d: "8×B300, 8.1M tok/s total, 76% of the 1-GPU rate per GPU.", x: "76%"},
+  {k: "new|setup", g: 1, v: 881, hw: "H200", run: "cudagraphs/d0", d: "H200, hemibrain EB 128³, displace 96³/64³, compile(dynamic), workers active through profile."},
+  {k: "+ CUDA|graphs", g: 1, v: 990, hw: "H200", run: "allreduce/d0 (≈ cudagraphs/d4)", d: "compile(mode='reduce-overhead'): replay recorded kernel sequences. 99% GPU busy.", x: "+12%"},
+  {k: "+ batch|views", g: 1, v: 1023, hw: "H200", run: "batchviews/d1", d: "2 encoder calls per step (all globals, all locals) instead of 6.", x: "+3%"},
+  {k: "+ uint8", g: 1, v: 1036, hw: "H200", run: "width-defer/d3", d: "defer_image_ops: workers ship uint8, GPU normalizes. 33.8% MFU.", x: "+1%"},
+  {k: "DDP", g: 8, v: 759, hw: "H200", run: "cudagraphs/d7", d: "8×H200 with CUDA graphs, 72 cores. 6.07M tok/s total.", x: "77%"},
+  {k: "+ full|node", g: 8, v: 812, hw: "H200", run: "allreduce/d2", d: "12 cores/GPU → all 96 cores. 6.50M tok/s total. bf16 grad compression: no further gain.", x: "83%"},
+  {k: "+ batch|views", g: 8, v: 835, hw: "H200", run: "batchviews/d3", d: "Batched encoder calls at 8 GPUs. 6.68M tok/s total.", x: "82%"},
+  {k: "+ uint8", g: 8, v: 975, hw: "H200", run: "width-defer/d5", d: "uint8 transfer at 8 GPUs: 7.80M tok/s total, 31.8% MFU.", x: "94%"},
 ];
 const scaling = [
   {k: "B300 · 1 GPU", v: 1.333, hw: "B300", run: "ddp/d0"},
   {k: "B300 · 8 GPUs", v: 8.111, hw: "B300", ideal: 8 * 1.333, run: "ddp/d3"},
-  {k: "H200 · 1 GPU", v: 0.990, hw: "H200", run: "allreduce/d0"},
-  {k: "H200 · 8 GPUs", v: 6.496, hw: "H200", ideal: 8 * 0.984, run: "allreduce/d2"},
+  {k: "H200 · 1 GPU", v: 1.036, hw: "H200", run: "width-defer/d3"},
+  {k: "H200 · 8 GPUs", v: 7.799, hw: "H200", ideal: 8 * 1.036, run: "width-defer/d5"},
 ];
 
 const NS = "http://www.w3.org/2000/svg";
@@ -201,41 +215,45 @@ function axes(svg, m, W, H, ymax, ticks, fmt) {
 // Journey chart
 (function () {
   const svg = document.getElementById("journey");
-  const m = {l: 56, r: 12, t: 58, b: 64}, W = 1000 - m.l - m.r, H = 470 - m.t - m.b, ymax = 1500;
+  const m = {l: 56, r: 12, t: 58, b: 78}, W = 1000 - m.l - m.r, H = 490 - m.t - m.b, ymax = 1500;
   axes(svg, m, W, H, ymax, [0, 250, 500, 750, 1000, 1250, 1500], t => t.toLocaleString());
-  const phaseGap = 36, n = steps.length, slot = (W - phaseGap) / n, bw = slot - 14;
-  const xOf = i => m.l + i * slot + (i >= 5 ? phaseGap : 0) + 7;
+  // x layout: a big gap where the hardware phase changes, a small one where 1 GPU -> 8 GPUs.
+  const PHASE_GAP = 40, GROUP_GAP = 14;
+  const gaps = steps.map((s, i) => i === 0 ? 0 : s.hw !== steps[i - 1].hw ? PHASE_GAP : s.g !== steps[i - 1].g ? GROUP_GAP : 0);
+  const totalGap = gaps.reduce((a, b) => a + b, 0), slot = (W - totalGap) / steps.length, bw = slot - 10;
+  const xs = []; let acc = m.l;
+  steps.forEach((s, i) => { acc += gaps[i]; xs.push(acc + 5); acc += slot; });
   const yOf = v => m.t + H - H * v / ymax;
-  // phase divider + labels
-  const xd = m.l + 5 * slot + phaseGap / 2;
+  const split = steps.findIndex(s => s.hw === "H200");
+  const xd = xs[split] - 5 - PHASE_GAP / 2;
   el("line", {x1: xd, x2: xd, y1: 16, y2: m.t + H, stroke: "var(--axis)", "stroke-width": 1, "stroke-dasharray": "3 4"}, svg);
   el("text", {x: m.l + 4, y: 20, "font-size": 12.5, "font-weight": 600, fill: "var(--text-secondary)"}, svg, "B300 · one GPU, then 8");
   el("text", {x: xd + 10, y: 20, "font-size": 12.5, "font-weight": 600, fill: "var(--text-secondary)"}, svg, "H200 · new data + views (new baseline)");
-  // 1-GPU best reference line within each phase
-  const refs = [[0, 5, 1333], [5, 9, 990]];
-  for (const [a, b, v] of refs) {
-    el("line", {x1: xOf(a) - 7, x2: xOf(b - 1) + bw + 7, y1: yOf(v), y2: yOf(v), stroke: "var(--text-muted)", "stroke-width": 1, "stroke-dasharray": "2 3", opacity: .6}, svg);
+  // Best 1-GPU result per phase as a dashed reference across that phase.
+  for (const [a, b] of [[0, split], [split, steps.length]]) {
+    const best = Math.max(...steps.slice(a, b).filter(s => s.g === 1).map(s => s.v));
+    el("line", {x1: xs[a] - 5, x2: xs[b - 1] + bw + 5, y1: yOf(best), y2: yOf(best), stroke: "var(--text-muted)", "stroke-width": 1, "stroke-dasharray": "2 3", opacity: .6}, svg);
+    el("text", {x: xs[a], y: yOf(best) - 6, "text-anchor": "start", "font-size": 11, fill: "var(--text-muted)"}, svg, "best 1-GPU");
   }
   steps.forEach((s, i) => {
-    const x = xOf(i), y = yOf(s.v), h = m.t + H - y;
+    const x = xs[i], y = yOf(s.v), h = m.t + H - y;
     const g = el("g", {tabindex: 0}, svg);
-    el("rect", {x: x - 6, y: m.t, width: bw + 12, height: H, fill: "transparent"}, g); // hit target
+    el("rect", {x: x - 5, y: m.t, width: bw + 10, height: H, fill: "transparent"}, g); // hit target
     el("path", {d: topRounded(x, y, bw, h, 4), fill: color(s.hw)}, g);
-    el("text", {x: x + bw / 2, y: y - 8, "text-anchor": "middle", "font-size": 13, "font-weight": 650, fill: "var(--text-primary)"}, g, s.v.toLocaleString());
-    if (s.x) el("text", {x: x + bw / 2, y: y - 25, "text-anchor": "middle", "font-size": 11.5, fill: "var(--text-muted)"}, g, s.x.startsWith("×") || s.x.startsWith("+") ? s.x : s.x + " of 1-GPU");
-    el("text", {x: x + bw / 2, y: m.t + H + 18, "text-anchor": "middle", "font-size": 12, fill: "var(--text-secondary)"}, g, s.k);
-    el("text", {x: x + bw / 2, y: m.t + H + 34, "text-anchor": "middle", "font-size": 11, fill: "var(--text-muted)"}, g, i === 4 || i === 7 || i === 8 ? "8 GPUs" : "1 GPU");
-    const html = `<b>${s.k} · ${s.v.toLocaleString()} ktok/s/GPU</b>${s.d}<br><span class="k">${s.hw} · outdir/e00/${s.run}</span>`;
+    el("text", {x: x + bw / 2, y: y - 8, "text-anchor": "middle", "font-size": 12.5, "font-weight": 650, fill: "var(--text-primary)"}, g, s.v.toLocaleString());
+    if (s.x) el("text", {x: x + bw / 2, y: y - 24, "text-anchor": "middle", "font-size": 11, fill: "var(--text-muted)"}, g, s.x);
+    s.k.split("|").forEach((line, j) =>
+      el("text", {x: x + bw / 2, y: m.t + H + 17 + 14 * j, "text-anchor": "middle", "font-size": 11.5, fill: "var(--text-secondary)"}, g, line));
+    el("text", {x: x + bw / 2, y: m.t + H + 50, "text-anchor": "middle", "font-size": 10.5, fill: "var(--text-muted)"}, g, s.g === 8 ? "8 GPUs" : "1 GPU");
+    const html = `<b>${s.k.replace("|", " ")} · ${s.g} GPU${s.g > 1 ? "s" : ""} · ${s.v.toLocaleString()} ktok/s/GPU</b>${s.d}<br><span class="k">${s.hw} · outdir/e00/${s.run}</span>`;
     g.addEventListener("mousemove", ev => showTip(ev, html)); g.addEventListener("mouseleave", hideTip);
-    g.addEventListener("focus", () => { const r = svg.getBoundingClientRect(); showTip({clientX: r.left + (x / 1000) * r.width, clientY: r.top + (y / 470) * r.height}, html); });
+    g.addEventListener("focus", () => { const r = svg.getBoundingClientRect(); showTip({clientX: r.left + (x / 1000) * r.width, clientY: r.top + (y / 490) * r.height}, html); });
     g.addEventListener("blur", hideTip);
   });
   el("text", {x: 14, y: m.t + H / 2, transform: `rotate(-90 14 ${m.t + H / 2})`, "text-anchor": "middle", "font-size": 12, fill: "var(--text-muted)"}, svg, "ktok/s per GPU");
-  el("text", {x: xOf(4) + bw + 4, y: yOf(1333) - 6, "text-anchor": "end", "font-size": 11, fill: "var(--text-muted)"}, svg, "best 1-GPU");
-  el("text", {x: xOf(8) + bw + 4, y: yOf(990) - 6, "text-anchor": "end", "font-size": 11, fill: "var(--text-muted)"}, svg, "best 1-GPU");
   const t = document.getElementById("journey-table");
-  t.innerHTML = "<tr><th>Step</th><th>GPU</th><th>ktok/s per GPU</th><th>Change</th><th>Run</th><th>Notes</th></tr>" +
-    steps.map(s => `<tr><td>${s.k}</td><td>${s.hw}</td><td class="n">${s.v.toLocaleString()}</td><td>${s.x || ""}</td><td><code>${s.run}</code></td><td>${s.d}</td></tr>`).join("");
+  t.innerHTML = "<tr><th>Step</th><th>GPU</th><th>GPUs</th><th>ktok/s per GPU</th><th>Change</th><th>Run</th><th>Notes</th></tr>" +
+    steps.map(s => `<tr><td>${s.k.replace("|", " ")}</td><td>${s.hw}</td><td class="n">${s.g}</td><td class="n">${s.v.toLocaleString()}</td><td>${s.x || ""}</td><td><code>${s.run}</code></td><td>${s.d}</td></tr>`).join("");
 })();
 
 // Scaling chart

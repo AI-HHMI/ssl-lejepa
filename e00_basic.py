@@ -409,7 +409,7 @@ def plot1():
     res["run"] = short_runs(res.savedir) + repeat.map(lambda k: f".{k}" if k else "")
     res["sizes"] = res.patch_size.astype(str) + " " + res.global_size.astype(str) + " " + res.local_size.astype(str)
     px.line(res, x="idx_step", y="loss", color="run", line_dash="views", facet_col="n_gpus",
-            hover_data=["sizes", "n_workers"], markers=True).show()
+            hover_data=["sizes", "n_workers"], markers=True, log_y=True).show()
 
 def plot2():
     """ktok/s per GPU: one bar per result row, bars grouped by n_gpus with gaps between groups, colored by width + defer_image_ops."""
