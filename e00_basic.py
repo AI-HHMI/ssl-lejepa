@@ -70,22 +70,30 @@ def allparams():
     params = []
     # Training runs: best throughput config on a full 8xH200 node for 6 h (~7.8M tok/s, ~45k steps each).
     # d0 trains on the EB train split (~850x coverage per voxel); d1 adds hemibrain crops 002 + 003 (~30x).
-    for i, data in enumerate(["hemibrain_eb", "hemibrain_wide"]):
+    # for i, data in enumerate(["hemibrain_eb", "hemibrain_wide"]):
+    # Wider encoders at 1 GPU (MFU vs width), and uint8 transfer (defer_image_ops) at 1 and 8 GPUs.
+    runs = [(w, False, 1) for w in [512, 768, 1024]] + [(512, True, 1)] + [(512, d, 8) for d in [False, True]]
+    for i, (w, defer, ng) in enumerate(runs):
         p = Params()
-        p.savedir = f"outdir/e00/train6h_hemi_coslr/d{i}/"
-        p.data = data
+        p.savedir = f"outdir/e00/width-defer-repeat/d{i}/"
+        p.data = "hemibrain_eb"
         p.views = "displace"
         p.patch_size = (128, 128, 128)
         p.global_size = (96, 96, 96)
         p.local_size = (64, 64, 64)
         p.cudagraphs = True
         p.batch_views = True
+        # p.n_workers = 8
+        # p.n_gpus = 8
+        # p.max_hours = 6.0
+        # p.steps_per_epoch = 44_000  # ~6 h at 8xH200 (d0 did 44.4k); sets the cosine horizon, max_hours is the backstop
+        p.width = w
+        p.defer_image_ops = defer
         p.n_workers = 8
-        p.n_gpus = 8
-        p.max_hours = 6.0
-        p.steps_per_epoch = 44_000  # ~6 h at 8xH200 (d0 did 44.4k); sets the cosine horizon, max_hours is the backstop
+        p.n_gpus = ng
         params.append(p)
     # pprint(params)
+
     return params
 
 def collate_images(samples):
@@ -420,13 +428,12 @@ def loadJsonTable(filename):
                     # Params added after a run was saved must still be at their default, which that run used.
                     saved = record["params"]
                     defaults = asdict(Params())
-                    b1 = saved.keys() <= params.keys()
-                    b2 = all(json_equal(params[k], saved[k]) for k in saved if k in params)
-                    b3 = all(json_equal(params[k], defaults[k]) for k in params.keys() - saved.keys())
-                    assert b1 and b2 and b3, (
-                        f"Parameter mismatch in {path}:\n"
-                        f"current: {params}\nsaved: {saved}"
-                    )
+                    diffs = [f"  {k}: saved {saved[k]!r}, no longer a Params field" for k in saved if k not in params]
+                    diffs += [f"  {k}: current {params[k]!r}, saved {saved[k]!r}"
+                              for k in saved if k in params and not json_equal(params[k], saved[k])]
+                    diffs += [f"  {k}: current {params[k]!r}, not saved (run used the default {defaults[k]!r})"
+                              for k in params if k not in saved and not json_equal(params[k], defaults[k])]
+                    assert not diffs, f"Parameter mismatch in {path}:\n" + "\n".join(diffs)
                 row = {**params, **record}
                 rows.append(row)
     res = pandas.DataFrame(rows)
