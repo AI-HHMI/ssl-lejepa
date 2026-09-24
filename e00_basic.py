@@ -47,6 +47,7 @@ class Params:
     prefetch_factor: int = 2
     amp: bool = True  # bf16 autocast for forward + loss
     compile: bool = True  # torch.compile(dynamic=True) the encoder
+    cudagraphs: bool = False  # instead compile static with CUDA graphs (mode="reduce-overhead"); needs compile + displace views
     n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); batch_size and n_workers are per GPU
 
     # profiling params
@@ -56,18 +57,18 @@ class Params:
 
 def allparams():
     params = []
-    # (input, global, local) cube sides. d0 repeats views-hemibrain's sizes (odd token grids 11^3 / 7^3);
-    # d1-d4 use multiple-of-64 token counts (12^3 / 8^3) with 2x the global shift, scaled across GPUs.
-    sizes = [(104, 88, 56)] + [(128, 96, 64)] * 4
-    n_gpus = [1, 1, 2, 4, 8]
-    for i, ((inp, g, l), ng) in enumerate(zip(sizes, n_gpus)):
+    # Does removing CPU launch overhead (CUDA graphs) fix DDP scaling under data-worker CPU contention?
+    # cudagraphs x n_gpus at 8 workers, plus 4 workers at 8 GPUs (fewer competing processes).
+    runs = [(cg, ng, 8) for cg in [False, True] for ng in [1, 2, 4, 8]] + [(cg, 8, 4) for cg in [False, True]]
+    for i, (cg, ng, nw) in enumerate(runs):
         p = Params()
-        p.savedir = f"outdir/e00/displace-sizes/d{i}/"
+        p.savedir = f"outdir/e00/cudagraphs/d{i}/"
         p.views = "displace"
-        p.patch_size = (inp, inp, inp)
-        p.global_size = (g, g, g)
-        p.local_size = (l, l, l)
-        p.n_workers = 8  # 8 GPUs x (8 + 1) = 72 CPU slots fits a 96-core node
+        p.patch_size = (128, 128, 128)
+        p.global_size = (96, 96, 96)
+        p.local_size = (64, 64, 64)
+        p.cudagraphs = cg
+        p.n_workers = nw  # 8 GPUs x (8 + 1) = 72 CPU slots fits a 96-core node
         p.n_gpus = ng
         params.append(p)
     # pprint(params)
@@ -113,7 +114,8 @@ def run(n:int):
         volumes=volumes,
         patch_size=list(par.patch_size),
         resolutions=[[8.0, 8.0, 8.0]],
-        samples_per_epoch=par.batch_size * par.steps_per_epoch,
+        # Extra batches keep workers busy (as in real training) through the last, profiled steps.
+        samples_per_epoch=par.batch_size * (par.steps_per_epoch + par.n_workers * par.prefetch_factor),
         sampling="random",
         output_axes="lzyx",
     )
@@ -155,9 +157,16 @@ def run(n:int):
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
     print(f"Rank {rank}/{world_size} is using torch device {device} .")
     model = model.to(device)
+    assert par.compile or not par.cudagraphs, "cudagraphs requires compile"
     if par.compile:
         torch._logging.set_logs(recompiles=True)  # recompiles show up in job_*.log
-        model.encoder.compile(dynamic=True)  # Views change shape every step.
+        if par.cudagraphs:
+            # CUDA graphs replay whole kernel sequences, removing per-kernel CPU launch cost.
+            # They need static shapes: displace has exactly 2 view shapes, basic has ~9.
+            assert par.views == "displace", "cudagraphs needs views='displace' (few static shapes)"
+            model.encoder.compile(mode="reduce-overhead", dynamic=False)
+        else:
+            model.encoder.compile(dynamic=True)  # Views change shape every step.
     if world_size > 1:
         # SIGReg and projector BatchNorm statistics stay per-rank (local batch) for now.
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank] if device.type == "cuda" else None)
@@ -204,6 +213,8 @@ def run(n:int):
     # Only rank 0 writes results and profiles.
     with open(savedir / "metrics.json" if rank0 else os.devnull, "a") as metrics_file, ExitStack() as profile_scope:
         for idx_step in range(par.steps_per_epoch):
+            if par.cudagraphs:
+                torch.compiler.cudagraph_mark_step_begin()  # previous step's graph outputs may be overwritten
             if idx_step == par.warmup_steps and idx_step < benchmark_stop:
                 synchronize()
                 benchmark_started = time.perf_counter()
@@ -341,25 +352,26 @@ def plot1():
             hover_data=["sizes", "n_workers"], markers=True).show()
 
 def plot2():
-    """ktok/s per GPU: one bar per result row, bars grouped by n_gpus with gaps between groups, colored by views."""
+    """ktok/s per GPU: one bar per result row, bars grouped by n_gpus with gaps between groups, colored by cudagraphs + workers."""
     res = loadJsonTable("performance.json")
     res["ktok_s_per_gpu"] = res.tokens_per_second / res.n_gpus / 1e3
     assert len(res), "no performance.json rows for allparams(); run ./pull.sh?"
     # Bar label: short run name, plus a suffix for repeated rows in one run.
     repeat = res.groupby("savedir").cumcount()
     res["run"] = short_runs(res.savedir) + repeat.map(lambda k: f".{k}" if k else "")
-    res = res.sort_values(["n_gpus", "n_workers", "run"]).reset_index(drop=True)
+    res["color"] = "cudagraphs=" + res.cudagraphs.astype(str) + ", workers=" + res.n_workers.astype(str)
+    res = res.sort_values(["n_gpus", "color", "run"]).reset_index(drop=True)
     # x positions: consecutive within a group, GROUP_GAP extra slots between groups.
     GROUP_GAP = 0.8
     group_idx = res.n_gpus.rank(method="dense").astype(int) - 1
     res["x"] = res.index + GROUP_GAP * group_idx
     fig = go.Figure()
-    for color, r in res.groupby("n_workers", sort=False):
+    for color, r in res.groupby("color", sort=False):
         fig.add_bar(x=r.x, y=r.ktok_s_per_gpu, name=str(color), width=0.9)
     for g, r in res.groupby("n_gpus"):
         fig.add_annotation(x=r.x.mean(), y=-0.12, yref="paper", text=f"<b>{g} gpu</b>", showarrow=False)
     fig.update_xaxes(tickvals=res.x, ticktext=res.run)
-    fig.update_layout(yaxis_title="ktok/s per GPU", legend_title="n_workers", margin=dict(b=80))
+    fig.update_layout(yaxis_title="ktok/s per GPU", legend_title="", margin=dict(b=80))
     fig.show()
 
 def table():
@@ -371,7 +383,7 @@ def table():
         res[k] = res.savedir.map(dict(zip(trace.savedir, trace[k]))) if k in trace else float("nan")
     cols = {
         "savedir": "run", "views": "views", "patch_size": "input", "global_size": "global", "local_size": "local",
-        "compile": "compile", "n_gpus": "gpus", "batch_size": "batch", "n_workers": "workers",
+        "compile": "compile", "cudagraphs": "cudagraphs", "n_gpus": "gpus", "batch_size": "batch", "n_workers": "workers",
         "gpu_busy": "gpu busy %", "samples_per_second": "samples/s",
         "tokens_per_second": "tok/s", "input_mvox_per_second": "Mvox/s",
         "step_ms": "prof step ms", **phases,
