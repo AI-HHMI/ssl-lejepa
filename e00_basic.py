@@ -59,7 +59,7 @@ def allparams():
     params = []
     # views: list[Views] = ["displace"]
     n_gpus = [1, 2, 4]
-    n_workers = [8, 16]
+    n_workers = [8, 16] # in the future only req 12 not 16 CPU/GPU
     for i, (ng, nw) in enumerate(product(n_gpus, n_workers)):
         p = Params()
         p.savedir = f"outdir/e00/views-hemibrain/d{i}/"
@@ -326,7 +326,7 @@ def loadJsonTable(filename):
                 row = {**params, **record}
                 rows.append(row)
     res = pandas.DataFrame(rows)
-    pprint(res)
+    # pprint(res)
     return res
 
 def plot1():
@@ -341,18 +341,18 @@ def plot2():
     prefix = os.path.commonpath(list(res.savedir))
     repeat = res.groupby("savedir").cumcount()
     res["run"] = res.savedir.str[len(prefix):].str.strip("/") + repeat.map(lambda k: f".{k}" if k else "")
-    res = res.sort_values(["n_gpus", "views", "run"]).reset_index(drop=True)
+    res = res.sort_values(["n_gpus", "n_workers", "run"]).reset_index(drop=True)
     # x positions: consecutive within a group, GROUP_GAP extra slots between groups.
     GROUP_GAP = 0.8
     group_idx = res.n_gpus.rank(method="dense").astype(int) - 1
     res["x"] = res.index + GROUP_GAP * group_idx
     fig = go.Figure()
-    for color, r in res.groupby("views", sort=False):
+    for color, r in res.groupby("n_workers", sort=False):
         fig.add_bar(x=r.x, y=r.ktok_s_per_gpu, name=str(color), width=0.9)
     for g, r in res.groupby("n_gpus"):
         fig.add_annotation(x=r.x.mean(), y=-0.12, yref="paper", text=f"<b>{g} gpu</b>", showarrow=False)
     fig.update_xaxes(tickvals=res.x, ticktext=res.run)
-    fig.update_layout(yaxis_title="ktok/s per GPU", legend_title="views", margin=dict(b=80))
+    fig.update_layout(yaxis_title="ktok/s per GPU", legend_title="n_workers", margin=dict(b=80))
     fig.show()
 
 def table():
