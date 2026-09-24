@@ -161,6 +161,9 @@ def dataloader(n:int):
       multiprocessing_context="spawn",
     )
     batches = iter(loader)
+    # pprint(volumes)
+    # pprint(mcfg)
+    # pprint(dl[0]['img'].shape)
     if int(os.environ.get("RANK", 0)) == 0:
         save_view_pngs(par, dl)
     return batches
@@ -168,8 +171,6 @@ def dataloader(n:int):
 def run(n:int):
     start_time = time.time()
     par : Params = allparams()[n]
-    if min(par.warmup_steps, par.benchmark_steps, par.profile_steps) < 0:
-        raise ValueError("Profiling and benchmark step counts must be nonnegative")
     # lmd.set_data_root("/Volumes/miaai/lmd-v0.0.1/data")
     # volumes = [x.to_miao() for x in lmd.all() if "flyliconn" in x.name]
 
@@ -189,9 +190,6 @@ def run(n:int):
     if world_size > 1:
         dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo")
 
-    # pprint(volumes)
-    # pprint(mcfg)
-    # pprint(dl[0]['img'].shape)
     batches = dataloader(n)
 
     savedir = Path(par.savedir)
