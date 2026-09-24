@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 import os, sys
 import json
 import time
@@ -74,14 +73,6 @@ def write_trace_summary(savedir):
     summary = trace_summary(Path(savedir) / "profile.json")
     (Path(savedir) / "trace_summary.json").write_text(json.dumps({"tbl": "trace_summary", **summary}) + "\n")
     print(f"{savedir}: GPU busy during profiled steps {100 * summary['gpu_busy']:.0f}%")
-
-# def backfill_gpu_busy():
-#     """Write gpu_busy.json from profile.json for runs that predate it. Run on the cluster (traces aren't pulled)."""
-#     for par in allparams():
-#         b1 = (Path(par.savedir) / "profile.json").is_file()
-#         b2 = (Path(par.savedir) / "trace_summary.json").is_file()
-#         if b1 and not b2:
-#             write_trace_summary(par.savedir)
 
 def collate_images(samples):
     import torch
