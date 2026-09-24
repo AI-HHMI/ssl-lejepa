@@ -395,11 +395,24 @@ def table():
     for k in ["gpu_busy", "step_ms", *phases]:
         res[k] = res.savedir.map(dict(zip(trace.savedir, trace[k]))) if k in trace else float("nan")
     cols = {
-        "savedir": "run", "views": "views", "patch_size": "input", "global_size": "global", "local_size": "local",
-        "compile": "compile", "cudagraphs": "cudagraphs", "compile_blocks": "blocks", "grad_compress": "compress", "n_gpus": "gpus", "batch_size": "batch", "n_workers": "workers",
-        "gpu_busy": "gpu busy %", "samples_per_second": "samples/s",
-        "tokens_per_second": "tok/s", "input_mvox_per_second": "Mvox/s",
-        "step_ms": "prof step ms", **phases,
+        "savedir": "run",
+        # "views": "views",
+        # "patch_size": "input",
+        # "global_size": "global",
+        # "local_size": "local",
+        # "compile": "compile",
+        # "cudagraphs": "cudagraphs",
+        "compile_blocks": "blocks",
+        "grad_compress": "compress",
+        "n_gpus": "gpus",
+        "batch_size": "batch",
+        "n_workers": "workers",
+        "gpu_busy": "gpu busy %",
+        "samples_per_second": "samples/s",
+        "tokens_per_second": "tok/s",
+        "input_mvox_per_second": "Mvox/s",
+        "step_ms": "prof step ms",
+        **phases,
     }
     res = res[list(cols)].rename(columns=cols) # type: ignore
     res["gpu busy %"] *= 100
