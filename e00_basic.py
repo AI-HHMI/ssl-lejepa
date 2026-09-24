@@ -56,14 +56,18 @@ class Params:
 
 def allparams():
     params = []
-    # views: list[Views] = ["displace"]
-    n_gpus = [1, 2, 4]
-    n_workers = [8, 16] # in the future only req 12 not 16 CPU/GPU
-    for i, (ng, nw) in enumerate(product(n_gpus, n_workers)):
+    # (input, global, local) cube sides. d0 repeats views-hemibrain's sizes (odd token grids 11^3 / 7^3);
+    # d1-d4 use multiple-of-64 token counts (12^3 / 8^3) with 2x the global shift, scaled across GPUs.
+    sizes = [(104, 88, 56)] + [(128, 96, 64)] * 4
+    n_gpus = [1, 1, 2, 4, 8]
+    for i, ((inp, g, l), ng) in enumerate(zip(sizes, n_gpus)):
         p = Params()
-        p.savedir = f"outdir/e00/views-hemibrain/d{i}/"
+        p.savedir = f"outdir/e00/displace-sizes/d{i}/"
         p.views = "displace"
-        p.n_workers = nw
+        p.patch_size = (inp, inp, inp)
+        p.global_size = (g, g, g)
+        p.local_size = (l, l, l)
+        p.n_workers = 8  # 8 GPUs x (8 + 1) = 72 CPU slots fits a 96-core node
         p.n_gpus = ng
         params.append(p)
     # pprint(params)
@@ -354,7 +358,8 @@ def table():
     for k in ["gpu_busy", "step_ms", *phases]:
         res[k] = res.savedir.map(dict(zip(trace.savedir, trace[k]))) if k in trace else float("nan")
     cols = {
-        "savedir": "run", "views": "views", "compile": "compile", "n_gpus": "gpus", "batch_size": "batch", "n_workers": "workers",
+        "savedir": "run", "views": "views", "patch_size": "input", "global_size": "global", "local_size": "local",
+        "compile": "compile", "n_gpus": "gpus", "batch_size": "batch", "n_workers": "workers",
         "gpu_busy": "gpu busy %", "samples_per_second": "samples/s",
         "tokens_per_second": "tok/s", "input_mvox_per_second": "Mvox/s",
         "step_ms": "prof step ms", **phases,
