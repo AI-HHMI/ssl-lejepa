@@ -60,6 +60,7 @@ Data comes from `lmd_catalog` (the volume catalog) → `.to_miao()` → `miao.Vo
   - `basic`: each view draws a volume fraction from `global_scale` / `local_scale`. Sides are rounded to multiples of the patch size, which gives 9 distinct shapes for a 48×144×144 patch.
   - `displace`: fixed `global_size` / `local_size`. Each local sits inside a randomly chosen global of the same sample, at a uniformly random displacement. Every step has the same shapes and token count.
 - `util.py`: entrypoint CLI, `git_provenance`, `trace_summary`.
+- `benchmark.py`: `Benchmark`, which owns the training loop's timed window (`performance.json`) and profiled window (`profile.json`/`.out`, `trace_summary.json`). `run()` calls `begin`/`phase`/`count`/`end` each step. Also holds `PEAK_BF16_TFLOPS`.
 - `lib/__init__.py` monkeypatches `torch.Tensor.backwards` and a no-arg `torch.rand()`.
 
 `lib/tests/test_training_profile.py` runs `e00_basic.run` end to end on a synthetic dataset by monkeypatching the module's globals (`allparams`, `lmd.get`, `MiaoConfig`, `VolumeDataset`, `Lejepa`, `LejepaConfig`, `repo_root`, `git_provenance`). Renaming those names in the experiment script breaks it.

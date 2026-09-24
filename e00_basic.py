@@ -5,7 +5,6 @@ import os, sys
 import json
 import time
 from pathlib import Path
-from contextlib import ExitStack, nullcontext
 
 import math
 from math import prod
@@ -14,6 +13,7 @@ from itertools import product
 # local
 
 from lib.data import HEMIBRAIN_EB, TRAIN_BOXES
+from lib.benchmark import Benchmark, write_trace_summary
 from lib.models import Lejepa, LejepaConfig
 from lib.views import ViewMaker
 from lib.util import *
@@ -31,9 +31,6 @@ import pandas
 import plotly.express as px
 import plotly.graph_objects as go
 
-# Dense bf16 tensor-core peak per GPU, matched by substring of torch.cuda.get_device_name().
-# B300/B200 from NVIDIA's HGX spec (36 PFLOPS sparse per 8 GPUs); check the datasheet if it matters.
-PEAK_BF16_TFLOPS = {"H100": 989, "H200": 989, "B200": 2250, "B300": 2250}
 
 
 @dataclass(slots=True)
@@ -90,11 +87,6 @@ def allparams():
         params.append(p)
     # pprint(params)
     return params
-
-def write_trace_summary(savedir):
-    summary = trace_summary(Path(savedir) / "profile.json")
-    (Path(savedir) / "trace_summary.json").write_text(json.dumps({"tbl": "trace_summary", **summary}) + "\n")
-    print(f"{savedir}: GPU busy during profiled steps {100 * summary['gpu_busy']:.0f}%")
 
 def collate_images(samples):
     import torch
@@ -171,9 +163,6 @@ def dataloader(n:int):
 def run(n:int):
     start_time = time.time()
     par : Params = allparams()[n]
-    # lmd.set_data_root("/Volumes/miaai/lmd-v0.0.1/data")
-    # volumes = [x.to_miao() for x in lmd.all() if "flyliconn" in x.name]
-
     import torch
     import torch.distributed as dist
     torch.set_float32_matmul_precision(par.f32mode)
@@ -190,6 +179,7 @@ def run(n:int):
     if world_size > 1:
         dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo")
 
+    # each rank/process gets it's own dataloader with a distinct np.random generator?
     batches = dataloader(n)
 
     savedir = Path(par.savedir)
@@ -253,84 +243,29 @@ def run(n:int):
             old.unlink()
         print(f"Saved {path}", flush=True)
 
-    use_cuda = device.type == "cuda"
-    activities = [torch.profiler.ProfilerActivity.CPU]
-    if use_cuda:
-        activities.append(torch.profiler.ProfilerActivity.CUDA)
-    profile_start = par.warmup_steps + par.benchmark_steps
-    profile_stop = min(profile_start + 1 + par.profile_steps, par.steps_per_epoch)
-    benchmark_stop = min(profile_start, par.steps_per_epoch)
-
-    def synchronize():
-        if use_cuda:
-            torch.cuda.synchronize(device)
-
-    def save_trace(prof):
-        prof.export_chrome_trace(str(savedir / "profile.json"))
-        write_trace_summary(savedir)
-        averages = prof.key_averages()
-        report = (
-            f"Device: {device}; recorded steps (zero-based): "
-            f"{profile_start + 1}..{profile_stop - 1}\n"
-            "Open profile.json in https://ui.perfetto.dev to inspect CPU and CUDA tracks.\n"
-            "01_DATA_IO includes storage/network waits, decoding, and preprocessing;\n"
-            "02_CPU_BATCH is host tensor assembly. Neither is a pure disk counter.\n"
-            "03_H2D_TRANSFER is host-side transfer time; inspect Memcpy HtoD on CUDA tracks.\n"
-            "GPU gaps aligned with loading suggest input starvation; gaps amid CPU dispatch\n"
-            "suggest host overhead. Busy GPU tracks alone do not prove compute saturation.\n"
-            "CPU and device times overlap: do not add them into bottleneck percentages.\n\n"
-            "OPERATORS SORTED BY SELF CPU TIME\n"
-            + averages.table(sort_by="self_cpu_time_total", row_limit=50)
-        )
-        if use_cuda:
-            report += "\n\nOPERATORS SORTED BY SELF DEVICE TIME\n" + averages.table(
-                sort_by="self_device_time_total", row_limit=50,
-            )
-        (savedir / "profile.out").write_text(report)
-        print(f"Saved {savedir / 'profile.json'} and {savedir / 'profile.out'}")
-
-    prof = None
-    benchmark_started = None
-    n_tokens = 0  # encoder tokens since benchmark start
-    n_flops = 0  # model training FLOPs since benchmark start (see Lejepa.forward)
     # Only rank 0 writes results and profiles.
-    with open(savedir / "metrics.json" if rank0 else os.devnull, "a") as metrics_file, ExitStack() as profile_scope:
+    with open(savedir / "metrics.json" if rank0 else os.devnull, "a") as metrics_file, Benchmark(par, device, world_size, rank0) as bench:
         for idx_step in range(par.steps_per_epoch):
             if par.cudagraphs:
                 torch.compiler.cudagraph_mark_step_begin()  # previous step's graph outputs may be overwritten
-            if idx_step == par.warmup_steps and idx_step < benchmark_stop:
-                synchronize()
-                benchmark_started = time.perf_counter()
-            if rank0 and par.profile_steps and idx_step == profile_start and idx_step + 1 < profile_stop:
-                synchronize()
-                prof = profile_scope.enter_context(torch.profiler.profile(
-                    activities=activities,
-                    schedule=torch.profiler.schedule(wait=0, warmup=1, active=par.profile_steps, repeat=1),
-                    on_trace_ready=save_trace,
-                    record_shapes=False, profile_memory=False, with_stack=False,
-                ))
-                prof.add_metadata_json("run_config", json.dumps(asdict(par)))
-
+            bench.begin(idx_step)
             # No annotation hooks or profiler are active during the throughput baseline.
-            phase = torch.profiler.record_function if prof is not None else lambda name: nullcontext()
-            with phase("01_DATA_IO"):
+            with bench.phase("01_DATA_IO"):
                 x = next(batches)
-            with phase("03_H2D_TRANSFER"):
+            with bench.phase("03_H2D_TRANSFER"):
                 # Deferred batches are dicts of per-sample uint8 crops; finish_images copies and normalizes them.
                 x = finish_images(x, device)["img"] if par.defer_image_ops else x.to(device, non_blocking=True)
-            with phase("04_FORWARD_AND_LOSS"), torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.amp):
+            with bench.phase("04_FORWARD_AND_LOSS"), torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.amp):
                 out = model(x)
-            if benchmark_started is not None:
-                n_tokens += out.n_tokens
-                n_flops += out.n_flops
-            with phase("05_BACKWARD"):
+            bench.count(out)
+            with bench.phase("05_BACKWARD"):
                 out.loss.backward()
-            with phase("06_OPTIMIZER"):
+            with bench.phase("06_OPTIMIZER"):
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)  # no host sync
                 opt.step()
                 opt.zero_grad()
                 sched.step()
-            with phase("07_LOGGING"):
+            with bench.phase("07_LOGGING"):
                 if rank0 and (idx_step % 10 == 0 or idx_step + 1 == par.steps_per_epoch):
                     loss = out.loss.detach().item()
                     metrics_file.write(json.dumps({"tbl": "metrics", "idx_step": idx_step, "time": time.time() - start_time, "loss": loss,
@@ -338,43 +273,7 @@ def run(n:int):
                     metrics_file.flush()
                     print(f"finished step {idx_step + 1}/{par.steps_per_epoch}, loss={loss:.4f}", flush=True)
 
-            if benchmark_started is not None and idx_step + 1 == benchmark_stop:
-                if world_size > 1:  # Tokens and FLOPs summed over ranks; every rank reaches this step.
-                    total = torch.tensor([n_tokens, n_flops], dtype=torch.float64, device=device)
-                    dist.all_reduce(total)
-                    n_tokens, n_flops = int(total[0].item()), float(total[1].item())
-                synchronize()  # Only window boundaries synchronize; phases remain asynchronous.
-                seconds = time.perf_counter() - benchmark_started
-                steps = benchmark_stop - par.warmup_steps
-                samples_per_second = steps * par.batch_size * world_size / seconds
-                result = {
-                    "tbl": "throughput", "time": time.time(), "device": str(device),
-                    "torch_version": torch.__version__, "params": asdict(par),
-                    "steps": steps, "seconds": seconds, "seconds_per_step": seconds / steps,
-                    "samples_per_second": samples_per_second,
-                    "input_mvox_per_second": samples_per_second * prod(par.patch_size) / 1e6,
-                    "tokens_per_second": n_tokens / seconds,
-                    "tokens_per_sample": n_tokens / (steps * par.batch_size * world_size),
-                    "world_size": world_size,
-                    "tflops_per_second": n_flops / seconds / 1e12,  # node total
-                }
-                if use_cuda:
-                    gpu = torch.cuda.get_device_name(device)
-                    peaks = [v for k, v in PEAK_BF16_TFLOPS.items() if k in gpu]
-                    assert len(peaks) == 1, f"add {gpu!r} to PEAK_BF16_TFLOPS"
-                    result["gpu_name"] = gpu
-                    result["mfu"] = result["tflops_per_second"] / world_size / peaks[0]
-                    result["max_mem_gb"] = torch.cuda.max_memory_allocated(device) / 1e9
-                if rank0:
-                    with open(savedir / "performance.json", "a") as f:
-                        f.write(json.dumps(result) + "\n")
-                print(f"Unprofiled: {seconds / steps:.3f} s/step, {samples_per_second:.2f} samples/s, {n_tokens / seconds:.0f} tokens/s, "
-                      f"{result['tflops_per_second'] / world_size:.0f} TFLOP/s/GPU" + (f", MFU {100 * result['mfu']:.1f}%" if use_cuda else ""))
-            if prof is not None:
-                prof.step()
-                if idx_step + 1 == profile_stop:
-                    profile_scope.close()
-                    prof = None
+            bench.end(idx_step)
             # Every 100 steps, one all-reduce so every rank stops at the same step:
             # on a non-finite loss (divergence) or past max_hours.
             if idx_step % 100 == 99:
