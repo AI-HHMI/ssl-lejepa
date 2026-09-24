@@ -33,7 +33,7 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
     params = experiment.Params(
         savedir=str(tmp_path), patch_size=(8, 8, 8), batch_size=2,
         steps_per_epoch=n_steps, warmup_steps=1, benchmark_steps=2, profile_steps=profile_steps,
-        n_workers=1,
+        n_workers=1, defer_image_ops=False,  # synthetic dataset yields finished float images
     )
     monkeypatch.setattr(experiment, "allparams", lambda: [params])
     monkeypatch.setattr(experiment.lmd, "get", lambda name: SimpleNamespace(to_miao=lambda **kw: None))

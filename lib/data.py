@@ -10,7 +10,7 @@ import numpy as np
 import zarr
 from zarr.storage import LocalStore
 from miao.config import MiaoConfig, VolumeConfig
-from lib.types import Tup3Int
+from lib.types import TrainData, Tup3Int
 import lmd_catalog as lmd
 
 def create_mock_ome_zarr(
@@ -101,6 +101,23 @@ HEMIBRAIN_EB_BOXES = {  # [lo, hi) level-0 voxels, x y z
     "train": [[0, 5000], [0, 5000], [0, 3000]],
     "val": [[0, 5000], [0, 5000], [3000, 4000]],
     "test": [[4000, 5000], [4000, 5000], [4000, 5000]],
+}
+# Hemibrain crops in global hemibrain voxels (x y z), 8 nm, from their catalog names and shapes:
+#   crop-001 EB   x 24000-29000  y 23000-28000  z 17000-22000   (5000^3)
+#   crop-002 11k  x 18000-29000  y 17000-28000  z 11000-22000   (11000^3, CONTAINS crop-001)
+#   crop-003 10k  x  8000-18000  y 17000-27000  z 11000-21000   (10000^3, beside crop-002)
+# crop-002 is cut at its local z < 9000 (global z < 20000) so EB's val slab and test corner
+# (EB z >= 3000) never enter training; EB's train region (EB z < 3000) stays inside.
+HEMIBRAIN_002 = "em-drosophila-flyem-hemibrain/crop-002_11k_x18000_y17000_z11000"
+HEMIBRAIN_003 = "em-drosophila-flyem-hemibrain/crop-003_10k_x8000_y17000_z11000"
+
+# Training volumes per TrainData choice: catalog name -> [lo, hi) level-0 box in that crop, x y z.
+TRAIN_BOXES: dict[TrainData, dict[str, list[list[int]]]] = {
+    "hemibrain_eb": {HEMIBRAIN_EB: HEMIBRAIN_EB_BOXES["train"]},  # 75 Gvox
+    "hemibrain_wide": {  # ~2.1 Tvox, EB train included via crop-002
+        HEMIBRAIN_002: [[0, 11000], [0, 11000], [0, 9000]],
+        HEMIBRAIN_003: [[0, 10000], [0, 10000], [0, 10000]],
+    },
 }
 
 def hemibrain_eb_config(split: str) -> MiaoConfig:

@@ -12,7 +12,7 @@ from itertools import product
 
 # local
 
-from lib.data import HEMIBRAIN_EB, HEMIBRAIN_EB_BOXES
+from lib.data import TRAIN_BOXES
 from lib.models import Lejepa, LejepaConfig
 from lib.util import *
 from lib.types import *
@@ -37,9 +37,11 @@ PEAK_BF16_TFLOPS = {"H100": 989, "H200": 989, "B200": 2250, "B300": 2250}
 class Params:
     savedir: str = "outdir/e00/main/basic/"
     # patch_size: list[int] = field(default_factory=lambda: [104, 232, 232])
+    data: TrainData = "hemibrain_eb"  # training volumes, see lib.data.TRAIN_BOXES
     patch_size: Tup3Int = (104, 104, 104)  # hemibrain EB is 8 nm isotropic
     batch_size: int = 84
     steps_per_epoch: int = 71  # warmup + benchmark + 1 profiler warmup + profile steps: stop right after profiling
+    max_hours: float = 0.0  # >0: stop after this many hours (steps_per_epoch is then an upper bound); sets LSF walltime
     n_layers: int = 12
     width: int = 512  # encoder width; heads = width // 64
     views: Views = "basic"  # 'basic' (random scales) or 'displace' (fixed sizes below, locals inside globals)
@@ -54,7 +56,7 @@ class Params:
     compile: bool = True  # torch.compile(dynamic=True) the encoder
     cudagraphs: bool = False  # instead compile static with CUDA graphs (mode="reduce-overhead"); needs compile + displace views
     compile_blocks: bool = False  # compile each transformer block separately so DDP can overlap all-reduce with backward
-    defer_image_ops: bool = False  # workers ship uint8 crops; cast + normalize on the GPU (miao.finish_images)
+    defer_image_ops: bool = True  # workers ship uint8 crops; cast + normalize on the GPU (miao.finish_images)
     batch_views: bool = False  # one encoder call per group of same-shape views (2 per step with displace)
     grad_compress: bool = False  # DDP bf16_compress_hook: all-reduce gradients in bf16 (half the bytes)
     n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); batch_size and n_workers are per GPU
@@ -66,21 +68,22 @@ class Params:
 
 def allparams():
     params = []
-    # Wider encoders at 1 GPU (MFU vs width), and uint8 transfer (defer_image_ops) at 1 and 8 GPUs.
-    runs = [(w, False, 1) for w in [512, 768, 1024]] + [(512, True, 1)] + [(512, d, 8) for d in [False, True]]
-    for i, (w, defer, ng) in enumerate(runs):
+    # Training runs: best throughput config on a full 8xH200 node for 6 h (~7.8M tok/s, ~45k steps each).
+    # d0 trains on the EB train split (~850x coverage per voxel); d1 adds hemibrain crops 002 + 003 (~30x).
+    for i, data in enumerate(["hemibrain_eb", "hemibrain_wide"]):
         p = Params()
-        p.savedir = f"outdir/e00/width-defer/d{i}/"
+        p.savedir = f"outdir/e00/train6h_hemi/d{i}/"
+        p.data = data
         p.views = "displace"
         p.patch_size = (128, 128, 128)
         p.global_size = (96, 96, 96)
         p.local_size = (64, 64, 64)
         p.cudagraphs = True
         p.batch_views = True
-        p.width = w
-        p.defer_image_ops = defer
         p.n_workers = 8
-        p.n_gpus = ng
+        p.n_gpus = 8
+        p.max_hours = 6.0
+        p.steps_per_epoch = 1_000_000  # upper bound; max_hours stops it
         params.append(p)
     # pprint(params)
     return params
@@ -119,8 +122,9 @@ def run(n:int):
         dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo")
 
     # volumes = [x.to_miao() for x in lmd.all() if x.name == "exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001"]
-    # gary_comparison's hemibrain EB train split (lib/data.py), images only. Boxes are x y z; output is z y x.
-    volumes = [lmd.get(HEMIBRAIN_EB).to_miao(bounding_box=HEMIBRAIN_EB_BOXES["train"][::-1])]
+    # Training volumes (lib/data.py), images only. Boxes are x y z; output is z y x.
+    # With several volumes miao samples each equally (size_weighting_exponent=0); the wide crops are ~equal size.
+    volumes = [lmd.get(name).to_miao(bounding_box=box[::-1]) for name, box in TRAIN_BOXES[par.data].items()]
     mcfg = MiaoConfig(
         volumes=volumes,
         patch_size=list(par.patch_size),
@@ -184,6 +188,7 @@ def run(n:int):
         # start all-reducing until backward is done. Per-block compile releases each block's grads as it finishes.
         for m in (model.encoder.blocks if par.compile_blocks else [model.encoder]):
             m.compile(**kwargs)
+    lejepa = model  # unwrapped, for checkpoints
     if world_size > 1:
         # SIGReg and projector BatchNorm statistics stay per-rank (local batch) for now.
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank] if device.type == "cuda" else None)
@@ -191,6 +196,15 @@ def run(n:int):
             from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
             model.register_comm_hook(None, default_hooks.bf16_compress_hook)
     opt = torch.optim.Adam(model.parameters(), lr = 1e-4)
+    CHECKPOINT_EVERY = 2000  # steps; ~15 min at 8 GPUs
+
+    def save_checkpoint(step):
+        if not rank0:
+            return
+        tmp, path = savedir / "checkpoint.pt.tmp", savedir / "checkpoint.pt"
+        torch.save({"step": step, "params": asdict(par), "model": lejepa.state_dict(), "opt": opt.state_dict()}, tmp)
+        tmp.replace(path)  # never leave a half-written checkpoint.pt
+        print(f"Saved {path} at step {step}", flush=True)
     use_cuda = device.type == "cuda"
     activities = [torch.profiler.ProfilerActivity.CPU]
     if use_cuda:
@@ -310,6 +324,17 @@ def run(n:int):
                 if idx_step + 1 == profile_stop:
                     profile_scope.close()
                     prof = None
+            if idx_step % CHECKPOINT_EVERY == CHECKPOINT_EVERY - 1:
+                save_checkpoint(idx_step + 1)
+            # Time limit: checked every 100 steps with one all-reduce, so every rank stops at the same step.
+            if par.max_hours and idx_step % 100 == 99:
+                stop = torch.tensor(float(time.time() - start_time > par.max_hours * 3600), device=device)
+                if world_size > 1:
+                    dist.all_reduce(stop, op=dist.ReduceOp.MAX)
+                if stop.item():
+                    print(f"Reached max_hours={par.max_hours} at step {idx_step + 1}", flush=True)
+                    break
+    save_checkpoint(idx_step + 1)
     if world_size > 1:
         dist.destroy_process_group()
 
@@ -319,10 +344,11 @@ def runlsf(n:int):
     par:Params = allparams()[n]
     wipedir(par.savedir)
     RUN_NAME = "e00_basic"
+    minutes = int(par.max_hours * 60) + 30 if par.max_hours else 15  # 30 min slack for startup + final checkpoint
     CPUS_PER_GPU = 12  # 8 GPUs -> all 96 cores; training processes need cores beyond the data workers
     assert par.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={par.n_workers} leaves no core for the training process"
     cmd = f""" bsub -J {RUN_NAME} \
-        -W 0:15 \
+        -W {minutes // 60}:{minutes % 60:02d} \
         -P miaai \
         -n {par.n_gpus * CPUS_PER_GPU} \
         -R "span[hosts=1]" \
