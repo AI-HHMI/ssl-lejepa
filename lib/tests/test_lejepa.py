@@ -103,3 +103,17 @@ def test_view_maker_crops_are_flipped_subblocks():
             y0, x0 = divmod(rem, X)
             cz, cy, cx = crop.shape
             assert torch.equal(crop, x[b, 0, z0:z0 + cz, y0:y0 + cy, x0:x0 + cx])
+
+
+def test_view_maker_displace_locals_inside_globals():
+    B, Z, Y, X = 4, 48, 64, 64
+    x = torch.arange(B * Z * Y * X, dtype=torch.float32).view(B, 1, Z, Y, X)
+    maker = ViewMaker(n_global=2, n_local=3, flip=False, patch_size=(8, 8, 8), views="displace",
+                      global_size=(32, 48, 48), local_size=(16, 24, 24), generator=torch.Generator().manual_seed(0))
+    globals_, locals_ = maker(x)
+    assert all(g.shape == (B, 1, 32, 48, 48) for g in globals_)
+    assert all(l.shape == (B, 1, 16, 24, 24) for l in locals_)
+    for l in locals_:
+        for b in range(B):
+            # Unflipped: the local's values are a contiguous sub-block of one of this sample's globals.
+            assert any(set(l[b].flatten().tolist()) <= set(g[b].flatten().tolist()) for g in globals_)

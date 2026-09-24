@@ -44,6 +44,9 @@ class Params:
     prefetch_factor: int = 2
     amp: bool = False  # bf16 autocast for forward + loss
     compile: bool = False  # torch.compile(dynamic=True) the encoder
+    views: str = "basic"  # 'basic' (random scales) or 'displace' (fixed sizes below, locals inside globals)
+    global_size: list[int] = field(default_factory=lambda: [40, 128, 128])  # displace only
+    local_size: list[int] = field(default_factory=lambda: [32, 96, 96])  # displace only
     n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); batch_size and n_workers are per GPU
 
     # profiling params
@@ -145,7 +148,9 @@ def run(n:int):
     cfg = LejepaConfig(
         n_layers = par.n_layers,
         width = 512,
-        views = 'basic',
+        views = par.views,
+        global_size = tuple(par.global_size),
+        local_size = tuple(par.local_size),
         lamb = 0.1,
     )
     model = Lejepa(cfg)

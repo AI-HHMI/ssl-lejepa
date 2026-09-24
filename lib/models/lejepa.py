@@ -89,11 +89,13 @@ class LejepaConfig:
     proj_norm: str = "bn"
 
     # Multi-Crop Views
-    views: str = "basic"  # 'basic', 'dino', or 'none'
+    views: str = "basic"  # 'basic', 'displace', or 'none' (see ViewMaker)
     n_global: int = 2
     n_local: int = 4
-    global_scale: Tuple[float, float] = (0.5, 1.0)
-    local_scale: Tuple[float, float] = (0.15, 0.5)
+    global_scale: Tuple[float, float] = (0.5, 1.0)  # basic
+    local_scale: Tuple[float, float] = (0.15, 0.5)  # basic
+    global_size: Tuple[int, int, int] = (40, 128, 128)  # displace
+    local_size: Tuple[int, int, int] = (32, 96, 96)  # displace
     flip: bool = True
     token_dropout: float = 0.0
 
@@ -127,6 +129,8 @@ class LejepaConfig:
         n_local: int = 4,
         global_scale: Tuple[float, float] = (0.5, 1.0),
         local_scale: Tuple[float, float] = (0.15, 0.5),
+        global_size: Tuple[int, int, int] = (40, 128, 128),
+        local_size: Tuple[int, int, int] = (32, 96, 96),
         flip: bool = True,
         token_dropout: float = 0.0,
         lamb: float = 0.02,
@@ -178,6 +182,8 @@ class LejepaConfig:
         self.n_local = n_local
         self.global_scale = global_scale
         self.local_scale = local_scale
+        self.global_size = global_size
+        self.local_size = local_size
         self.flip = flip
         self.token_dropout = token_dropout
         self.lamb = lamb
@@ -310,6 +316,9 @@ class Lejepa(nn.Module):
                 local_scale=self.cfg.local_scale,
                 flip=self.cfg.flip,
                 patch_size=self.encoder.patch_embed.patch_size,
+                views=self.cfg.views,
+                global_size=self.cfg.global_size,
+                local_size=self.cfg.local_size,
             )
         else:
             self.view_maker = None
