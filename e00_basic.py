@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from contextlib import ExitStack, nullcontext
 
+import math
 from math import prod
 from itertools import product
 
@@ -84,7 +85,7 @@ def allparams():
         p.n_workers = 8
         p.n_gpus = 8
         p.max_hours = 6.0
-        p.steps_per_epoch = 1_000_000  # upper bound; max_hours stops it
+        p.steps_per_epoch = 44_000  # ~6 h at 8xH200 (d0 did 44.4k); sets the cosine horizon, max_hours is the backstop
         params.append(p)
     # pprint(params)
     return params
@@ -198,16 +199,32 @@ def run(n:int):
         if par.grad_compress:
             from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
             model.register_comm_hook(None, default_hooks.bf16_compress_hook)
-    opt = torch.optim.Adam(model.parameters(), lr = 1e-4)
-    CHECKPOINT_EVERY = 2000  # steps; ~15 min at 8 GPUs
+    LR, LR_WARMUP, LR_FLOOR = 1e-4, 1000, 0.01  # peak lr; linear warmup steps; cosine ends at LR_FLOOR * LR
+    GRAD_CLIP = 1.0  # max global grad norm
+    CHECKPOINT_EVERY, CHECKPOINT_KEEP = 2000, 1  # steps (~15 min at 8 GPUs); newest checkpoints kept
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
+    # Warmup then cosine decay over steps_per_epoch, by step count so every rank uses the same lr.
+    # For max_hours runs set steps_per_epoch to the expected step count so the schedule completes.
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / LR_WARMUP) * (
+        LR_FLOOR + (1 - LR_FLOOR) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / par.steps_per_epoch)))))
 
     def save_checkpoint(step):
         if not rank0:
             return
-        tmp, path = savedir / "checkpoint.pt.tmp", savedir / "checkpoint.pt"
-        torch.save({"step": step, "params": asdict(par), "model": lejepa.state_dict(), "opt": opt.state_dict()}, tmp)
-        tmp.replace(path)  # never leave a half-written checkpoint.pt
-        print(f"Saved {path} at step {step}", flush=True)
+        state = lejepa.state_dict()
+        bad = [k for k, v in state.items() if v.is_floating_point() and not torch.isfinite(v).all()]
+        if bad:  # never let a diverged model overwrite good checkpoints
+            print(f"Not saving step {step}: {len(bad)} non-finite tensors, e.g. {bad[0]}", flush=True)
+            return
+        ckdir = savedir / "checkpoints"
+        ckdir.mkdir(exist_ok=True)
+        tmp, path = ckdir / "tmp.pt", ckdir / f"step_{step:07d}.pt"
+        torch.save({"step": step, "params": asdict(par), "model": state, "opt": opt.state_dict(), "sched": sched.state_dict()}, tmp)
+        tmp.replace(path)  # never leave a half-written checkpoint
+        for old in sorted(ckdir.glob("step_*.pt"))[:-CHECKPOINT_KEEP]:
+            old.unlink()
+        print(f"Saved {path}", flush=True)
+
     use_cuda = device.type == "cuda"
     activities = [torch.profiler.ProfilerActivity.CPU]
     if use_cuda:
@@ -281,12 +298,15 @@ def run(n:int):
             with phase("05_BACKWARD"):
                 out.loss.backward()
             with phase("06_OPTIMIZER"):
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)  # no host sync
                 opt.step()
                 opt.zero_grad()
+                sched.step()
             with phase("07_LOGGING"):
                 if rank0 and (idx_step % 10 == 0 or idx_step + 1 == par.steps_per_epoch):
                     loss = out.loss.detach().item()
-                    metrics_file.write(json.dumps({"tbl": "metrics", "idx_step": idx_step, "time": time.time() - start_time, "loss": loss}) + "\n")
+                    metrics_file.write(json.dumps({"tbl": "metrics", "idx_step": idx_step, "time": time.time() - start_time, "loss": loss,
+                                                   "grad_norm": grad_norm.item(), "lr": sched.get_last_lr()[0]}) + "\n")
                     metrics_file.flush()
                     print(f"finished step {idx_step + 1}/{par.steps_per_epoch}, loss={loss:.4f}", flush=True)
 
@@ -327,16 +347,22 @@ def run(n:int):
                 if idx_step + 1 == profile_stop:
                     profile_scope.close()
                     prof = None
-            if idx_step % CHECKPOINT_EVERY == CHECKPOINT_EVERY - 1:
-                save_checkpoint(idx_step + 1)
-            # Time limit: checked every 100 steps with one all-reduce, so every rank stops at the same step.
-            if par.max_hours and idx_step % 100 == 99:
-                stop = torch.tensor(float(time.time() - start_time > par.max_hours * 3600), device=device)
+            # Every 100 steps, one all-reduce so every rank stops at the same step:
+            # on a non-finite loss (divergence) or past max_hours.
+            if idx_step % 100 == 99:
+                b1 = not torch.isfinite(out.loss.detach()).item()
+                b2 = bool(par.max_hours) and time.time() - start_time > par.max_hours * 3600
+                stop = torch.tensor([float(b1), float(b2)], device=device)
                 if world_size > 1:
                     dist.all_reduce(stop, op=dist.ReduceOp.MAX)
-                if stop.item():
+                if stop[0].item():
+                    print(f"Non-finite loss by step {idx_step + 1}; stopping (checkpoints keep the last finite weights)", flush=True)
+                    break
+                if stop[1].item():
                     print(f"Reached max_hours={par.max_hours} at step {idx_step + 1}", flush=True)
                     break
+            if idx_step % CHECKPOINT_EVERY == CHECKPOINT_EVERY - 1:
+                save_checkpoint(idx_step + 1)
     save_checkpoint(idx_step + 1)
     if world_size > 1:
         dist.destroy_process_group()
@@ -351,7 +377,9 @@ def pca(n: int):
     from PIL import Image
     par: Params = allparams()[n]
     savedir = Path(par.savedir)
-    ckpt = torch.load(savedir / "checkpoint.pt", map_location="cpu", weights_only=False)
+    # Newest numbered checkpoint; runs from before numbered checkpoints saved a single checkpoint.pt.
+    paths = sorted((savedir / "checkpoints").glob("step_*.pt")) or [savedir / "checkpoint.pt"]
+    ckpt = torch.load(paths[-1], map_location="cpu", weights_only=False)
     model = Lejepa(lejepa_config(par))
     model.load_state_dict(ckpt["model"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
