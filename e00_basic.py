@@ -36,7 +36,6 @@ import plotly.graph_objects as go
 @dataclass(slots=True)
 class Params:
     savedir: str = "outdir/e00/main/basic/"
-    # patch_size: list[int] = field(default_factory=lambda: [104, 232, 232])
     data: TrainData = "hemibrain_eb"  # training volumes, see lib.data.TRAIN_BOXES
     patch_size: Tup3Int = (104, 104, 104)  # hemibrain EB is 8 nm isotropic
     batch_size: int = 84
@@ -68,14 +67,12 @@ class Params:
 
 def allparams():
     params = []
-    # Training runs: best throughput config on a full 8xH200 node for 6 h (~7.8M tok/s, ~45k steps each).
-    # d0 trains on the EB train split (~850x coverage per voxel); d1 adds hemibrain crops 002 + 003 (~30x).
-    # for i, data in enumerate(["hemibrain_eb", "hemibrain_wide"]):
-    # Wider encoders at 1 GPU (MFU vs width), and uint8 transfer (defer_image_ops) at 1 and 8 GPUs.
-    runs = [(w, False, 1) for w in [512, 768, 1024]] + [(512, True, 1)] + [(512, d, 8) for d in [False, True]]
-    for i, (w, defer, ng) in enumerate(runs):
+    # RTX PRO 6000 Blackwell (95.5 GB, PCIe, meant for single-GPU jobs): which width x batch fits, and at what MFU?
+    # H200 peaks at batch 84 were 95 GB (width 512) and 142 GB (768), so batch 84 can't fit here.
+    runs = list(product([512, 768], [16, 32, 48, 64]))
+    for i, (w, bs) in enumerate(runs):
         p = Params()
-        p.savedir = f"outdir/e00/width-defer-repeat/d{i}/"
+        p.savedir = f"outdir/e00/rtx6k-memory/d{i}/"
         p.data = "hemibrain_eb"
         p.views = "displace"
         p.patch_size = (128, 128, 128)
@@ -83,14 +80,10 @@ def allparams():
         p.local_size = (64, 64, 64)
         p.cudagraphs = True
         p.batch_views = True
-        # p.n_workers = 8
-        # p.n_gpus = 8
-        # p.max_hours = 6.0
-        # p.steps_per_epoch = 44_000  # ~6 h at 8xH200 (d0 did 44.4k); sets the cosine horizon, max_hours is the backstop
         p.width = w
-        p.defer_image_ops = defer
+        p.batch_size = bs
         p.n_workers = 8
-        p.n_gpus = ng
+        p.n_gpus = 1
         params.append(p)
     # pprint(params)
 
@@ -251,53 +244,65 @@ def run(n:int):
             old.unlink()
         print(f"Saved {path}", flush=True)
 
-    # Only rank 0 writes results and profiles.
-    with open(savedir / "metrics.json" if rank0 else os.devnull, "a") as metrics_file, Benchmark(par, device, world_size, rank0) as bench:
-        for idx_step in range(par.steps_per_epoch):
-            if par.cudagraphs:
-                torch.compiler.cudagraph_mark_step_begin()  # previous step's graph outputs may be overwritten
-            bench.begin(idx_step)
-            # No annotation hooks or profiler are active during the throughput baseline.
-            with bench.phase("01_DATA_IO"):
-                x = next(batches)
-            with bench.phase("03_H2D_TRANSFER"):
-                # Deferred batches are dicts of per-sample uint8 crops; finish_images copies and normalizes them.
-                x = finish_images(x, device)["img"] if par.defer_image_ops else x.to(device, non_blocking=True)
-            with bench.phase("04_FORWARD_AND_LOSS"), torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.amp):
-                out = model(x)
-            bench.count(out)
-            with bench.phase("05_BACKWARD"):
-                out.loss.backward()
-            with bench.phase("06_OPTIMIZER"):
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)  # no host sync
-                opt.step()
-                opt.zero_grad()
-                sched.step()
-            with bench.phase("07_LOGGING"):
-                if rank0 and (idx_step % 10 == 0 or idx_step + 1 == par.steps_per_epoch):
-                    loss = out.loss.detach().item()
-                    metrics_file.write(json.dumps({"tbl": "metrics", "idx_step": idx_step, "time": time.time() - start_time, "loss": loss,
-                                                   "grad_norm": grad_norm.item(), "lr": sched.get_last_lr()[0]}) + "\n")
-                    metrics_file.flush()
-                    print(f"finished step {idx_step + 1}/{par.steps_per_epoch}, loss={loss:.4f}", flush=True)
+    idx_step = -1
+    try:
+        # Only rank 0 writes results and profiles.
+        with open(savedir / "metrics.json" if rank0 else os.devnull, "a") as metrics_file, Benchmark(par, device, world_size, rank0) as bench:
+            for idx_step in range(par.steps_per_epoch):
+                if par.cudagraphs:
+                    torch.compiler.cudagraph_mark_step_begin()  # previous step's graph outputs may be overwritten
+                bench.begin(idx_step)
+                # No annotation hooks or profiler are active during the throughput baseline.
+                with bench.phase("01_DATA_IO"):
+                    x = next(batches)
+                with bench.phase("03_H2D_TRANSFER"):
+                    # Deferred batches are dicts of per-sample uint8 crops; finish_images copies and normalizes them.
+                    x = finish_images(x, device)["img"] if par.defer_image_ops else x.to(device, non_blocking=True)
+                with bench.phase("04_FORWARD_AND_LOSS"), torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.amp):
+                    out = model(x)
+                bench.count(out)
+                with bench.phase("05_BACKWARD"):
+                    out.loss.backward()
+                with bench.phase("06_OPTIMIZER"):
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)  # no host sync
+                    opt.step()
+                    opt.zero_grad()
+                    sched.step()
+                with bench.phase("07_LOGGING"):
+                    if rank0 and (idx_step % 10 == 0 or idx_step + 1 == par.steps_per_epoch):
+                        loss = out.loss.detach().item()
+                        metrics_file.write(json.dumps({"tbl": "metrics", "idx_step": idx_step, "time": time.time() - start_time, "loss": loss,
+                                                       "grad_norm": grad_norm.item(), "lr": sched.get_last_lr()[0]}) + "\n")
+                        metrics_file.flush()
+                        print(f"finished step {idx_step + 1}/{par.steps_per_epoch}, loss={loss:.4f}", flush=True)
 
-            bench.end(idx_step)
-            # Every 100 steps, one all-reduce so every rank stops at the same step:
-            # on a non-finite loss (divergence) or past max_hours.
-            if idx_step % 100 == 99:
-                b1 = not torch.isfinite(out.loss.detach()).item()
-                b2 = bool(par.max_hours) and time.time() - start_time > par.max_hours * 3600
-                stop = torch.tensor([float(b1), float(b2)], device=device)
-                if world_size > 1:
-                    dist.all_reduce(stop, op=dist.ReduceOp.MAX)
-                if stop[0].item():
-                    print(f"Non-finite loss by step {idx_step + 1}; stopping (checkpoints keep the last finite weights)", flush=True)
-                    break
-                if stop[1].item():
-                    print(f"Reached max_hours={par.max_hours} at step {idx_step + 1}", flush=True)
-                    break
-            if idx_step % CHECKPOINT_EVERY == CHECKPOINT_EVERY - 1:
-                save_checkpoint(idx_step + 1)
+                bench.end(idx_step)
+                # Every 100 steps, one all-reduce so every rank stops at the same step:
+                # on a non-finite loss (divergence) or past max_hours.
+                if idx_step % 100 == 99:
+                    b1 = not torch.isfinite(out.loss.detach()).item()
+                    b2 = bool(par.max_hours) and time.time() - start_time > par.max_hours * 3600
+                    stop = torch.tensor([float(b1), float(b2)], device=device)
+                    if world_size > 1:
+                        dist.all_reduce(stop, op=dist.ReduceOp.MAX)
+                    if stop[0].item():
+                        print(f"Non-finite loss by step {idx_step + 1}; stopping (checkpoints keep the last finite weights)", flush=True)
+                        break
+                    if stop[1].item():
+                        print(f"Reached max_hours={par.max_hours} at step {idx_step + 1}", flush=True)
+                        break
+                if idx_step % CHECKPOINT_EVERY == CHECKPOINT_EVERY - 1:
+                    save_checkpoint(idx_step + 1)
+    except torch.OutOfMemoryError as err:
+        # Record the OOM as a result (the table shows which configs don't fit), then fail the job as usual.
+        if rank0:
+            row = {"tbl": "oom", "time": time.time(), "params": asdict(par), "idx_step": idx_step,
+                   "error": str(err).splitlines()[0][:300]}
+            if device.type == "cuda":
+                row |= {"gpu_name": torch.cuda.get_device_name(device), "max_mem_gb": torch.cuda.max_memory_allocated(device) / 1e9}
+            with open(savedir / "performance.json", "a") as f:
+                f.write(json.dumps(row) + "\n")
+        raise
     save_checkpoint(idx_step + 1)
     if world_size > 1:
         dist.destroy_process_group()
@@ -399,7 +404,7 @@ def runlsf(n:int):
         -n {par.n_gpus * CPUS_PER_GPU} \
         -R "span[hosts=1]" \
         -gpu "num={par.n_gpus}:mode=exclusive_process" \
-        -q gpu_h200 \
+        -q gpu_rtx6000 \
         -o {par.savedir}/job_%J.log \
         uv run torchrun --standalone --nproc_per_node={par.n_gpus} e00_basic.py run {n}
         """
@@ -488,6 +493,7 @@ def table():
         res[k] = res.savedir.map(dict(zip(trace.savedir, trace[k]))) if k in trace else float("nan")
     cols = {
         "savedir": "run",
+        "tbl": "result",  # "throughput", or "oom" for runs that ran out of GPU memory
         # "views": "views",
         # "patch_size": "input",
         # "global_size": "global",
