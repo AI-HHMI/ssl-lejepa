@@ -26,6 +26,7 @@ from miao import VolumeDataset
 from rich import print as pprint
 import pandas
 import plotly.express as px
+import plotly.graph_objects as go
 
 
 @dataclass(slots=True)
@@ -328,12 +329,26 @@ def plot1():
     px.line(res, x="idx_step", y="loss", color="views", facet_col="n_gpus", markers=True).show()
 
 def plot2():
+    """ktok/s per GPU: one bar per result row, bars grouped by n_gpus with gaps between groups, colored by views."""
     res = loadJsonTable("performance.json")
-    res['vox'] = res.patch_size.apply(prod)
-    pprint(res.columns)
-    res["tokens_per_second_per_gpu"] = res.tokens_per_second / res.n_gpus
-    px.line(res, x="n_gpus", y="tokens_per_second_per_gpu", color="views", markers=True).show()
-    px.bar(res, x="compile", y="input_mvox_per_second", color="compile", facet_col="batch_size", facet_row="amp", barmode="group").show()
+    res["ktok_s_per_gpu"] = res.tokens_per_second / res.n_gpus / 1e3
+    # Bar label: savedir relative to the sweep's common prefix, plus a suffix for repeated rows in one run.
+    prefix = os.path.commonpath(list(res.savedir))
+    repeat = res.groupby("savedir").cumcount()
+    res["run"] = res.savedir.str[len(prefix):].str.strip("/") + repeat.map(lambda k: f".{k}" if k else "")
+    res = res.sort_values(["n_gpus", "views", "run"]).reset_index(drop=True)
+    # x positions: consecutive within a group, GROUP_GAP extra slots between groups.
+    GROUP_GAP = 0.8
+    group_idx = res.n_gpus.rank(method="dense").astype(int) - 1
+    res["x"] = res.index + GROUP_GAP * group_idx
+    fig = go.Figure()
+    for color, r in res.groupby("views", sort=False):
+        fig.add_bar(x=r.x, y=r.ktok_s_per_gpu, name=str(color), width=0.9)
+    for g, r in res.groupby("n_gpus"):
+        fig.add_annotation(x=r.x.mean(), y=-0.12, yref="paper", text=f"<b>{g} gpu</b>", showarrow=False)
+    fig.update_xaxes(tickvals=res.x, ticktext=res.run)
+    fig.update_layout(yaxis_title="ktok/s per GPU", legend_title="views", margin=dict(b=80))
+    fig.show()
 
 def table():
     res = loadJsonTable("performance.json")
