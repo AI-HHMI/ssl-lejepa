@@ -12,7 +12,7 @@ from itertools import product
 
 # local
 
-from lib.data import TRAIN_BOXES
+from lib.data import HEMIBRAIN_EB, TRAIN_BOXES
 from lib.models import Lejepa, LejepaConfig
 from lib.util import *
 from lib.types import *
@@ -341,6 +341,86 @@ def run(n:int):
     if world_size > 1:
         dist.destroy_process_group()
 
+
+def pca(n: int):
+    """PCA maps of patch-token embeddings from allparams()[n]'s latest checkpoint, on a held-out EB val crop.
+
+    pca.png columns: EM | PCA of tokens | PCA after subtracting each tile's mean token | token L2 norm.
+    """
+    import torch
+    from PIL import Image
+    par: Params = allparams()[n]
+    savedir = Path(par.savedir)
+    ckpt = torch.load(savedir / "checkpoint.pt", map_location="cpu", weights_only=False)
+    model = Lejepa(lejepa_config(par))
+    model.load_state_dict(ckpt["model"])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    encoder = model.encoder.to(device).eval()
+
+    # One 96x384x384 (z y x) window inside EB's val slab (EB z 3000-4000), held out from training.
+    # miao needs the box strictly larger than the patch: one extra voxel per axis leaves exactly one window.
+    shape, z0, y0, x0 = (96, 384, 384), 3400, 2000, 2000
+    vol = lmd.get(HEMIBRAIN_EB).to_miao(bounding_box=[[o, o + s + 1] for o, s in zip((z0, y0, x0), shape)])
+    mcfg = MiaoConfig(volumes=[vol], patch_size=list(shape), resolutions=[[8.0, 8.0, 8.0]],
+                      samples_per_epoch=1, sampling="random", output_axes="lzyx")
+    img = VolumeDataset(mcfg)[0]["img"]  # 1 Z Y X in [0, 1]
+
+    # Tokens from non-overlapping tiles at the training global-view size, stitched into one grid.
+    tile, patch = par.global_size, encoder.patch_embed.patch_size
+    assert all(s % t == 0 for s, t in zip(shape, tile)), f"crop {shape} must tile by {tile}"
+    grid = [s // p for s, p in zip(shape, patch)]
+    feats = torch.empty(*grid, par.width)  # Z Y X D, tokens
+    with torch.no_grad(), torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+        for z, y, x in product(*(range(0, s, t) for s, t in zip(shape, tile))):
+            t = encoder.forward_features(img[None, :, z:z + tile[0], y:y + tile[1], x:x + tile[2]].to(device))
+            tz, ty, tx = (o // p for o, p in zip((z, y, x), patch))
+            gz, gy, gx = (t_ // p for t_, p in zip(tile, patch))
+            feats[tz:tz + gz, ty:ty + gy, tx:tx + gx] = t[0].float().reshape(gz, gy, gx, -1).cpu()
+
+    def pca_rgb(f):  # N D tokens -> (Z Y X 3 uint8 top-3 PCs, effective rank, top-10 explained variance)
+        f = f - f.mean(0)
+        _, sv, vh = torch.linalg.svd(f, full_matrices=False)
+        p = sv / sv.sum()
+        erank = float(torch.exp(-(p * p.clamp_min(1e-12).log()).sum()))  # effective rank; ~1 means collapse
+        pcs = (f @ vh[:3].T).reshape(*grid, 3)
+        lo, hi = torch.quantile(pcs.reshape(-1, 3), torch.tensor([0.01, 0.99]), dim=0)
+        rgb = ((pcs - lo) / (hi - lo)).clamp(0, 1).mul(255).byte().numpy()
+        return rgb, erank, (sv ** 2 / (sv ** 2).sum())[:10].tolist()
+
+    # Tile-centered tokens: subtract each tile's mean token, removing the per-view code and keeping within-view structure.
+    g = [t_ // p for t_, p in zip(tile, patch)]  # tokens per tile side
+    nt = [n // gi for n, gi in zip(grid, g)]  # tiles per axis
+    tiled = feats.reshape(nt[0], g[0], nt[1], g[1], nt[2], g[2], par.width)
+    centered = (tiled - tiled.mean(dim=(1, 3, 5), keepdim=True)).reshape(*grid, par.width)
+    rgb, erank, var = pca_rgb(feats.reshape(-1, par.width))
+    rgb_c, erank_c, var_c = pca_rgb(centered.reshape(-1, par.width))
+    between_tile = 1 - float(centered.var(dim=(0, 1, 2)).sum() / feats.var(dim=(0, 1, 2)).sum())
+
+    # Token norms: "register"-like tokens that store global information show up as sparse high-norm outliers.
+    norms = feats.norm(dim=-1)  # Z Y X
+    med = float(norms.median())
+    lo, hi = torch.quantile(norms.flatten(), torch.tensor([0.01, 0.999]))
+    norm_u8 = ((norms - lo) / (hi - lo)).clamp(0, 1).mul(255).byte().numpy()
+
+    # Rows: 3 z-slices; columns: EM | PCA | tile-centered PCA | token norm, upsampled to voxels.
+    up = lambda a: a.repeat(patch[1], axis=0).repeat(patch[2], axis=1)
+    vgap = np.full((shape[1], 8, 3), 255, np.uint8)
+    rows = []
+    for gz in [grid[0] // 6, grid[0] // 2, grid[0] * 5 // 6]:
+        zv = gz * patch[0] + patch[0] // 2
+        em = np.repeat((img[0, zv].numpy() * 255).astype(np.uint8)[..., None], 3, axis=2)
+        nm = np.repeat(norm_u8[gz][..., None], 3, axis=2)
+        rows.append(np.concatenate([em, vgap, up(rgb[gz]), vgap, up(rgb_c[gz]), vgap, up(nm)], axis=1))
+    gap = np.full((8, rows[0].shape[1], 3), 255, np.uint8)
+    Image.fromarray(np.concatenate([r for row in rows for r in (row, gap)][:-1], axis=0)).save(savedir / "pca.png")
+    stats = {"tbl": "pca", "step": ckpt["step"], "effective_rank": erank, "explained_variance": var,
+             "centered_effective_rank": erank_c, "centered_explained_variance": var_c,
+             "between_tile_variance": between_tile,  # fraction of token variance explained by tile means
+             "norm_median": med, "norm_p99": float(torch.quantile(norms.flatten(), 0.99)), "norm_max": float(norms.max()),
+             "norm_outliers": int((norms > 2 * med).sum()), "n_tokens": norms.numel()}
+    (savedir / "pca.json").write_text(json.dumps(stats) + "\n")
+    print(f"{savedir}: step {ckpt['step']}, effective rank {erank:.1f}, top-3 variance {sum(var[:3]):.2f}, "
+          f"between-tile variance {between_tile:.2f}, norm outliers (>2x median) {stats['norm_outliers']}/{norms.numel()}; wrote pca.png")
 
 def runlsf(n:int):
     import subprocess

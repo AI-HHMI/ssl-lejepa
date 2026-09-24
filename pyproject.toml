@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "ssl-lejepa"
 version = "0.1.0"
 description = "LeJEPA SSL for microsocopy"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "torch>=2.0",
     "numpy>=1.24",
@@ -17,6 +17,7 @@ dependencies = [
     "zarr>=2.16",
     "pandas",
     "plotly",
+    "pillow>=12.3.0",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +27,13 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["lib"]
+
+[tool.uv]
+# Lock only for the machines we use: local Macs and the Janelia cluster.
+environments = [
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
 
 [tool.uv.sources]
 lmd-catalog = { git = "https://github.com/AI-HHMI/lmd-catalog", branch = "main" }

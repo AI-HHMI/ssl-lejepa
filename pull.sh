@@ -5,6 +5,7 @@ oc-rsync -avz --delete \
   --include='**/profile.out' \
   --exclude='**/profile.json' \
   --include='*.json' \
+  --include='*.png' \
   --include='*.log' \
   --exclude='*' \
   --prune-empty-dirs \
