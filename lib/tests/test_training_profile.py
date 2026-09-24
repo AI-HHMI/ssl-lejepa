@@ -75,6 +75,7 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
     performance = json.loads((tmp_path / "performance.json").read_text())
     assert performance["steps"] == 2
     assert performance["samples_per_second"] > 0
+    assert performance["tflops_per_second"] > 0 and "mfu" not in performance  # CPU run: no peak to compare to
     # 8^3 input, 4^3 patches: 2 globals of 2^3 tokens, 1 local of 1^3 or 2^3 tokens.
     assert 2 * 8 + 1 <= performance["tokens_per_sample"] <= 3 * 8
     assert performance["seconds_per_step"] == performance["seconds"] / 2

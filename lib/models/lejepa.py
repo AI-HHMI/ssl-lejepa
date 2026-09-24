@@ -99,6 +99,7 @@ class LejepaConfig:
     local_size: Tup3Int = (32, 96, 96)  # displace
     flip: bool = True
     token_dropout: float = 0.0
+    batch_views: bool = False  # one encoder call per group of same-shape views (projector BN then pools the group)
 
     # Objective / Loss
     lamb: float = 0.02
@@ -134,6 +135,7 @@ class LejepaConfig:
         local_size: Tup3Int = (32, 96, 96),
         flip: bool = True,
         token_dropout: float = 0.0,
+        batch_views: bool = False,
         lamb: float = 0.02,
         num_slices: int = 256,
         sigreg_knots: int = 17,
@@ -187,6 +189,7 @@ class LejepaConfig:
         self.local_size = local_size
         self.flip = flip
         self.token_dropout = token_dropout
+        self.batch_views = batch_views
         self.lamb = lamb
         self.num_slices = num_slices
         self.sigreg_knots = sigreg_knots
@@ -324,6 +327,10 @@ class Lejepa(nn.Module):
         else:
             self.view_maker = None
 
+        # For FLOP accounting in forward.
+        self._n_encoder_params = sum(p.numel() for p in self.encoder.parameters())
+        self._n_projector_params = sum(p.numel() for p in self.projector.parameters()) if self.projector is not None else 0
+
     def encode(self, x: Tensor) -> Tensor:
         """Encode input volume directly to embedding representations (B, width)."""
         return self.encoder(x)
@@ -338,6 +345,23 @@ class Lejepa(nn.Module):
         """Encode input volume and project to metric space."""
         emb = self.encode(x)
         return self.project(emb)
+
+    def encode_views(self, views: list[Tensor]) -> Tensor:
+        """Encode and project each view (each Batch C Z Y X) -> View Batch D.
+
+        With cfg.batch_views, same-shape views are concatenated along Batch into one encoder call.
+        """
+        if not self.cfg.batch_views:
+            return torch.stack([self.encode_and_project(v) for v in views])
+        groups: dict[tuple[int, ...], list[int]] = {}
+        for i, v in enumerate(views):
+            groups.setdefault(tuple(v.shape), []).append(i)
+        out: list[Tensor] = [views[0]] * len(views)  # placeholders, all overwritten below
+        for idx in groups.values():
+            z = self.encode_and_project(torch.cat([views[i] for i in idx]))  # (len(idx)·Batch) D
+            for i, zi in zip(idx, z.chunk(len(idx))):
+                out[i] = zi
+        return torch.stack(out)
 
     def forward(
         self,
@@ -381,14 +405,10 @@ class Lejepa(nn.Module):
 
         # Encode and project each view group
         # Each view is (B, C, Z_v, Y_v, X_v) -> projected to (B, proj_dim)
-        proj_globals = torch.stack([
-            self.encode_and_project(v) for v in g_views
-        ], dim=0)  # (n_globals, B, proj_dim)
+        proj_globals = self.encode_views(g_views)  # (n_globals, B, proj_dim)
 
         if l_views:
-            proj_locals = torch.stack([
-                self.encode_and_project(v) for v in l_views
-            ], dim=0)  # (n_locals, B, proj_dim)
+            proj_locals = self.encode_views(l_views)  # (n_locals, B, proj_dim)
             proj_all = torch.cat([proj_globals, proj_locals], dim=0)
         else:
             proj_all = proj_globals
@@ -404,4 +424,12 @@ class Lejepa(nn.Module):
         # Encoder tokens this step, summed over views and batch (python int, no device sync).
         patch_vol = prod(self.encoder.patch_embed.patch_size)
         out.n_tokens = sum(v.shape[0] * prod(v.shape[2:]) // patch_vol for v in [*g_views, *l_views])
+        # Model training FLOPs this step (backward ~ 2x forward): per token, 6 x encoder params for the weights
+        # plus 12 x depth x width x N for attention over its N-token view; per sample, 6 x projector params.
+        # Ignores flash-attention recompute and elementwise ops, as MFU conventionally does.
+        out.n_flops = sum(
+            v.shape[0] * (n * (6 * self._n_encoder_params + 12 * self.cfg.n_layers * self.cfg.width * n) + 6 * self._n_projector_params)
+            for v in [*g_views, *l_views]
+            for n in [prod(v.shape[2:]) // patch_vol]
+        )
         return out

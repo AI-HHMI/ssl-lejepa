@@ -28,6 +28,10 @@ import pandas
 import plotly.express as px
 import plotly.graph_objects as go
 
+# Dense bf16 tensor-core peak per GPU, matched by substring of torch.cuda.get_device_name().
+# B300/B200 from NVIDIA's HGX spec (36 PFLOPS sparse per 8 GPUs); check the datasheet if it matters.
+PEAK_BF16_TFLOPS = {"H100": 989, "H200": 989, "B200": 2250, "B300": 2250}
+
 
 @dataclass(slots=True)
 class Params:
@@ -49,6 +53,7 @@ class Params:
     compile: bool = True  # torch.compile(dynamic=True) the encoder
     cudagraphs: bool = False  # instead compile static with CUDA graphs (mode="reduce-overhead"); needs compile + displace views
     compile_blocks: bool = False  # compile each transformer block separately so DDP can overlap all-reduce with backward
+    batch_views: bool = False  # one encoder call per group of same-shape views (2 per step with displace)
     grad_compress: bool = False  # DDP bf16_compress_hook: all-reduce gradients in bf16 (half the bytes)
     n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); batch_size and n_workers are per GPU
 
@@ -59,19 +64,17 @@ class Params:
 
 def allparams():
     params = []
-    # 8-GPU all-reduce cost: bf16 gradient compression x per-block compile (overlap with backward),
-    # with 1-GPU baselines. All jobs now get 12 cores per GPU (full node at 8 GPUs).
-    runs = [(1, False, False), (1, True, False)] + [(8, b, c) for b in [False, True] for c in [False, True]]
-    for i, (ng, blocks, compress) in enumerate(runs):
+    # Batched encoder calls (2 per step: all globals, all locals) vs one call per view (6), at 1 and 8 GPUs.
+    runs = [(bv, ng) for ng in [1, 8] for bv in [False, True]]
+    for i, (bv, ng) in enumerate(runs):
         p = Params()
-        p.savedir = f"outdir/e00/allreduce/d{i}/"
+        p.savedir = f"outdir/e00/batchviews/d{i}/"
         p.views = "displace"
         p.patch_size = (128, 128, 128)
         p.global_size = (96, 96, 96)
         p.local_size = (64, 64, 64)
         p.cudagraphs = True
-        p.compile_blocks = blocks
-        p.grad_compress = compress
+        p.batch_views = bv
         p.n_workers = 8
         p.n_gpus = ng
         params.append(p)
@@ -153,6 +156,7 @@ def run(n:int):
         views = par.views,
         global_size = par.global_size,
         local_size = par.local_size,
+        batch_views = par.batch_views,
         lamb = 0.1,
     )
     model = Lejepa(cfg)
@@ -221,6 +225,7 @@ def run(n:int):
     prof = None
     benchmark_started = None
     n_tokens = 0  # encoder tokens since benchmark start
+    n_flops = 0  # model training FLOPs since benchmark start (see Lejepa.forward)
     # Only rank 0 writes results and profiles.
     with open(savedir / "metrics.json" if rank0 else os.devnull, "a") as metrics_file, ExitStack() as profile_scope:
         for idx_step in range(par.steps_per_epoch):
@@ -249,6 +254,7 @@ def run(n:int):
                 out = model(x)
             if benchmark_started is not None:
                 n_tokens += out.n_tokens
+                n_flops += out.n_flops
             with phase("05_BACKWARD"):
                 out.loss.backward()
             with phase("06_OPTIMIZER"):
@@ -262,10 +268,10 @@ def run(n:int):
                     print(f"finished step {idx_step + 1}/{par.steps_per_epoch}, loss={loss:.4f}", flush=True)
 
             if benchmark_started is not None and idx_step + 1 == benchmark_stop:
-                if world_size > 1:  # Tokens summed over ranks; every rank reaches this step.
-                    total = torch.tensor(n_tokens, device=device)
+                if world_size > 1:  # Tokens and FLOPs summed over ranks; every rank reaches this step.
+                    total = torch.tensor([n_tokens, n_flops], dtype=torch.float64, device=device)
                     dist.all_reduce(total)
-                    n_tokens = int(total.item())
+                    n_tokens, n_flops = int(total[0].item()), float(total[1].item())
                 synchronize()  # Only window boundaries synchronize; phases remain asynchronous.
                 seconds = time.perf_counter() - benchmark_started
                 steps = benchmark_stop - par.warmup_steps
@@ -279,11 +285,19 @@ def run(n:int):
                     "tokens_per_second": n_tokens / seconds,
                     "tokens_per_sample": n_tokens / (steps * par.batch_size * world_size),
                     "world_size": world_size,
+                    "tflops_per_second": n_flops / seconds / 1e12,  # node total
                 }
+                if use_cuda:
+                    gpu = torch.cuda.get_device_name(device)
+                    peaks = [v for k, v in PEAK_BF16_TFLOPS.items() if k in gpu]
+                    assert len(peaks) == 1, f"add {gpu!r} to PEAK_BF16_TFLOPS"
+                    result["gpu_name"] = gpu
+                    result["mfu"] = result["tflops_per_second"] / world_size / peaks[0]
                 if rank0:
                     with open(savedir / "performance.json", "a") as f:
                         f.write(json.dumps(result) + "\n")
-                print(f"Unprofiled: {seconds / steps:.3f} s/step, {samples_per_second:.2f} samples/s, {n_tokens / seconds:.0f} tokens/s")
+                print(f"Unprofiled: {seconds / steps:.3f} s/step, {samples_per_second:.2f} samples/s, {n_tokens / seconds:.0f} tokens/s, "
+                      f"{result['tflops_per_second'] / world_size:.0f} TFLOP/s/GPU" + (f", MFU {100 * result['mfu']:.1f}%" if use_cuda else ""))
             if prof is not None:
                 prof.step()
                 if idx_step + 1 == profile_stop:
@@ -365,14 +379,14 @@ def plot1():
             hover_data=["sizes", "n_workers"], markers=True).show()
 
 def plot2():
-    """ktok/s per GPU: one bar per result row, bars grouped by n_gpus with gaps between groups, colored by compile_blocks + grad_compress."""
+    """ktok/s per GPU: one bar per result row, bars grouped by n_gpus with gaps between groups, colored by batch_views."""
     res = loadJsonTable("performance.json")
     res["ktok_s_per_gpu"] = res.tokens_per_second / res.n_gpus / 1e3
     assert len(res), "no performance.json rows for allparams(); run ./pull.sh?"
     # Bar label: short run name, plus a suffix for repeated rows in one run.
     repeat = res.groupby("savedir").cumcount()
     res["run"] = short_runs(res.savedir) + repeat.map(lambda k: f".{k}" if k else "")
-    res["color"] = "blocks=" + res.compile_blocks.astype(str) + ", compress=" + res.grad_compress.astype(str)
+    res["color"] = "batch_views=" + res.batch_views.astype(str)
     res = res.sort_values(["n_gpus", "color", "run"]).reset_index(drop=True)
     # x positions: consecutive within a group, GROUP_GAP extra slots between groups.
     GROUP_GAP = 0.8
@@ -402,20 +416,29 @@ def table():
         # "local_size": "local",
         # "compile": "compile",
         # "cudagraphs": "cudagraphs",
-        "compile_blocks": "blocks",
-        "grad_compress": "compress",
+        # "compile_blocks": "blocks",
+        # "grad_compress": "compress",
+        "batch_views": "batch views",
         "n_gpus": "gpus",
         "batch_size": "batch",
         "n_workers": "workers",
         "gpu_busy": "gpu busy %",
         "samples_per_second": "samples/s",
         "tokens_per_second": "tok/s",
+        "tflops_per_second": "TFLOP/s",
+        "mfu": "mfu %",
         "input_mvox_per_second": "Mvox/s",
         "step_ms": "prof step ms",
         **phases,
     }
+    for k in cols:  # older runs predate some columns
+        if k not in res:
+            res[k] = float("nan")
     res = res[list(cols)].rename(columns=cols) # type: ignore
     res["gpu busy %"] *= 100
+    res["mfu %"] *= 100
+    res["TFLOP/s"] /= res["gpus"]
+    res = res.rename(columns={"TFLOP/s": "TFLOP/s/gpu"})
     res["tok/s"] /= 1e3
     res.insert(res.columns.get_loc("tok/s") + 1, "ktok/s/gpu", res["tok/s"] / res["gpus"])
     res = res.rename(columns={"tok/s": "ktok/s"}).round(1)
