@@ -48,6 +48,15 @@ def logish_samples(base, factors, final, N):
     res = [list(int(xi) for xi in x) for x in res]
     return res
 
+def json_equal(a, b) -> bool:
+    """Equality that survives a JSON round-trip: tuples and lists compare as sequences, dicts by key."""
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all(json_equal(x, y) for x, y in zip(a, b))
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(json_equal(a[k], b[k]) for k in a)
+    return a == b
+
+
 def trace_summary(trace_path: str | Path) -> dict[str, float]:
     """Averages over the profiled steps of a chrome trace.
 

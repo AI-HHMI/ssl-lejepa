@@ -12,6 +12,7 @@ from torch import Tensor
 
 from lib.encoders import ViT3DEncoder
 from lib.losses import LejepaOutput, SIGReg, lejepa_loss
+from lib.types import Tup3Int, Views
 from lib.views import ViewMaker
 
 
@@ -75,7 +76,7 @@ class LejepaConfig:
     width: int = 512
     num_heads: int = 8
     mlp_ratio: float = 4.0
-    patch_size: Union[int, Tuple[int, int, int]] = (8, 8, 8)
+    patch_size: Union[int, Tup3Int] = (8, 8, 8)
     in_channels: int = 1
     dropout: float = 0.0
     attention_dropout: float = 0.0
@@ -89,13 +90,13 @@ class LejepaConfig:
     proj_norm: str = "bn"
 
     # Multi-Crop Views
-    views: str = "basic"  # 'basic', 'displace', or 'none' (see ViewMaker)
+    views: Views = "basic"  # see ViewMaker
     n_global: int = 2
     n_local: int = 4
     global_scale: Tuple[float, float] = (0.5, 1.0)  # basic
     local_scale: Tuple[float, float] = (0.15, 0.5)  # basic
-    global_size: Tuple[int, int, int] = (40, 128, 128)  # displace
-    local_size: Tuple[int, int, int] = (32, 96, 96)  # displace
+    global_size: Tup3Int = (40, 128, 128)  # displace
+    local_size: Tup3Int = (32, 96, 96)  # displace
     flip: bool = True
     token_dropout: float = 0.0
 
@@ -114,7 +115,7 @@ class LejepaConfig:
         width: int = 512,
         num_heads: Optional[int] = None,
         mlp_ratio: float = 4.0,
-        patch_size: Union[int, Tuple[int, int, int]] = (8, 8, 8),
+        patch_size: Union[int, Tup3Int] = (8, 8, 8),
         in_channels: int = 1,
         dropout: float = 0.0,
         attention_dropout: float = 0.0,
@@ -124,13 +125,13 @@ class LejepaConfig:
         proj_hidden: int = 2048,
         proj_n_hidden: int = 2,
         proj_norm: str = "bn",
-        views: str = "basic",
+        views: Views = "basic",
         n_global: int = 2,
         n_local: int = 4,
         global_scale: Tuple[float, float] = (0.5, 1.0),
         local_scale: Tuple[float, float] = (0.15, 0.5),
-        global_size: Tuple[int, int, int] = (40, 128, 128),
-        local_size: Tuple[int, int, int] = (32, 96, 96),
+        global_size: Tup3Int = (40, 128, 128),
+        local_size: Tup3Int = (32, 96, 96),
         flip: bool = True,
         token_dropout: float = 0.0,
         lamb: float = 0.02,

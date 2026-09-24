@@ -15,6 +15,7 @@ from itertools import product
 
 from lib.models import Lejepa, LejepaConfig
 from lib.util import *
+from lib.types import *
 
 # external 
 
@@ -27,13 +28,11 @@ import pandas
 import plotly.express as px
 
 
-F32Mode = Literal["highest", "high", "medium"]
-
 @dataclass(slots=True)
 class Params:
     savedir: str = "outdir/e00/main/basic/"
     # patch_size: list[int] = field(default_factory=lambda: [104, 232, 232])
-    patch_size: list[int] = field(default_factory=lambda: [48, 144, 144])
+    patch_size: Tup3Int = (48, 144, 144)
     batch_size: int = 42
     steps_per_epoch: int = 71  # warmup + benchmark + 1 profiler warmup + profile steps: stop right after profiling
     n_layers: int = 12
@@ -44,9 +43,9 @@ class Params:
     prefetch_factor: int = 2
     amp: bool = False  # bf16 autocast for forward + loss
     compile: bool = False  # torch.compile(dynamic=True) the encoder
-    views: str = "basic"  # 'basic' (random scales) or 'displace' (fixed sizes below, locals inside globals)
-    global_size: list[int] = field(default_factory=lambda: [40, 128, 128])  # displace only
-    local_size: list[int] = field(default_factory=lambda: [32, 96, 96])  # displace only
+    views: Views = "basic"  # 'basic' (random scales) or 'displace' (fixed sizes below, locals inside globals)
+    global_size: Tup3Int = (40, 128, 128)  # displace only
+    local_size: Tup3Int = (32, 96, 96)  # displace only
     n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); batch_size and n_workers are per GPU
 
     # profiling params
@@ -115,7 +114,7 @@ def run(n:int):
     volumes = [x.to_miao() for x in lmd.all() if x.name == "exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001"]
     mcfg = MiaoConfig(
         volumes=volumes,
-        patch_size=par.patch_size,
+        patch_size=list(par.patch_size),
         resolutions=[[25.0, 10.0, 10.0]],
         samples_per_epoch=par.batch_size * par.steps_per_epoch,
         sampling="random",
@@ -149,8 +148,8 @@ def run(n:int):
         n_layers = par.n_layers,
         width = 512,
         views = par.views,
-        global_size = tuple(par.global_size),
-        local_size = tuple(par.local_size),
+        global_size = par.global_size,
+        local_size = par.local_size,
         lamb = 0.1,
     )
     model = Lejepa(cfg)
@@ -312,12 +311,17 @@ def loadJsonTable(filename):
             if line.strip():
                 record = json.loads(line)
                 if "params" in record:
-                    assert record["params"] == params, (
+                    # Params added after a run was saved must still be at their default, which that run used.
+                    saved = record["params"]
+                    defaults = asdict(Params())
+                    b1 = saved.keys() <= params.keys()
+                    b2 = all(json_equal(params[k], saved[k]) for k in saved if k in params)
+                    b3 = all(json_equal(params[k], defaults[k]) for k in params.keys() - saved.keys())
+                    assert b1 and b2 and b3, (
                         f"Parameter mismatch in {path}:\n"
-                        f"current: {params}\nsaved: {record['params']}"
+                        f"current: {params}\nsaved: {saved}"
                     )
                 row = {**params, **record}
-                row["patch_size"] = tuple(row["patch_size"])
                 rows.append(row)
     res = pandas.DataFrame(rows)
     pprint(res)

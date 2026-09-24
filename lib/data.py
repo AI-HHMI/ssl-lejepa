@@ -10,11 +10,12 @@ import numpy as np
 import zarr
 from zarr.storage import LocalStore
 from miao.config import MiaoConfig, VolumeConfig
+from lib.types import Tup3Int
 import lmd_catalog as lmd
 
 def create_mock_ome_zarr(
     root_path: Path | str,
-    shape: Tuple[int, int, int] = (128, 256, 256),
+    shape: Tup3Int = (128, 256, 256),
     resolutions: Tuple[float, float, float] = (25.0, 10.0, 10.0),
     group_key: str = "raw",
     dtype: str = "uint16",
@@ -79,7 +80,7 @@ def create_mock_ome_zarr(
 
 def get_mock_volume_config(
     mock_dir: Path | str = "/tmp/mock_flyliconn.zarr",
-    shape: Tuple[int, int, int] = (128, 256, 256),
+    shape: Tup3Int = (128, 256, 256),
     resolutions: Tuple[float, float, float] = (25.0, 10.0, 10.0),
 ) -> VolumeConfig:
     """Return a VolumeConfig pointing to a local mock volume, creating it if needed."""

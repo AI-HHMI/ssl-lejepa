@@ -10,10 +10,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from lib.types import Tup3Int
+
 
 def get_3d_sincos_pos_embed(
     embed_dim: int,
-    grid_size: Tuple[int, int, int],
+    grid_size: Tup3Int,
     device: Optional[torch.device] = None,
     dtype: torch.dtype = torch.float32,
 ) -> Tensor:
@@ -67,7 +69,7 @@ class PatchEmbed3d(nn.Module):
 
     def __init__(
         self,
-        patch_size: Union[int, Tuple[int, int, int]] = (8, 8, 8),
+        patch_size: Union[int, Tup3Int] = (8, 8, 8),
         in_channels: int = 1,
         embed_dim: int = 512,
     ):
@@ -85,7 +87,7 @@ class PatchEmbed3d(nn.Module):
             stride=patch_size,
         )
 
-    def forward(self, x: Tensor) -> Tuple[Tensor, Tuple[int, int, int]]:
+    def forward(self, x: Tensor) -> Tuple[Tensor, Tup3Int]:
         """Extract patch tokens from 3D volume.
 
         Args:
@@ -183,7 +185,7 @@ class ViT3DEncoder(nn.Module):
     def __init__(
         self,
         in_channels: int = 1,
-        patch_size: Union[int, Tuple[int, int, int]] = (8, 8, 8),
+        patch_size: Union[int, Tup3Int] = (8, 8, 8),
         embed_dim: int = 512,
         depth: int = 12,
         num_heads: int = 8,

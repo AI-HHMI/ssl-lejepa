@@ -7,11 +7,13 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
+from lib.types import Tup3Int, Views
+
 
 @dataclass
 class ViewConfig:
     """Configuration for multi-crop view creation."""
-    views: str = "basic"
+    views: Views = "basic"
     n_global: int = 2
     n_local: int = 4
     global_scale: Tuple[float, float] = (0.5, 1.0)
@@ -37,10 +39,10 @@ class ViewMaker:
         local_scale: Tuple[float, float] = (0.15, 0.5),
         flip: bool = True,
         generator: Optional[torch.Generator] = None,
-        patch_size: Tuple[int, int, int] = (1, 1, 1),
-        views: str = "basic",
-        global_size: Tuple[int, int, int] = (40, 128, 128),
-        local_size: Tuple[int, int, int] = (32, 96, 96),
+        patch_size: Tup3Int = (1, 1, 1),
+        views: Views = "basic",
+        global_size: Tup3Int = (40, 128, 128),
+        local_size: Tup3Int = (32, 96, 96),
     ):
         assert views in ("basic", "displace"), f"unknown views {views!r}"
         self.n_global = n_global
@@ -51,8 +53,8 @@ class ViewMaker:
         self.generator = generator
         self.patch_size = patch_size  # crop sizes are rounded to multiples of this
         self.views = views
-        self.global_size = tuple(global_size)
-        self.local_size = tuple(local_size)
+        self.global_size = global_size
+        self.local_size = local_size
         if views == "displace":
             for name, size in [("global_size", self.global_size), ("local_size", self.local_size)]:
                 assert all(s % p == 0 for s, p in zip(size, patch_size)), f"{name} {size} must be a multiple of patch size {patch_size}"
@@ -64,7 +66,7 @@ class ViewMaker:
     def _rand_uniform(self, low: float, high: float) -> float:
         return low + (high - low) * torch.rand((), generator=self.generator).item()
 
-    def _crop_shape(self, scale: float, spatial_shape: Tuple[int, int, int]) -> Tuple[int, ...]:
+    def _crop_shape(self, scale: float, spatial_shape: Tup3Int) -> Tuple[int, ...]:
         """Crop with volume fraction `scale`, each side rounded to a whole number of patches."""
         linear_scale = scale ** (1.0 / 3.0)
         return tuple(
