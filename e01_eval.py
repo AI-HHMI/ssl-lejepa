@@ -13,7 +13,6 @@ from itertools import product
 
 # local
 
-from lib.data import HEMIBRAIN_EB, HEMIBRAIN_EB_BOXES
 from lib.models import Lejepa, LejepaConfig
 from lib.util import *
 from lib.types import *
@@ -34,17 +33,17 @@ import plotly.graph_objects as go
 class Params:
     savedir: str = "outdir/e00/main/basic/"
     # patch_size: list[int] = field(default_factory=lambda: [104, 232, 232])
-    patch_size: Tup3Int = (104, 104, 104)  # hemibrain EB is 8 nm isotropic
+    patch_size: Tup3Int = (48, 144, 144)
     batch_size: int = 84
     steps_per_epoch: int = 71  # warmup + benchmark + 1 profiler warmup + profile steps: stop right after profiling
     n_layers: int = 12
     views: Views = "basic"  # 'basic' (random scales) or 'displace' (fixed sizes below, locals inside globals)
-    global_size: Tup3Int = (88, 88, 88)  # displace only
-    local_size: Tup3Int = (56, 56, 56)  # displace only
+    global_size: Tup3Int = (40, 128, 128)  # displace only
+    local_size: Tup3Int = (32, 96, 96)  # displace only
 
     # optimizations
     f32mode: F32Mode = "high"
-    n_workers: int = 16
+    n_workers: int = 8
     prefetch_factor: int = 2
     amp: bool = True  # bf16 autocast for forward + loss
     compile: bool = True  # torch.compile(dynamic=True) the encoder
@@ -57,14 +56,12 @@ class Params:
 
 def allparams():
     params = []
-    # views: list[Views] = ["displace"]
-    n_gpus = [1, 2, 4]
-    n_workers = [8, 16]
-    for i, (ng, nw) in enumerate(product(n_gpus, n_workers)):
+    views: list[Views] = ["basic", "displace"]
+    n_gpus = [1, 2, 4, 8]
+    for i, (ng, v) in enumerate(product(n_gpus, views)):
         p = Params()
-        p.savedir = f"outdir/e00/views-hemibrain/d{i}/"
-        p.views = "displace"
-        p.n_workers = nw
+        p.savedir = f"outdir/e00/views/d{i}/"
+        p.views = v
         p.n_gpus = ng
         params.append(p)
     # pprint(params)
@@ -111,13 +108,11 @@ def run(n:int):
     if world_size > 1:
         dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo")
 
-    # volumes = [x.to_miao() for x in lmd.all() if x.name == "exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001"]
-    # gary_comparison's hemibrain EB train split (lib/data.py), images only. Boxes are x y z; output is z y x.
-    volumes = [lmd.get(HEMIBRAIN_EB).to_miao(bounding_box=HEMIBRAIN_EB_BOXES["train"][::-1])]
+    volumes = [x.to_miao() for x in lmd.all() if x.name == "exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001"]
     mcfg = MiaoConfig(
         volumes=volumes,
         patch_size=list(par.patch_size),
-        resolutions=[[8.0, 8.0, 8.0]],
+        resolutions=[[25.0, 10.0, 10.0]],
         samples_per_epoch=par.batch_size * par.steps_per_epoch,
         sampling="random",
         output_axes="lzyx",

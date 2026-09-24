@@ -36,11 +36,7 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
         n_workers=1,
     )
     monkeypatch.setattr(experiment, "allparams", lambda: [params])
-    volume = SimpleNamespace(
-        name="exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001",
-        to_miao=lambda: None,
-    )
-    monkeypatch.setattr(experiment.lmd, "all", lambda: [volume])
+    monkeypatch.setattr(experiment.lmd, "get", lambda name: SimpleNamespace(to_miao=lambda **kw: None))
     monkeypatch.setattr(experiment, "MiaoConfig", SimpleNamespace)
     monkeypatch.setattr(experiment, "VolumeDataset", SyntheticDataset)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)

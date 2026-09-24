@@ -62,7 +62,7 @@ Data comes from `lmd_catalog` (the volume catalog) → `.to_miao()` → `miao.Vo
 - `util.py`: entrypoint CLI, `git_provenance`, `trace_summary`.
 - `lib/__init__.py` monkeypatches `torch.Tensor.backwards` and a no-arg `torch.rand()`.
 
-`lib/tests/test_training_profile.py` runs `e00_basic.run` end to end on a synthetic dataset by monkeypatching the module's globals (`allparams`, `lmd`, `VolumeDataset`, `Lejepa`, `LejepaConfig`, `repo_root`, `git_provenance`). Renaming those names in the experiment script breaks it.
+`lib/tests/test_training_profile.py` runs `e00_basic.run` end to end on a synthetic dataset by monkeypatching the module's globals (`allparams`, `lmd.get`, `MiaoConfig`, `VolumeDataset`, `Lejepa`, `LejepaConfig`, `repo_root`, `git_provenance`). Renaming those names in the experiment script breaks it.
 
 ## Throughput so far (B300, 12-layer width-512 ViT, 48×144×144 patches, `basic` views)
 
