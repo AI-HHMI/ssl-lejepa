@@ -58,7 +58,7 @@ def allparams():
     params = []
     views: list[Views] = ["basic", "displace"]
     n_gpus = [1, 2, 4, 8]
-    for i, (v, ng) in enumerate(product(views, n_gpus)):
+    for i, (ng, v) in enumerate(product(n_gpus, views)):
         p = Params()
         p.savedir = f"outdir/e00/views/d{i}/"
         p.views = v
@@ -282,7 +282,7 @@ def runlsf(n:int):
         -n {par.n_gpus * (par.n_workers + 1)} \
         -R "span[hosts=1]" \
         -gpu "num={par.n_gpus}:mode=exclusive_process" \
-        -q gpu_b300 \
+        -q gpu_h200 \
         -o {par.savedir}/job_%J.log \
         uv run torchrun --standalone --nproc_per_node={par.n_gpus} e00_basic.py run {n}
         """
