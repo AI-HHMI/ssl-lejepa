@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 import os, sys
 import json
 import time
@@ -269,7 +269,8 @@ def run(n:int):
         ckdir = savedir / "checkpoints"
         ckdir.mkdir(exist_ok=True)
         tmp, path = ckdir / "tmp.pt", ckdir / f"step_{step:07d}.pt"
-        torch.save({"step": step, "params": asdict(par), "model": state, "opt": opt.state_dict(), "sched": sched.state_dict()}, tmp)
+        torch.save({"step": step, "params": asdict(par), "model_config": lejepa.cfg.to_kwargs(), "model": state,
+                    "opt": opt.state_dict(), "sched": sched.state_dict()}, tmp)
         tmp.replace(path)  # never leave a half-written checkpoint
         for old in sorted(ckdir.glob("step_*.pt"))[:-CHECKPOINT_KEEP]:
             old.unlink()
@@ -335,26 +336,45 @@ def run(n:int):
                 f.write(json.dumps(row) + "\n")
         raise
     save_checkpoint(idx_step + 1)
+    if rank0 and par.max_hours:  # training runs (not benchmarks): PCA maps of the last finite checkpoint
+        pca(str(savedir))
     if world_size > 1:
         dist.destroy_process_group()
 
 
-def pca(n: int):
-    """PCA maps of patch-token embeddings from allparams()[n]'s latest checkpoint, on a held-out EB val crop.
+def pca(run: str):
+    """PCA maps (pca_maps) of a run's latest checkpoint. Runs automatically at the end of training runs.
+
+    `run` is an index into allparams() or any run's savedir. The model is rebuilt from the checkpoint's own
+    LejepaConfig (strict state_dict load, so architecture drift fails loudly) and the eval settings from its
+    saved Params, so old sweeps work without being in allparams().
+    """
+    import torch
+    savedir = Path(allparams()[int(run)].savedir if run.isdigit() else run)
+    # Newest numbered checkpoint; runs from before numbered checkpoints saved a single checkpoint.pt.
+    paths = sorted((savedir / "checkpoints").glob("step_*.pt")) or [savedir / "checkpoint.pt"]
+    assert paths[-1].is_file(), f"no checkpoint under {savedir}"
+    ckpt = torch.load(paths[-1], map_location="cpu", weights_only=False)
+    saved = ckpt["params"]
+    unknown = saved.keys() - {f.name for f in fields(Params)}
+    assert not unknown, f"{paths[-1]} has params no longer in Params: {sorted(unknown)}"
+    par = Params(**saved)  # fields added since the run take their defaults
+    # Checkpoints from before model_config was saved rebuild it from Params with the current lejepa_config.
+    cfg = LejepaConfig(**ckpt["model_config"]) if "model_config" in ckpt else lejepa_config(par)
+    model = Lejepa(cfg)
+    model.load_state_dict(ckpt["model"])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pca_maps(model.encoder.to(device), par, savedir, ckpt["step"])
+
+def pca_maps(encoder, par: Params, savedir: Path, step: int):
+    """PCA maps of patch-token embeddings on a held-out EB val crop -> savedir/pca.png, pca.json.
 
     pca.png columns: EM | PCA of tokens | PCA after subtracting each tile's mean token | token L2 norm.
     """
     import torch
     from PIL import Image
-    par: Params = allparams()[n]
-    savedir = Path(par.savedir)
-    # Newest numbered checkpoint; runs from before numbered checkpoints saved a single checkpoint.pt.
-    paths = sorted((savedir / "checkpoints").glob("step_*.pt")) or [savedir / "checkpoint.pt"]
-    ckpt = torch.load(paths[-1], map_location="cpu", weights_only=False)
-    model = Lejepa(lejepa_config(par))
-    model.load_state_dict(ckpt["model"])
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    encoder = model.encoder.to(device).eval()
+    device = next(encoder.parameters()).device
+    encoder.eval()
 
     # One (g, 4g, 4g) window (z y x, g = global view size, so it tiles exactly) inside EB's val slab
     # (EB z 3000-4000), held out from training.
@@ -369,7 +389,7 @@ def pca(n: int):
     tile, patch = par.global_size, encoder.patch_embed.patch_size
     assert all(s % t == 0 for s, t in zip(shape, tile)), f"crop {shape} must tile by {tile}"
     grid = [s // p for s, p in zip(shape, patch)]
-    feats = torch.empty(*grid, par.width)  # Z Y X D, tokens
+    feats = torch.empty(*grid, encoder.embed_dim)  # Z Y X D, tokens
     with torch.no_grad(), torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
         for z, y, x in product(*(range(0, s, t) for s, t in zip(shape, tile))):
             t = encoder.forward_features(img[None, :, z:z + tile[0], y:y + tile[1], x:x + tile[2]].to(device))
@@ -390,10 +410,10 @@ def pca(n: int):
     # Tile-centered tokens: subtract each tile's mean token, removing the per-view code and keeping within-view structure.
     g = [t_ // p for t_, p in zip(tile, patch)]  # tokens per tile side
     nt = [n // gi for n, gi in zip(grid, g)]  # tiles per axis
-    tiled = feats.reshape(nt[0], g[0], nt[1], g[1], nt[2], g[2], par.width)
-    centered = (tiled - tiled.mean(dim=(1, 3, 5), keepdim=True)).reshape(*grid, par.width)
-    rgb, erank, var = pca_rgb(feats.reshape(-1, par.width))
-    rgb_c, erank_c, var_c = pca_rgb(centered.reshape(-1, par.width))
+    tiled = feats.reshape(nt[0], g[0], nt[1], g[1], nt[2], g[2], encoder.embed_dim)
+    centered = (tiled - tiled.mean(dim=(1, 3, 5), keepdim=True)).reshape(*grid, encoder.embed_dim)
+    rgb, erank, var = pca_rgb(feats.reshape(-1, encoder.embed_dim))
+    rgb_c, erank_c, var_c = pca_rgb(centered.reshape(-1, encoder.embed_dim))
     between_tile = 1 - float(centered.var(dim=(0, 1, 2)).sum() / feats.var(dim=(0, 1, 2)).sum())
 
     # Token norms: "register"-like tokens that store global information show up as sparse high-norm outliers.
@@ -413,14 +433,20 @@ def pca(n: int):
         rows.append(np.concatenate([em, vgap, up(rgb[gz]), vgap, up(rgb_c[gz]), vgap, up(nm)], axis=1))
     gap = np.full((8, rows[0].shape[1], 3), 255, np.uint8)
     Image.fromarray(np.concatenate([r for row in rows for r in (row, gap)][:-1], axis=0)).save(savedir / "pca.png")
-    stats = {"tbl": "pca", "step": ckpt["step"], "effective_rank": erank, "explained_variance": var,
+    stats = {"tbl": "pca", "step": step, "effective_rank": erank, "explained_variance": var,
              "centered_effective_rank": erank_c, "centered_explained_variance": var_c,
              "between_tile_variance": between_tile,  # fraction of token variance explained by tile means
              "norm_median": med, "norm_p99": float(torch.quantile(norms.flatten(), 0.99)), "norm_max": float(norms.max()),
              "norm_outliers": int((norms > 2 * med).sum()), "n_tokens": norms.numel()}
     (savedir / "pca.json").write_text(json.dumps(stats) + "\n")
-    print(f"{savedir}: step {ckpt['step']}, effective rank {erank:.1f}, top-3 variance {sum(var[:3]):.2f}, "
+    print(f"{savedir}: step {step}, effective rank {erank:.1f}, top-3 variance {sum(var[:3]):.2f}, "
           f"between-tile variance {between_tile:.2f}, norm outliers (>2x median) {stats['norm_outliers']}/{norms.numel()}; wrote pca.png")
+
+def pca_sweep(sweepdir: str):
+    """pca() for every run dir (d0, d1, ...) under sweepdir that has a checkpoint."""
+    for d in sorted(Path(sweepdir).glob("d*"), key=lambda d: int(d.name[1:])):
+        if (d / "checkpoints").is_dir() or (d / "checkpoint.pt").is_file():
+            pca(str(d))
 
 def runlsf(n:int):
     import subprocess

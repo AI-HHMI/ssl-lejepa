@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from math import prod
 from typing import Any, Optional, Tuple, Union
 
@@ -247,6 +247,10 @@ class LejepaConfig:
     @n_local_views.setter
     def n_local_views(self, val: int) -> None:
         self.n_local = val
+
+    def to_kwargs(self) -> dict[str, Any]:
+        """Constructor kwargs that rebuild this config exactly: LejepaConfig(**cfg.to_kwargs())."""
+        return {f.name: getattr(self, f.name) for f in fields(self) if f.name != "extra"} | self.extra
 
     def __repr__(self) -> str:
         parts = [
