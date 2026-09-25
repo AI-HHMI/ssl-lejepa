@@ -77,6 +77,13 @@ class Params:
     benchmark_steps: int = 50
     profile_steps: int = 10  # Set to zero to disable trace collection.
 
+def on_queue(p: Params, queue: str) -> Params:
+    """Put p on an LSF GPU queue with that queue's default architecture (QUEUE_ARCH)."""
+    assert queue in QUEUE_ARCH, f"no default architecture for {queue!r}; add it to QUEUE_ARCH"
+    p.queue = queue
+    p.width, p.batch_size = QUEUE_ARCH[queue]
+    return p
+
 def allparams():
     params = []
     # A100 SXM4 80 GB (4 per node, NVLink, 12 cores/GPU, sm80, 312 TFLOPS bf16): which width x batch fits, at what
