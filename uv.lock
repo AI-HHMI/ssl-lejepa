@@ -171,7 +171,7 @@ wheels = [
 [[package]]
 name = "lmd-catalog"
 version = "0.1.0"
-source = { git = "https://github.com/AI-HHMI/lmd-catalog?branch=main#6f7f9da837f38d2799ad5ad7f17f61eb00f26f13" }
+source = { git = "https://github.com/AI-HHMI/lmd-catalog?branch=main#d528e6983c6b40dd39413679b34128db76a3e0b2" }
 dependencies = [
     { name = "miao-io" },
     { name = "pydantic" },
