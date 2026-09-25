@@ -69,6 +69,7 @@ class Params:
     defer_image_ops: bool = True  # workers ship uint8 crops; cast + normalize on the GPU (miao.finish_images)
     batch_views: bool = False  # one encoder call per group of same-shape views (2 per step with displace)
     grad_compress: bool = False  # DDP bf16_compress_hook: all-reduce gradients in bf16 (half the bytes)
+    queue: str = "gpu_h200"  # LSF queue
     n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); batch_size and n_workers are per GPU
 
     # profiling params
@@ -78,23 +79,38 @@ class Params:
 
 def allparams():
     params = []
-    # RTX PRO 6000 Blackwell (95.5 GB, PCIe, meant for single-GPU jobs): which width x batch fits, and at what MFU?
-    # H200 peaks at batch 84 were 95 GB (width 512) and 142 GB (768), so batch 84 can't fit here.
-    runs = list(product([512, 768], [16, 32, 48, 64]))
-    for i, (w, bs) in enumerate(runs):
+    # View-size study: 17 one-GPU H200 runs, 8 h each, on the wide hemibrain data. Baseline (input, global, local)
+    # = (128, 96, 64); vary input, global and local one at a time, plus 4 jointly scaled configs.
+    base = (128, 96, 64)
+    runs = [base]
+    runs += [(p, 96, 64) for p in [104, 160, 192, 256]]  # input patch: room for globals to move
+    runs += [(128, g, 64) for g in [64, 80, 112, 128]]  # global view size
+    runs += [(128, 96, l) for l in [32, 48, 80, 96]]  # local view size
+    runs += [(96, 64, 32), (160, 128, 80), (192, 144, 96), (256, 192, 128)]  # all scaled together
+    tokens = lambda g, l: 2 * (g // 8) ** 3 + 4 * (l // 8) ** 3  # per sample: 2 globals + 4 locals, 8^3 patches
+    # Model FLOPs per sample, relative units: 6 x ~38M encoder params per token + 12 x depth x width x N attention.
+    flops = lambda g, l: sum(k * (n * (6 * 38.1e6 + 12 * 12 * 512 * n)) for k, n in [(2, (g // 8) ** 3), (4, (l // 8) ** 3)])
+    for i, (inp, g, l) in enumerate(runs):
         p = Params()
-        p.savedir = f"outdir/e00/rtx6k-memory/d{i}/"
-        p.data = "hemibrain_eb"
+        p.savedir = f"outdir/e00/viewsizes/d{i}/"
+        p.data = "hemibrain_wide"
         p.views = "displace"
-        p.patch_size = (128, 128, 128)
-        p.global_size = (96, 96, 96)
-        p.local_size = (64, 64, 64)
+        p.patch_size = (inp, inp, inp)
+        p.global_size = (g, g, g)
+        p.local_size = (l, l, l)
+        # Hold tokens per step (so GPU memory, ~95 GB at the baseline) about constant: the baseline's
+        # 84 x 5504 tokens. Multiple of 4, capped at 2x the baseline batch.
+        p.batch_size = min(168, max(8, 4 * round(84 * tokens(*base[1:]) / tokens(g, l) / 4)))
+        # Cosine horizon = expected steps in 8 h: the baseline's ~0.45 s/step scaled by FLOPs per step.
+        # Data-loading-bound configs (large inputs, big batches) will be slower; max_hours stops them regardless.
+        step_s = 0.45 * (p.batch_size * flops(g, l)) / (84 * flops(*base[1:]))
+        p.steps_per_epoch = int(8 * 3600 / step_s)
+        p.max_hours = 8.0
         p.cudagraphs = True
         p.batch_views = True
-        p.width = w
-        p.batch_size = bs
-        p.n_workers = 8
+        p.n_workers = 11  # 12 cores per GPU
         p.n_gpus = 1
+        p.queue = "gpu_h200"
         params.append(p)
     # pprint(params)
 
@@ -340,9 +356,10 @@ def pca(n: int):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     encoder = model.encoder.to(device).eval()
 
-    # One 96x384x384 (z y x) window inside EB's val slab (EB z 3000-4000), held out from training.
+    # One (g, 4g, 4g) window (z y x, g = global view size, so it tiles exactly) inside EB's val slab
+    # (EB z 3000-4000), held out from training.
     # miao needs the box strictly larger than the patch: one extra voxel per axis leaves exactly one window.
-    shape, z0, y0, x0 = (96, 384, 384), 3400, 2000, 2000
+    shape, z0, y0, x0 = (par.global_size[0], 4 * par.global_size[1], 4 * par.global_size[2]), 3400, 2000, 2000
     vol = lmd.get(HEMIBRAIN_EB).to_miao(bounding_box=[[o, o + s + 1] for o, s in zip((z0, y0, x0), shape)])
     mcfg = MiaoConfig(volumes=[vol], patch_size=list(shape), resolutions=[[8.0, 8.0, 8.0]],
                       samples_per_epoch=1, sampling="random", output_axes="lzyx")
@@ -424,7 +441,7 @@ def runlsf(n:int):
         -n {par.n_gpus * CPUS_PER_GPU} \
         -R "span[hosts=1]" \
         -gpu "num={par.n_gpus}:mode=exclusive_process" \
-        -q gpu_rtx6000 \
+        -q {par.queue} \
         -o {par.savedir}/job_%J.log \
         uv run torchrun --standalone --nproc_per_node={par.n_gpus} {code}/e00_basic.py run {n}
         """
