@@ -17,7 +17,7 @@ from lib.util import trace_summary
 # Dense bf16 tensor-core peak per GPU, matched by substring of torch.cuda.get_device_name().
 # B300/B200 from NVIDIA's HGX spec (36 PFLOPS sparse per 8 GPUs); check the datasheet if it matters.
 # RTX PRO 6000 Blackwell Server Edition: ~500 dense (1 PFLOPS sparse), from memory; verify against NVIDIA's datasheet.
-PEAK_BF16_TFLOPS = {"H100": 989, "H200": 989, "B200": 2250, "B300": 2250, "RTX PRO 6000": 500}
+PEAK_BF16_TFLOPS = {"A100": 312, "H100": 989, "H200": 989, "B200": 2250, "B300": 2250, "RTX PRO 6000": 500}
 
 PROFILE_README = (
     "Open profile.json in https://ui.perfetto.dev to inspect CPU and CUDA tracks.\n"
