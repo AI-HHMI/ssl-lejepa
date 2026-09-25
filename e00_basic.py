@@ -79,38 +79,26 @@ class Params:
 
 def allparams():
     params = []
-    # View-size study: 17 one-GPU H200 runs, 8 h each, on the wide hemibrain data. Baseline (input, global, local)
-    # = (128, 96, 64); vary input, global and local one at a time, plus 4 jointly scaled configs.
-    base = (128, 96, 64)
-    runs = [base]
-    runs += [(p, 96, 64) for p in [104, 160, 192, 256]]  # input patch: room for globals to move
-    runs += [(128, g, 64) for g in [64, 80, 112, 128]]  # global view size
-    runs += [(128, 96, l) for l in [32, 48, 80, 96]]  # local view size
-    runs += [(96, 64, 32), (160, 128, 80), (192, 144, 96), (256, 192, 128)]  # all scaled together
-    tokens = lambda g, l: 2 * (g // 8) ** 3 + 4 * (l // 8) ** 3  # per sample: 2 globals + 4 locals, 8^3 patches
-    # Model FLOPs per sample, relative units: 6 x ~38M encoder params per token + 12 x depth x width x N attention.
-    flops = lambda g, l: sum(k * (n * (6 * 38.1e6 + 12 * 12 * 512 * n)) for k, n in [(2, (g // 8) ** 3), (4, (l // 8) ** 3)])
-    for i, (inp, g, l) in enumerate(runs):
+    # A100 SXM4 80 GB (4 per node, NVLink, 12 cores/GPU, sm80, 312 TFLOPS bf16): which width x batch fits, at what
+    # MFU (d0-d11, 1 GPU), and how it scales across a node's NVLink (d12-d15, 2 and 4 GPUs at batch 32).
+    # H200 memory per sample: ~0.8 GB (384, est.), 1.13 GB (512), 1.7 GB (768), so the largest batches won't fit.
+    runs = [(w, bs, 1) for w in [384, 512, 768] for bs in [16, 32, 48, 64]]
+    runs += [(w, 32, ng) for w in [512, 768] for ng in [2, 4]]
+    for i, (w, bs, ng) in enumerate(runs):
         p = Params()
-        p.savedir = f"outdir/e00/viewsizes/d{i}/"
-        p.data = "hemibrain_wide"
+        p.savedir = f"outdir/e00/a100/d{i}/"
+        p.data = "hemibrain_eb"
         p.views = "displace"
-        p.patch_size = (inp, inp, inp)
-        p.global_size = (g, g, g)
-        p.local_size = (l, l, l)
-        # Hold tokens per step (so GPU memory, ~95 GB at the baseline) about constant: the baseline's
-        # 84 x 5504 tokens. Multiple of 4, capped at 2x the baseline batch.
-        p.batch_size = min(168, max(8, 4 * round(84 * tokens(*base[1:]) / tokens(g, l) / 4)))
-        # Cosine horizon = expected steps in 8 h: the baseline's ~0.45 s/step scaled by FLOPs per step.
-        # Data-loading-bound configs (large inputs, big batches) will be slower; max_hours stops them regardless.
-        step_s = 0.45 * (p.batch_size * flops(g, l)) / (84 * flops(*base[1:]))
-        p.steps_per_epoch = int(8 * 3600 / step_s)
-        p.max_hours = 8.0
+        p.patch_size = (128, 128, 128)
+        p.global_size = (96, 96, 96)
+        p.local_size = (64, 64, 64)
         p.cudagraphs = True
         p.batch_views = True
-        p.n_workers = 11  # 12 cores per GPU
-        p.n_gpus = 1
-        p.queue = "gpu_h200"
+        p.width = w
+        p.batch_size = bs
+        p.n_workers = 8
+        p.n_gpus = ng  # 4 GPUs x 12 cores = a whole node
+        p.queue = "gpu_a100"
         params.append(p)
     # pprint(params)
 
@@ -566,8 +554,9 @@ def plot1():
     repeat = (res.idx_step == 0).groupby(res.savedir).cumsum() - 1
     res["run"] = short_runs(res.savedir) + repeat.map(lambda k: f".{k}" if k else "")
     res["sizes"] = res.patch_size.astype(str) + " " + res.global_size.astype(str) + " " + res.local_size.astype(str)
-    px.line(res, x="idx_step", y="loss", color="run", line_dash="views", facet_col="n_gpus",
-            hover_data=["sizes", "n_workers"], markers=True, log_y=True).show()
+    px.line(res, x="idx_step", y="loss", color="width", facet_col="batch_size",
+            hover_data=["n_gpus"], markers=True, log_y=True,
+            category_orders={"batch_size": sorted(res.batch_size.unique())}).show()
 
 def plot2():
     """ktok/s per GPU: one bar per result row, bars grouped by n_gpus with gaps between groups, colored by width + defer_image_ops."""
