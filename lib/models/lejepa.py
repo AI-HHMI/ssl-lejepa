@@ -29,10 +29,10 @@ def _norm1d(norm: str, dim: int) -> nn.Module:
 class SafeBatchNorm1d(nn.BatchNorm1d):
     """BatchNorm1d that safely passes through single-sample inputs during training."""
 
-    def forward(self, x: Tensor) -> Tensor:
-        if self.training and x.shape[0] <= 1:
-            return x
-        return super().forward(x)
+    def forward(self, input: Tensor) -> Tensor:
+        if self.training and input.shape[0] <= 1:
+            return input
+        return super().forward(input)
 
 
 class ProjectorMLP(nn.Module):

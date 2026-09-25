@@ -7,10 +7,6 @@ import torch
 from lib.losses import LejepaOutput
 from lib.models import Lejepa, LejepaConfig
 
-# Compatibility patch for out.loss.backwards()
-if not hasattr(torch.Tensor, "backwards"):
-    torch.Tensor.backwards = torch.Tensor.backward
-
 # Compatibility patch for torch.rand() with no arguments (e.g. format specifier f"{torch.rand():4f}")
 _orig_rand = torch.rand
 

@@ -108,7 +108,7 @@ class ViewMaker:
         ]
 
     def _basic_view(self, x: Tensor, scale_range: Tuple[float, float]) -> Tensor:
-        spatial_shape = tuple(x.shape[2:])
+        spatial_shape: Tup3Int = (x.shape[2], x.shape[3], x.shape[4])
         crop_shape = self._crop_shape(self._rand_uniform(*scale_range), spatial_shape)
         return self._gather(x, self._origins(spatial_shape, crop_shape, x.shape[0]), crop_shape)
 

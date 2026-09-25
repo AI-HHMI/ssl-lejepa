@@ -120,9 +120,10 @@ def test_view_maker_displace_locals_inside_globals():
 
 
 def test_batch_views_matches_per_view():
-    kw = dict(n_layers=1, width=32, num_heads=2, patch_size=(4, 4, 4), proj_hidden=32, proj_dim=8)
-    per_view, batched = Lejepa(LejepaConfig(**kw)), Lejepa(LejepaConfig(**kw, batch_views=True))
+    per_view = Lejepa(LejepaConfig(n_layers=1, width=32, num_heads=2, patch_size=(4, 4, 4), proj_hidden=32, proj_dim=8))
+    batched = Lejepa(LejepaConfig(n_layers=1, width=32, num_heads=2, patch_size=(4, 4, 4), proj_hidden=32, proj_dim=8, batch_views=True))
     batched.load_state_dict(per_view.state_dict())
-    per_view.eval(), batched.eval()  # BatchNorm running stats: identical math either way
+    per_view.eval()  # BatchNorm running stats: identical math either way
+    batched.eval()
     views = [torch.randn(3, 1, 8, 8, 8), torch.randn(3, 1, 4, 8, 8), torch.randn(3, 1, 8, 8, 8)]
     torch.testing.assert_close(per_view.encode_views(views), batched.encode_views(views))

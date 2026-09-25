@@ -7,13 +7,12 @@ import time
 from pathlib import Path
 
 import math
-from math import prod
 from itertools import product
 
 # local
 
 from lib.data import HEMIBRAIN_EB, TRAIN_BOXES
-from lib.benchmark import Benchmark, write_trace_summary
+from lib.benchmark import Benchmark
 from lib.models import Lejepa, LejepaConfig
 from lib.views import ViewMaker
 from lib.util import *
@@ -107,10 +106,10 @@ def lejepa_config(par: Params):
 def save_view_pngs(par: Params, dataset, n_samples: int = 3):
     """Save what the model sees: for n_samples fresh samples, the input and each of its views, as
     center-z slices at native voxel size, left to right (input | globals | locals) -> savedir/views_{i}.png."""
-    import torch
     from PIL import Image
     cfg = lejepa_config(par)
-    patch = (cfg.patch_size,) * 3 if isinstance(cfg.patch_size, int) else tuple(cfg.patch_size)
+    p = cfg.patch_size
+    patch = (p, p, p) if isinstance(p, int) else p
     maker = ViewMaker(n_global=cfg.n_global, n_local=cfg.n_local, global_scale=cfg.global_scale, local_scale=cfg.local_scale,
                       flip=cfg.flip, patch_size=patch, views=cfg.views, global_size=cfg.global_size, local_size=cfg.local_size)
     samples = [dataset[i] for i in range(n_samples)]
@@ -199,7 +198,7 @@ def run(n:int):
     model = model.to(device)
     assert par.compile or not (par.cudagraphs or par.compile_blocks), "cudagraphs / compile_blocks require compile"
     if par.compile:
-        torch._logging.set_logs(recompiles=True)  # recompiles show up in job_*.log
+        torch._logging.set_logs(recompiles=True)  # pyright: ignore[reportPrivateImportUsage]  # recompiles show up in job_*.log
         if par.cudagraphs:
             # CUDA graphs replay whole kernel sequences, removing per-kernel CPU launch cost.
             # They need static shapes: displace has exactly 2 view shapes, basic has ~9.
@@ -527,7 +526,7 @@ def table():
     res["TFLOP/s"] /= res["gpus"]
     res = res.rename(columns={"TFLOP/s": "TFLOP/s/gpu"})
     res["tok/s"] /= 1e3
-    res.insert(res.columns.get_loc("tok/s") + 1, "ktok/s/gpu", res["tok/s"] / res["gpus"])
+    res.insert(list(res.columns).index("tok/s") + 1, "ktok/s/gpu", res["tok/s"] / res["gpus"])
     res = res.rename(columns={"tok/s": "ktok/s"}).round(1)
     print(res.to_string(index=False))
     return res
