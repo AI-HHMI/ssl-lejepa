@@ -68,6 +68,7 @@ class Params:
     compile_blocks: bool = False  # compile each transformer block separately so DDP can overlap all-reduce with backward
     defer_image_ops: bool = True  # workers ship uint8 crops; cast + normalize on the GPU (miao.finish_images)
     batch_views: bool = False  # one encoder call per group of same-shape views (2 per step with displace)
+    weight_decay: float = 0.0  # AdamW decay on weight matrices (biases/norms excluded); 0 = the original plain Adam
     grad_compress: bool = False  # DDP bf16_compress_hook: all-reduce gradients in bf16 (half the bytes)
     queue: str = "gpu_h200"  # LSF queue
     n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); batch_size and n_workers are per GPU
@@ -79,36 +80,33 @@ class Params:
 
 def allparams():
     params = []
-    # View-size study: 17 one-GPU H200 runs, 8 h each, on the wide hemibrain data. Baseline (input, global, local)
-    # = (128, 96, 64); vary input, global and local one at a time, plus 4 jointly scaled configs.
+    # viewsizes rerun with AdamW weight decay 0.05: the 7 configs that diverged under plain Adam, plus the
+    # baseline d0 as a control. Run dirs keep their viewsizes index (d0, d2, ...) for side-by-side comparison.
     base = (128, 96, 64)
-    runs = [base]
-    runs += [(p, 96, 64) for p in [104, 160, 192, 256]]  # input patch: room for globals to move
-    runs += [(128, g, 64) for g in [64, 80, 112, 128]]  # global view size
-    runs += [(128, 96, l) for l in [32, 48, 80, 96]]  # local view size
-    runs += [(96, 64, 32), (160, 128, 80), (192, 144, 96), (256, 192, 128)]  # all scaled together
-    tokens = lambda g, l: 2 * (g // 8) ** 3 + 4 * (l // 8) ** 3  # per sample: 2 globals + 4 locals, 8^3 patches
-    # Model FLOPs per sample, relative units: 6 x ~38M encoder params per token + 12 x depth x width x N attention.
+    configs = [base]  # the same 17 (input, global, local) configs, in the same order, as e00/viewsizes
+    configs += [(p, 96, 64) for p in [104, 160, 192, 256]]
+    configs += [(128, g, 64) for g in [64, 80, 112, 128]]
+    configs += [(128, 96, l) for l in [32, 48, 80, 96]]
+    configs += [(96, 64, 32), (160, 128, 80), (192, 144, 96), (256, 192, 128)]
+    tokens = lambda g, l: 2 * (g // 8) ** 3 + 4 * (l // 8) ** 3
     flops = lambda g, l: sum(k * (n * (6 * 38.1e6 + 12 * 12 * 512 * n)) for k, n in [(2, (g // 8) ** 3), (4, (l // 8) ** 3)])
-    for i, (inp, g, l) in enumerate(runs):
+    for i in [0, 2, 3, 4, 9, 10, 13, 15]:
+        inp, g, l = configs[i]
         p = Params()
-        p.savedir = f"outdir/e00/viewsizes/d{i}/"
+        p.savedir = f"outdir/e00/viewsizes_wd/d{i}/"
         p.data = "hemibrain_wide"
         p.views = "displace"
         p.patch_size = (inp, inp, inp)
         p.global_size = (g, g, g)
         p.local_size = (l, l, l)
-        # Hold tokens per step (so GPU memory, ~95 GB at the baseline) about constant: the baseline's
-        # 84 x 5504 tokens. Multiple of 4, capped at 2x the baseline batch.
         p.batch_size = min(168, max(8, 4 * round(84 * tokens(*base[1:]) / tokens(g, l) / 4)))
-        # Cosine horizon = expected steps in 8 h: the baseline's ~0.45 s/step scaled by FLOPs per step.
-        # Data-loading-bound configs (large inputs, big batches) will be slower; max_hours stops them regardless.
         step_s = 0.45 * (p.batch_size * flops(g, l)) / (84 * flops(*base[1:]))
         p.steps_per_epoch = int(8 * 3600 / step_s)
         p.max_hours = 8.0
+        p.weight_decay = 0.05
         p.cudagraphs = True
         p.batch_views = True
-        p.n_workers = 11  # 12 cores per GPU
+        p.n_workers = 11
         p.n_gpus = 1
         p.queue = "gpu_h200"
         params.append(p)
@@ -252,7 +250,11 @@ def run(n:int):
     LR, LR_WARMUP, LR_FLOOR = 1e-4, 1000, 0.01  # peak lr; linear warmup steps; cosine ends at LR_FLOOR * LR
     GRAD_CLIP = 1.0  # max global grad norm
     CHECKPOINT_EVERY, CHECKPOINT_KEEP = 2000, 1  # steps (~15 min at 8 GPUs); newest checkpoints kept
-    opt = torch.optim.Adam(model.parameters(), lr=LR)
+    # AdamW with weight_decay=0 is exactly Adam. Decay only weight matrices, not biases or norm gains.
+    decay = [p for p in model.parameters() if p.ndim >= 2]
+    no_decay = [p for p in model.parameters() if p.ndim < 2]
+    opt = torch.optim.AdamW([{"params": decay, "weight_decay": par.weight_decay},
+                             {"params": no_decay, "weight_decay": 0.0}], lr=LR)
     # Warmup then cosine decay over steps_per_epoch, by step count so every rank uses the same lr.
     # For max_hours runs set steps_per_epoch to the expected step count so the schedule completes.
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / LR_WARMUP) * (
@@ -303,8 +305,14 @@ def run(n:int):
                 with bench.phase("07_LOGGING"):
                     if rank0 and (idx_step % 10 == 0 or idx_step + 1 == par.steps_per_epoch):
                         loss = out.loss.detach().item()
+                        # Median pre-LayerNorm token norm on a global-view-sized corner of 4 samples: residual-stream
+                        # growth tends to precede divergence (see e00/viewsizes). Eager and grad-free, so cheap.
+                        g = par.global_size
+                        with torch.no_grad(), torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.amp):
+                            resid = lejepa.encoder.forward_residual(x[:4, :, :g[0], :g[1], :g[2]])
                         metrics_file.write(json.dumps({"tbl": "metrics", "idx_step": idx_step, "time": time.time() - start_time, "loss": loss,
-                                                       "grad_norm": grad_norm.item(), "lr": sched.get_last_lr()[0]}) + "\n")
+                                                       "grad_norm": grad_norm.item(), "lr": sched.get_last_lr()[0],
+                                                       "resid_norm": resid.float().norm(dim=-1).median().item()}) + "\n")
                         metrics_file.flush()
                         print(f"finished step {idx_step + 1}/{par.steps_per_epoch}, loss={loss:.4f}", flush=True)
 
@@ -435,7 +443,7 @@ def pca_maps(encoder, par: Params, savedir: Path, step: int):
         nm = np.repeat(norm_u8[gz][..., None], 3, axis=2)
         rows.append(np.concatenate([em, vgap, up(rgb[gz]), vgap, up(rgb_c[gz]), vgap, up(nm)], axis=1))
     gap = np.full((8, rows[0].shape[1], 3), 255, np.uint8)
-    Image.fromarray(np.concatenate([r for row in rows for r in (row, gap)][:-1], axis=0)).save(savedir / "pca2.png")
+    Image.fromarray(np.concatenate([r for row in rows for r in (row, gap)][:-1], axis=0)).save(savedir / "pca.png")
     stats = {"tbl": "pca", "step": step, "effective_rank": erank, "explained_variance": var,
              "centered_effective_rank": erank_c, "centered_explained_variance": var_c,
              "between_tile_variance": between_tile,  # fraction of token variance explained by tile means
