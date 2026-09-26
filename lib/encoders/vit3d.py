@@ -228,7 +228,15 @@ class ViT3DEncoder(nn.Module):
             x: (B, C, Z, Y, X)
 
         Returns:
-            tokens: (B, N, embed_dim)
+            tokens: (B, N, embed_dim), after the final LayerNorm
+        """
+        return self.norm(self.forward_residual(x))
+
+    def forward_residual(self, x: Tensor) -> Tensor:
+        """Patch tokens from the residual stream after the last block, before the final LayerNorm.
+
+        The LayerNorm fixes every token's norm to ~sqrt(embed_dim), so token-norm analyses
+        (e.g. high-norm "register" tokens) need these. x: (B, C, Z, Y, X) -> (B, N, embed_dim).
         """
         tokens, grid_size = self.patch_embed(x)
         pos_embed = get_3d_sincos_pos_embed(
@@ -251,8 +259,6 @@ class ViT3DEncoder(nn.Module):
 
         for block in self.blocks:
             x = block(x)
-
-        x = self.norm(x)
         return x
 
     def forward(self, x: Tensor) -> Tensor:

@@ -369,7 +369,7 @@ def pca(run: str):
 def pca_maps(encoder, par: Params, savedir: Path, step: int):
     """PCA maps of patch-token embeddings on a held-out EB val crop -> savedir/pca.png, pca.json.
 
-    pca.png columns: EM | PCA of tokens | PCA after subtracting each tile's mean token | token L2 norm.
+    pca.png columns: EM | PCA of tokens | PCA after subtracting each tile's mean token | pre-LayerNorm token L2 norm.
     """
     import torch
     from PIL import Image
@@ -389,13 +389,16 @@ def pca_maps(encoder, par: Params, savedir: Path, step: int):
     tile, patch = par.global_size, encoder.patch_embed.patch_size
     assert all(s % t == 0 for s, t in zip(shape, tile)), f"crop {shape} must tile by {tile}"
     grid = [s // p for s, p in zip(shape, patch)]
-    feats = torch.empty(*grid, encoder.embed_dim)  # Z Y X D, tokens
+    feats = torch.empty(*grid, encoder.embed_dim)  # Z Y X D, tokens (after the final LayerNorm)
+    norms = torch.empty(*grid)  # Z Y X, token norms before the final LayerNorm
     with torch.no_grad(), torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
         for z, y, x in product(*(range(0, s, t) for s, t in zip(shape, tile))):
-            t = encoder.forward_features(img[None, :, z:z + tile[0], y:y + tile[1], x:x + tile[2]].to(device))
+            r = encoder.forward_residual(img[None, :, z:z + tile[0], y:y + tile[1], x:x + tile[2]].to(device))
+            t = encoder.norm(r)
             tz, ty, tx = (o // p for o, p in zip((z, y, x), patch))
             gz, gy, gx = (t_ // p for t_, p in zip(tile, patch))
             feats[tz:tz + gz, ty:ty + gy, tx:tx + gx] = t[0].float().reshape(gz, gy, gx, -1).cpu()
+            norms[tz:tz + gz, ty:ty + gy, tx:tx + gx] = r[0].float().norm(dim=-1).reshape(gz, gy, gx).cpu()
 
     def pca_rgb(f):  # N D tokens -> (Z Y X 3 uint8 top-3 PCs, effective rank, top-10 explained variance)
         f = f - f.mean(0)
@@ -416,8 +419,8 @@ def pca_maps(encoder, par: Params, savedir: Path, step: int):
     rgb_c, erank_c, var_c = pca_rgb(centered.reshape(-1, encoder.embed_dim))
     between_tile = 1 - float(centered.var(dim=(0, 1, 2)).sum() / feats.var(dim=(0, 1, 2)).sum())
 
-    # Token norms: "register"-like tokens that store global information show up as sparse high-norm outliers.
-    norms = feats.norm(dim=-1)  # Z Y X
+    # Pre-LayerNorm token norms: "register"-like tokens that store global information show up as sparse
+    # high-norm outliers. (After the final LayerNorm every token's norm is ~sqrt(width), so those can't show this.)
     med = float(norms.median())
     lo, hi = torch.quantile(norms.flatten(), torch.tensor([0.01, 0.999]))
     norm_u8 = ((norms - lo) / (hi - lo)).clamp(0, 1).mul(255).byte().numpy()
@@ -432,7 +435,7 @@ def pca_maps(encoder, par: Params, savedir: Path, step: int):
         nm = np.repeat(norm_u8[gz][..., None], 3, axis=2)
         rows.append(np.concatenate([em, vgap, up(rgb[gz]), vgap, up(rgb_c[gz]), vgap, up(nm)], axis=1))
     gap = np.full((8, rows[0].shape[1], 3), 255, np.uint8)
-    Image.fromarray(np.concatenate([r for row in rows for r in (row, gap)][:-1], axis=0)).save(savedir / "pca.png")
+    Image.fromarray(np.concatenate([r for row in rows for r in (row, gap)][:-1], axis=0)).save(savedir / "pca2.png")
     stats = {"tbl": "pca", "step": step, "effective_rank": erank, "explained_variance": var,
              "centered_effective_rank": erank_c, "centered_explained_variance": var_c,
              "between_tile_variance": between_tile,  # fraction of token variance explained by tile means
@@ -441,6 +444,13 @@ def pca_maps(encoder, par: Params, savedir: Path, step: int):
     (savedir / "pca.json").write_text(json.dumps(stats) + "\n")
     print(f"{savedir}: step {step}, effective rank {erank:.1f}, top-3 variance {sum(var[:3]):.2f}, "
           f"between-tile variance {between_tile:.2f}, norm outliers (>2x median) {stats['norm_outliers']}/{norms.numel()}; wrote pca.png")
+
+def run_pcasweep(sweepdir: str):
+    cmd = f"""bsub -P miaai -q gpu_a100 -n 12 -gpu "num=1" -W 1:00 \
+          -o {sweepdir}/pca_%J.log uv run python e00_basic.py pca_sweep {sweepdir}
+          """
+    subprocess.Popen(cmd, shell=True)
+    print(f"Submitted pca_sweep {sweepdir} to LSF.")
 
 def pca_sweep(sweepdir: str):
     """pca() for every run dir (d0, d1, ...) under sweepdir that has a checkpoint."""
