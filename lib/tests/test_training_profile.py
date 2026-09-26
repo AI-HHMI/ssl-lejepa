@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import e00_basic as experiment
+from lib.losses import LejepaOutput
 from lib.models import Lejepa, LejepaConfig
 
 
@@ -25,16 +26,20 @@ class SyntheticDataset:
         return {"img": image}
 
 
-@pytest.mark.parametrize(
-    "profile_steps,n_steps,recorded_steps",
-    [(2, 7, 2), (0, 4, 0), (3, 4, 0), (3, 5, 1)],
-)
-def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorded_steps):
-    params = experiment.Params(
-        savedir=str(tmp_path), patch_size=(8, 8, 8), batch_size=2,
-        steps_per_epoch=n_steps, warmup_steps=1, benchmark_steps=2, profile_steps=profile_steps,
-        n_workers=1, defer_image_ops=False,  # synthetic dataset yields finished float images
-    )
+class NanGrad(torch.autograd.Function):
+    """Identity in the forward pass, NaN gradient in the backward: a finite loss whose backward goes non-finite."""
+
+    @staticmethod
+    def forward(ctx, x):
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        return grad_outputs[0] * float("nan")
+
+
+def patch_experiment(monkeypatch, tmp_path, params):
+    """Point e00_basic at params, a synthetic dataset and a tiny model, with no cluster, git or GPU."""
     monkeypatch.setattr(experiment, "allparams", lambda: [params])
     monkeypatch.setattr(experiment.lmd, "get", lambda name: SimpleNamespace(to_miao=lambda **kw: None))
     monkeypatch.setattr(experiment, "MiaoConfig", SimpleNamespace)
@@ -46,6 +51,28 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
     monkeypatch.setattr(experiment, "git_provenance", lambda: {
         "commit_id": "test-commit", "diff_hash": "test-diff", "diff": "",
     })
+
+    def small_model_config(**kwargs):
+        return LejepaConfig(
+            n_layers=1, width=16, num_heads=2, patch_size=(4, 4, 4),
+            proj_hidden=16, proj_dim=8, num_slices=4, sigreg_knots=3,
+            n_global=2, n_local=1,
+        )
+
+    monkeypatch.setattr(experiment, "LejepaConfig", small_model_config)
+
+
+@pytest.mark.parametrize(
+    "profile_steps,n_steps,recorded_steps",
+    [(2, 7, 2), (0, 4, 0), (3, 4, 0), (3, 5, 1)],
+)
+def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorded_steps):
+    params = experiment.Params(
+        savedir=str(tmp_path), patch_size=(8, 8, 8), batch_size=2,
+        steps_per_epoch=n_steps, warmup_steps=1, benchmark_steps=2, profile_steps=profile_steps,
+        n_workers=1, defer_image_ops=False,  # synthetic dataset yields finished float images
+    )
+    patch_experiment(monkeypatch, tmp_path, params)
     consumed = []
 
     def record_batch(model, args):
@@ -57,15 +84,6 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
         return model
 
     monkeypatch.setattr(experiment, "Lejepa", small_model)
-
-    def small_model_config(**kwargs):
-        return LejepaConfig(
-            n_layers=1, width=16, num_heads=2, patch_size=(4, 4, 4),
-            proj_hidden=16, proj_dim=8, num_slices=4, sigreg_knots=3,
-            n_global=2, n_local=1,
-        )
-
-    monkeypatch.setattr(experiment, "LejepaConfig", small_model_config)
     experiment.run(0)
 
     assert consumed == list(range(n_steps * params.batch_size))
@@ -93,3 +111,31 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
         summary = json.loads((tmp_path / "trace_summary.json").read_text())
         assert summary["step_ms"] > 0 and summary["gpu_busy"] == 0  # CPU run: no GPU kernels.
         assert summary["04_FORWARD_AND_LOSS_ms"] > 0
+
+
+def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
+    params = experiment.Params(
+        savedir=str(tmp_path), patch_size=(8, 8, 8), batch_size=2, steps_per_epoch=6,
+        warmup_steps=1, benchmark_steps=2, profile_steps=0, n_workers=1, defer_image_ops=False,
+    )
+    patch_experiment(monkeypatch, tmp_path, params)
+    calls = []
+
+    class PoisonedStep(Lejepa):  # step 3's loss is finite but its gradient is NaN
+        def forward(self, *args, **kwargs):
+            out = super().forward(*args, **kwargs)
+            assert isinstance(out, LejepaOutput)
+            calls.append(1)
+            if len(calls) == 4:
+                out.loss = NanGrad.apply(out.loss)
+            return out
+
+    monkeypatch.setattr(experiment, "Lejepa", PoisonedStep)
+    experiment.run(0)
+
+    metrics = [json.loads(line) for line in (tmp_path / "metrics.json").read_text().splitlines()]
+    assert metrics[-1]["idx_step"] == 5 and metrics[-1]["skipped"] == 1  # training continued past the bad step
+    dump = torch.load(tmp_path / "bad_batch_0000003.pt", weights_only=False)
+    assert dump["step"] == 3 and dump["x_uint8"].dtype == torch.uint8 and dump["rng_cpu"] is not None
+    ckpt = torch.load(sorted((tmp_path / "checkpoints").glob("step_*.pt"))[-1], weights_only=False)
+    assert all(torch.isfinite(v).all() for v in ckpt["model"].values() if v.is_floating_point())

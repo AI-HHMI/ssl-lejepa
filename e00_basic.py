@@ -259,6 +259,9 @@ def run(n:int):
     # For max_hours runs set steps_per_epoch to the expected step count so the schedule completes.
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / LR_WARMUP) * (
         LR_FLOOR + (1 - LR_FLOOR) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / par.steps_per_epoch)))))
+    # Steps whose gradient is non-finite are skipped, not applied (see the optimizer phase below).
+    MAX_SKIPPED, BAD_BATCHES_KEPT = 100, 2  # stop after this many skipped steps; replayable dumps written
+    n_skipped = 0
 
     def save_checkpoint(step):
         if not rank0:
@@ -292,14 +295,30 @@ def run(n:int):
                 with bench.phase("03_H2D_TRANSFER"):
                     # Deferred batches are dicts of per-sample uint8 crops; finish_images copies and normalizes them.
                     x = finish_images(x, device)["img"] if par.defer_image_ops else x.to(device, non_blocking=True)
+                # RNG state before the forward (views draw on the CPU generator, SIGReg slices on the GPU's),
+                # so a skipped step's forward/backward can be replayed exactly from its bad_batch dump.
+                rng_cpu = torch.get_rng_state()
+                rng_cuda = torch.cuda.get_rng_state(device) if device.type == "cuda" else None
                 with bench.phase("04_FORWARD_AND_LOSS"), torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.amp):
                     out = model(x)
                 bench.count(out)
                 with bench.phase("05_BACKWARD"):
                     out.loss.backward()
                 with bench.phase("06_OPTIMIZER"):
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)  # no host sync
-                    opt.step()
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                    # A single non-finite gradient would write NaN into every weight via opt.step() (the sudden
+                    # divergences in e00/viewsizes*). Skip such steps instead. DDP ranks share the all-reduced norm,
+                    # so they all skip together. Costs one host sync per step.
+                    if torch.isfinite(grad_norm).item():
+                        opt.step()
+                    else:
+                        n_skipped += 1
+                        print(f"Non-finite grad norm at step {idx_step}; skipped ({n_skipped} so far)", flush=True)
+                        if rank0 and n_skipped <= BAD_BATCHES_KEPT:
+                            # Weights are still the pre-step ones; inputs are uint8 on disk, so this is lossless.
+                            torch.save({"step": idx_step, "params": asdict(par), "model_config": lejepa.cfg.to_kwargs(),
+                                        "model": lejepa.state_dict(), "x_uint8": (x.clamp(0, 1) * 255).round().byte().cpu(),
+                                        "rng_cpu": rng_cpu, "rng_cuda": rng_cuda}, savedir / f"bad_batch_{idx_step:07d}.pt")
                     opt.zero_grad()
                     sched.step()
                 with bench.phase("07_LOGGING"):
@@ -312,17 +331,19 @@ def run(n:int):
                             resid = lejepa.encoder.forward_residual(x[:4, :, :g[0], :g[1], :g[2]])
                         metrics_file.write(json.dumps({"tbl": "metrics", "idx_step": idx_step, "time": time.time() - start_time, "loss": loss,
                                                        "grad_norm": grad_norm.item(), "lr": sched.get_last_lr()[0],
-                                                       "resid_norm": resid.float().norm(dim=-1).median().item()}) + "\n")
+                                                       "resid_norm": resid.float().norm(dim=-1).median().item(),
+                                                       "skipped": n_skipped}) + "\n")
                         metrics_file.flush()
                         print(f"finished step {idx_step + 1}/{par.steps_per_epoch}, loss={loss:.4f}", flush=True)
 
                 bench.end(idx_step)
-                # Every 100 steps, one all-reduce so every rank stops at the same step:
-                # on a non-finite loss (divergence) or past max_hours.
+                # Every 100 steps, one all-reduce so every rank stops at the same step: on a non-finite loss
+                # (divergence), past max_hours, or after too many skipped (non-finite gradient) steps.
                 if idx_step % 100 == 99:
                     b1 = not torch.isfinite(out.loss.detach()).item()
                     b2 = bool(par.max_hours) and time.time() - start_time > par.max_hours * 3600
-                    stop = torch.tensor([float(b1), float(b2)], device=device)
+                    b3 = n_skipped >= MAX_SKIPPED
+                    stop = torch.tensor([float(b1), float(b2), float(b3)], device=device)
                     if world_size > 1:
                         dist.all_reduce(stop, op=dist.ReduceOp.MAX)
                     if stop[0].item():
@@ -330,6 +351,9 @@ def run(n:int):
                         break
                     if stop[1].item():
                         print(f"Reached max_hours={par.max_hours} at step {idx_step + 1}", flush=True)
+                        break
+                    if stop[2].item():
+                        print(f"{n_skipped} steps skipped for non-finite gradients by step {idx_step + 1}; stopping", flush=True)
                         break
                 if idx_step % CHECKPOINT_EVERY == CHECKPOINT_EVERY - 1:
                     save_checkpoint(idx_step + 1)
