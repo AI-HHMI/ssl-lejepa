@@ -393,7 +393,8 @@ def runlsf(n:int):
     import subprocess
     par:Params = allparams()[n]
     wipedir(par.savedir)
-    RUN_NAME = "e00_basic"
+    # Job name from the savedir, e.g. outdir/e00/nanhunt/d9/ -> e00-nanhunt-d9, so bjobs shows which run is which.
+    RUN_NAME = "-".join(Path(par.savedir).parts[1:])
     minutes = int(par.max_hours * 60) + 30 if par.max_hours else 15  # 30 min slack for startup + final checkpoint
     CPUS_PER_GPU = 12  # 8 GPUs -> all 96 cores; training processes need cores beyond the data workers
     assert par.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={par.n_workers} leaves no core for the training process"
@@ -408,7 +409,7 @@ def runlsf(n:int):
         uv run torchrun --standalone --nproc_per_node={par.n_gpus} e00_basic.py run {n}
         """
     subprocess.Popen(cmd, shell=True, stdin=subprocess.DEVNULL, start_new_session=True)
-    print(f"Submitted {RUN_NAME} {n} to LSF.")
+    print(f"Submitted {RUN_NAME} (allparams()[{n}]) to LSF.")
 
 def runmany():
     for i in range(len(allparams())):
