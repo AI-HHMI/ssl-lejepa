@@ -293,7 +293,7 @@ def run(n:int):
                 with bench.phase("06_OPTIMIZER"):
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)  # no host sync
                     opt.step()
-                    opt.zero_grad()
+                    opt.zero_grad(set_to_none=True)
                     sched.step()
                 with bench.phase("07_LOGGING"):
                     if rank0 and (idx_step % 10 == 0 or idx_step + 1 == par.steps_per_epoch):
