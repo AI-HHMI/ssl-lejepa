@@ -13,6 +13,7 @@ from itertools import product
 
 from lib.data import HEMIBRAIN_EB, TRAIN_BOXES
 from lib.benchmark import Benchmark
+from lib.losses import LejepaOutput
 from lib.models import Lejepa, LejepaConfig
 from lib.views import ViewMaker
 from lib.util import *
@@ -80,8 +81,10 @@ class Params:
 
 def allparams():
     params = []
-    # viewsizes rerun with AdamW weight decay 0.05: the 7 configs that diverged under plain Adam, plus the
-    # baseline d0 as a control. Run dirs keep their viewsizes index (d0, d2, ...) for side-by-side comparison.
+    # NaN hunt: the 4 viewsizes_wd configs that diverged fastest (~4-6k steps, 1-2 h), rerun for 2 h with the
+    # non-finite-gradient skip, which dumps the first bad steps as bad_batch_*.pt for replay_bad_batch().
+    # Same settings as viewsizes_wd, including its 8 h cosine horizon, so lr sits near peak when they diverged.
+    # Run dirs keep their viewsizes index (d2, d9, ...).
     base = (128, 96, 64)
     configs = [base]  # the same 17 (input, global, local) configs, in the same order, as e00/viewsizes
     configs += [(p, 96, 64) for p in [104, 160, 192, 256]]
@@ -90,10 +93,10 @@ def allparams():
     configs += [(96, 64, 32), (160, 128, 80), (192, 144, 96), (256, 192, 128)]
     tokens = lambda g, l: 2 * (g // 8) ** 3 + 4 * (l // 8) ** 3
     flops = lambda g, l: sum(k * (n * (6 * 38.1e6 + 12 * 12 * 512 * n)) for k, n in [(2, (g // 8) ** 3), (4, (l // 8) ** 3)])
-    for i in [0, 2, 3, 4, 9, 10, 13, 15]:
+    for i in [2, 9, 10, 15]:
         inp, g, l = configs[i]
         p = Params()
-        p.savedir = f"outdir/e00/viewsizes_wd/d{i}/"
+        p.savedir = f"outdir/e00/nanhunt/d{i}/"
         p.data = "hemibrain_wide"
         p.views = "displace"
         p.patch_size = (inp, inp, inp)
@@ -102,7 +105,7 @@ def allparams():
         p.batch_size = min(168, max(8, 4 * round(84 * tokens(*base[1:]) / tokens(g, l) / 4)))
         step_s = 0.45 * (p.batch_size * flops(g, l)) / (84 * flops(*base[1:]))
         p.steps_per_epoch = int(8 * 3600 / step_s)
-        p.max_hours = 8.0
+        p.max_hours = 2.0
         p.weight_decay = 0.05
         p.cudagraphs = True
         p.batch_views = True
@@ -128,6 +131,25 @@ def lejepa_config(par: Params):
         batch_views = par.batch_views,
         lamb = 0.1,
     )
+
+def compile_model(model: Lejepa, par: Params):
+    """torch.compile the encoder in place, as par says (no-op unless par.compile)."""
+    import torch
+    assert par.compile or not (par.cudagraphs or par.compile_blocks), "cudagraphs / compile_blocks require compile"
+    if not par.compile:
+        return
+    torch._logging.set_logs(recompiles=True)  # pyright: ignore[reportPrivateImportUsage]  # recompiles show up in job_*.log
+    if par.cudagraphs:
+        # CUDA graphs replay whole kernel sequences, removing per-kernel CPU launch cost.
+        # They need static shapes: displace has exactly 2 view shapes, basic has ~9.
+        assert par.views == "displace", "cudagraphs needs views='displace' (few static shapes)"
+        kwargs = dict(mode="reduce-overhead", dynamic=False)
+    else:
+        kwargs = dict(dynamic=True)  # Views change shape every step.
+    # A whole-encoder compile releases every gradient at the end of one fused backward, so DDP can't
+    # start all-reducing until backward is done. Per-block compile releases each block's grads as it finishes.
+    for m in (model.encoder.blocks if par.compile_blocks else [model.encoder]):
+        m.compile(**kwargs)
 
 def save_view_pngs(par: Params, dataset, n_samples: int = 3):
     """Save what the model sees: for n_samples fresh samples, the input and each of its views, as
@@ -226,20 +248,7 @@ def run(n:int):
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
     print(f"Rank {rank}/{world_size} is using torch device {device} .")
     model = model.to(device)
-    assert par.compile or not (par.cudagraphs or par.compile_blocks), "cudagraphs / compile_blocks require compile"
-    if par.compile:
-        torch._logging.set_logs(recompiles=True)  # pyright: ignore[reportPrivateImportUsage]  # recompiles show up in job_*.log
-        if par.cudagraphs:
-            # CUDA graphs replay whole kernel sequences, removing per-kernel CPU launch cost.
-            # They need static shapes: displace has exactly 2 view shapes, basic has ~9.
-            assert par.views == "displace", "cudagraphs needs views='displace' (few static shapes)"
-            kwargs = dict(mode="reduce-overhead", dynamic=False)
-        else:
-            kwargs = dict(dynamic=True)  # Views change shape every step.
-        # A whole-encoder compile releases every gradient at the end of one fused backward, so DDP can't
-        # start all-reducing until backward is done. Per-block compile releases each block's grads as it finishes.
-        for m in (model.encoder.blocks if par.compile_blocks else [model.encoder]):
-            m.compile(**kwargs)
+    compile_model(model, par)
     lejepa = model  # unwrapped, for checkpoints
     if world_size > 1:
         # SIGReg and projector BatchNorm statistics stay per-rank (local batch) for now.
@@ -373,6 +382,48 @@ def run(n:int):
     if world_size > 1:
         dist.destroy_process_group()
 
+
+def replay_bad_batch(path: str):
+    """Replay a skipped (non-finite gradient) training step from its bad_batch_*.pt dump.
+
+    1. As trained (compiled per the run's Params): does the gradient come out non-finite again?
+    2. Eager under torch.autograd.detect_anomaly: raises at the first backward op that produced NaN/inf, with
+       the traceback of the forward op that created it. Eager kernels can differ numerically from compiled
+       ones, so 2 may not reproduce what 1 does. Returns the two losses.
+    """
+    import torch
+    dump = torch.load(path, map_location="cpu", weights_only=False)
+    par = Params(**dump["params"])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.set_float32_matmul_precision(par.f32mode)
+    x = dump["x_uint8"].to(device).float() / 255  # Batch C Z Y X, exactly the training input
+
+    def step(compiled: bool) -> float:
+        model = Lejepa(LejepaConfig(**dump["model_config"]))
+        model.load_state_dict(dump["model"])  # the pre-step weights
+        model.to(device).train()
+        if compiled:
+            compile_model(model, par)
+            if par.cudagraphs:
+                torch.compiler.cudagraph_mark_step_begin()
+        # Same view crops (CPU generator) and SIGReg slices (GPU generator) as the original step.
+        torch.set_rng_state(dump["rng_cpu"])
+        if device.type == "cuda" and dump["rng_cuda"] is not None:
+            torch.cuda.set_rng_state(dump["rng_cuda"], device)
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.amp):
+            out = model(x)
+        assert isinstance(out, LejepaOutput)
+        out.loss.backward()
+        bad = [n for n, p in model.named_parameters() if p.grad is not None and not torch.isfinite(p.grad).all()]
+        print(f"{'compiled' if compiled else 'eager'}: loss {out.loss.item():.6f}, {len(bad)} params with non-finite grads"
+              + (f", e.g. {bad[:3]}" if bad else ""), flush=True)
+        return out.loss.item()
+
+    print(f"Replaying step {dump['step']} of {par.savedir}", flush=True)
+    compiled_loss = step(compiled=True)
+    with torch.autograd.detect_anomaly(check_nan=True):
+        eager_loss = step(compiled=False)
+    return {"compiled": compiled_loss, "eager": eager_loss}
 
 def pca(run: str):
     """PCA maps (pca_maps) of a run's latest checkpoint. Runs automatically at the end of training runs.

@@ -26,6 +26,13 @@ class SyntheticDataset:
         return {"img": image}
 
 
+class Uint8Dataset(SyntheticDataset):
+    """Images on the uint8 grid in [0, 1], like real (normalized uint8) EM, so bad_batch dumps store them exactly."""
+
+    def __getitem__(self, index):
+        return {"img": torch.randint(0, 256, (1, 8, 8, 8)).float() / 255}
+
+
 class NanGrad(torch.autograd.Function):
     """Identity in the forward pass, NaN gradient in the backward: a finite loss whose backward goes non-finite."""
 
@@ -117,16 +124,18 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
     params = experiment.Params(
         savedir=str(tmp_path), patch_size=(8, 8, 8), batch_size=2, steps_per_epoch=6,
         warmup_steps=1, benchmark_steps=2, profile_steps=0, n_workers=1, defer_image_ops=False,
+        compile=False,  # eager on CPU, so the replay below must reproduce the step's loss exactly
     )
     patch_experiment(monkeypatch, tmp_path, params)
-    calls = []
+    monkeypatch.setattr(experiment, "VolumeDataset", Uint8Dataset)
+    losses = []
 
     class PoisonedStep(Lejepa):  # step 3's loss is finite but its gradient is NaN
         def forward(self, *args, **kwargs):
             out = super().forward(*args, **kwargs)
             assert isinstance(out, LejepaOutput)
-            calls.append(1)
-            if len(calls) == 4:
+            losses.append(out.loss.item())
+            if len(losses) == 4:
                 out.loss = NanGrad.apply(out.loss)
             return out
 
@@ -139,3 +148,9 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
     assert dump["step"] == 3 and dump["x_uint8"].dtype == torch.uint8 and dump["rng_cpu"] is not None
     ckpt = torch.load(sorted((tmp_path / "checkpoints").glob("step_*.pt"))[-1], weights_only=False)
     assert all(torch.isfinite(v).all() for v in ckpt["model"].values() if v.is_floating_point())
+
+    # Replay: same weights, input and RNG give the same views and SIGReg slices, so the same loss
+    # (the NaN came from the test's poisoned model, which the replay doesn't use).
+    replay = experiment.replay_bad_batch(str(tmp_path / "bad_batch_0000003.pt"))
+    assert replay["eager"] == pytest.approx(losses[3], rel=1e-5)
+    assert replay["compiled"] == pytest.approx(losses[3], rel=1e-5)  # compile=False: both paths are eager
