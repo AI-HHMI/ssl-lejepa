@@ -86,14 +86,12 @@ def on_queue(p: Params, queue: str) -> Params:
 
 def allparams():
     params = []
-    # A100 SXM4 80 GB (4 per node, NVLink, 12 cores/GPU, sm80, 312 TFLOPS bf16): which width x batch fits, at what
-    # MFU (d0-d11, 1 GPU), and how it scales across a node's NVLink (d12-d15, 2 and 4 GPUs at batch 32).
-    # H200 memory per sample: ~0.8 GB (384, est.), 1.13 GB (512), 1.7 GB (768), so the largest batches won't fit.
-    runs = [(w, bs, 1) for w in [384, 512, 768] for bs in [16, 32, 48, 64]]
-    runs += [(w, 32, ng) for w in [512, 768] for ng in [2, 4]]
-    for i, (w, bs, ng) in enumerate(runs):
+    # B300 revisited with every improvement since the first B300 sweeps (bf16 + compile + 8 workers, basic views:
+    # 1333 ktok/s on 1 GPU, 8.1M tok/s on 8). Width 512, batch 84 matches the best H200 runs (width-defer/d3, d5:
+    # 1036 ktok/s on 1 GPU, 7.8M on 8), so both GPU generations compare directly. d0: 1 GPU; d1: full 8-GPU node.
+    for i, ng in enumerate([1, 8]):
         p = Params()
-        p.savedir = f"outdir/e00/a100-zerograd-none/d{i}/"
+        p.savedir = f"outdir/e00/b300-revisit/d{i}/"
         p.data = "hemibrain_eb"
         p.views = "displace"
         p.patch_size = (128, 128, 128)
@@ -101,11 +99,11 @@ def allparams():
         p.local_size = (64, 64, 64)
         p.cudagraphs = True
         p.batch_views = True
-        p.width = w
-        p.batch_size = bs
+        p.width = 512
+        p.batch_size = 84
         p.n_workers = 8
-        p.n_gpus = ng  # 4 GPUs x 12 cores = a whole node
-        p.queue = "gpu_a100"
+        p.n_gpus = ng  # 8 GPUs x 12 cores = all 96 cores of a B300 node
+        p.queue = "gpu_b300"
         params.append(p)
     # pprint(params)
 
