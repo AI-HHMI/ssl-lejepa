@@ -93,7 +93,7 @@ def allparams():
     runs += [(w, 32, ng) for w in [512, 768] for ng in [2, 4]]
     for i, (w, bs, ng) in enumerate(runs):
         p = Params()
-        p.savedir = f"outdir/e00/a100/d{i}/"
+        p.savedir = f"outdir/e00/a100-zerograd-none/d{i}/"
         p.data = "hemibrain_eb"
         p.views = "displace"
         p.patch_size = (128, 128, 128)
@@ -561,6 +561,10 @@ def plot1():
     repeat = (res.idx_step == 0).groupby(res.savedir).cumsum() - 1
     res["run"] = short_runs(res.savedir) + repeat.map(lambda k: f".{k}" if k else "")
     res["sizes"] = res.patch_size.astype(str) + " " + res.global_size.astype(str) + " " + res.local_size.astype(str)
+    # px.line(res, x="idx_step", y="loss", color="run", line_dash="views", facet_col="n_gpus",
+    #         hover_data=["sizes", "n_workers"], markers=True, log_y=True).show()
+    # px.line(res, x="idx_step", y="loss", facet_col="batch_size", color="width",
+    #         hover_data=["n_gpus"], markers=True, log_y=True, ).show()
     px.line(res, x="idx_step", y="loss", color="width", facet_col="batch_size",
             hover_data=["n_gpus"], markers=True, log_y=True,
             category_orders={"batch_size": sorted(res.batch_size.unique())}).show()
