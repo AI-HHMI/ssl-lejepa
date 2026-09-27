@@ -419,6 +419,51 @@ def runmany_sequential():
     for i in range(len(allparams())):
         run(i)
 
+def check_runs(root: str = "outdir/e00"):
+    """Flag run dirs a job wrote under the wrong name (e.g. the shared-checkout race), or that lack results.
+
+    Conflicts: a row whose params.savedir isn't the dir it sits in, a job log whose run wrote elsewhere, or
+    more than one runs.json row (two jobs wrote here). Several job logs alone are just resubmissions.
+    Missing: every run dir needs at least a job log and metrics.json (pending or still-running jobs show up too).
+    Different: within a sweep, a run lacking file names (top level, excluding IGNORED) that other runs have.
+    """
+    import re
+    from collections import defaultdict
+    flagged = 0
+    run_dirs = sorted(p for p in Path(root).glob("**/d*/") if re.fullmatch(r"d\d+", p.name))
+    from fnmatch import fnmatch
+    IGNORED = ["job_*.log", ".DS_Store"]  # expected to differ between runs, or not ours
+    names = {d: {f.name for f in d.iterdir() if not any(fnmatch(f.name, g) for g in IGNORED)} for d in run_dirs}
+    sweep_names = defaultdict(set)
+    for d in run_dirs:
+        sweep_names[d.parent] |= names[d]
+    for d in run_dirs:
+        issues = []
+        missing = sweep_names[d.parent] - names[d]
+        if missing:
+            issues.append(f"lacks {', '.join(sorted(missing))}. ")
+        if not any(d.glob("job_*.log")):
+            issues.append("no job log")
+        if not (d / "metrics.json").is_file():
+            issues.append("no metrics.json")
+        perf = d / "performance.json"
+        for line in (perf.read_text().splitlines() if perf.is_file() else []):
+            saved = json.loads(line).get("params", {}).get("savedir")
+            if saved and Path(saved) != d:
+                issues.append(f"row for {saved}")
+        runs = d / "runs.json"
+        n = len(runs.read_text().splitlines()) if runs.is_file() else 0
+        if n > 1:
+            issues.append(f"{n} runs.json rows")
+        for log in d.glob("job_*.log"):
+            m = re.search(r"input \+ view slices to (\S+)/views", log.read_text(errors="ignore"))
+            if m and Path(m.group(1)) != d:
+                issues.append(f"{log.name} ran as {m.group(1)}")
+        if issues:
+            flagged += 1
+            print(f"{d}: {'; '.join(sorted(set(issues)))}")
+    print(f"{flagged} run dirs flagged under {root}")
+
 def loadJsonTable(filename):
     rows = []
     for par in allparams():
