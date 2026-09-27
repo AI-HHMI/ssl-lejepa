@@ -127,3 +127,25 @@ def test_batch_views_matches_per_view():
     batched.eval()
     views = [torch.randn(3, 1, 8, 8, 8), torch.randn(3, 1, 4, 8, 8), torch.randn(3, 1, 8, 8, 8)]
     torch.testing.assert_close(per_view.encode_views(views), batched.encode_views(views))
+
+def test_config_round_trip():
+    cfg = LejepaConfig(n_layers=3, width=64, views="displace", global_size=(32, 32, 32), local_size=(16, 16, 16), lamb=0.1)
+    again = LejepaConfig(**cfg.to_kwargs())
+    assert again.to_kwargs() == cfg.to_kwargs()
+    Lejepa(again).load_state_dict(Lejepa(cfg).state_dict())  # same architecture
+
+
+def test_snapshot_copies_once(tmp_path, monkeypatch):
+    from lib.util import snapshot
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pkg" / "sub").mkdir(parents=True)
+    (tmp_path / "main.py").write_text("x = 1\n")
+    (tmp_path / "pkg" / "sub" / "m.py").write_text("y = 2\n")
+    dest = snapshot(["main.py", "pkg"], tmp_path / "snap")
+    assert (dest / "main.py").read_text() == "x = 1\n" and (dest / "pkg" / "sub" / "m.py").read_text() == "y = 2\n"
+    mtime = (dest / "main.py").stat().st_mtime_ns
+    snapshot(["main.py", "pkg"], tmp_path / "snap")  # unchanged content: nothing rewritten
+    assert (dest / "main.py").stat().st_mtime_ns == mtime
+    (tmp_path / "main.py").write_text("x = 3\n")
+    snapshot(["main.py", "pkg"], tmp_path / "snap")  # changed content: refreshed
+    assert (dest / "main.py").read_text() == "x = 3\n"

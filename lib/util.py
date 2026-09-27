@@ -16,6 +16,28 @@ def wipedir(path):
   path.mkdir(parents=True, exist_ok=True)
 
 
+def snapshot(paths, dest) -> Path:
+    """Copy files/dirs (relative to the cwd) into dest, for jobs that must run exactly this code.
+
+    Skipped if dest already holds identical content, so repeated calls (one per job in a sweep) don't rewrite
+    files a started job may be importing. Each file is written to a temp name and os.replace()d into place.
+    """
+    dest = Path(dest)
+    files = sorted(f for p in map(Path, paths) for f in ([p] if p.is_file() else p.rglob("*.py")) if "__pycache__" not in f.parts)
+    assert files, f"nothing to snapshot in {paths}"
+    digest = sha256(b"".join(str(f).encode() + b"\0" + f.read_bytes() for f in files)).hexdigest()
+    stamp = dest / ".sha256"
+    if stamp.is_file() and stamp.read_text() == digest:
+        return dest
+    for f in files:
+        (dest / f).parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest / f"{f}.tmp"
+        shutil.copy2(f, tmp)
+        tmp.replace(dest / f)
+    stamp.write_text(digest)
+    return dest
+
+
 def repo_root(path=".") -> Path:
     """Return the absolute Git repository root containing the given directory."""
     return Path(subprocess.check_output(

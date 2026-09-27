@@ -30,7 +30,19 @@ import pandas
 import plotly.express as px
 import plotly.graph_objects as go
 
-
+# Default (width, batch per GPU) per LSF GPU queue, for displace 128^3 / 96^3 / 64^3 views. Measured runs cited;
+# "est." sizes extrapolate the measured ~1.7 GB/sample at width 768 and haven't been run.
+QUEUE_ARCH = {
+ "gpu_a100": (768, 32),     # a100/d9: 50% MFU, 55 of 80 GB
+ "gpu_rtx6000": (768, 32),  # rtx6k-memory/d5: 46% MFU, 55 of 95 GB
+ "gpu_h200": (768, 64),     # est. ~110 of 140 GB (b84 peaked at 142); width-defer/d1: 38% MFU at b84
+ "gpu_h100": (768, 32),     # est., same 80 GB as A100
+ "gpu_b300": (768, 128),    # est. ~220 of 288 GB; untested with displace views
+}
+ 
+# Code copied into .tmpcode/<sweep>/ at submission (runlsf); jobs import only from these. Add files here if
+# the experiment starts depending on others. Dependencies (pyproject.toml / uv.lock) are not frozen.
+SNAPSHOT_PATHS = ["e00_basic.py", "lib"]
 
 @dataclass(slots=True)
 class Params:
@@ -162,6 +174,10 @@ def dataloader(n:int):
 
 def run(n:int):
     start_time = time.time()
+    # LSF jobs must run a runlsf snapshot: the shared checkout's allparams()[n] may be another sweep by now.
+    b1 = "LSB_JOBID" in os.environ
+    b2 = ".tmpcode" not in Path(__file__).resolve().parts
+    assert not (b1 and b2), f"LSF job running {__file__} from the shared checkout; submit via runlsf (code snapshot)"
     par : Params = allparams()[n]
     import torch
     import torch.distributed as dist
@@ -395,6 +411,10 @@ def runlsf(n:int):
     wipedir(par.savedir)
     # Job name from the savedir, e.g. outdir/e00/nanhunt/d9/ -> e00-nanhunt-d9, so bjobs shows which run is which.
     RUN_NAME = "-".join(Path(par.savedir).parts[1:])
+    # The job runs a per-sweep snapshot of this code, not the shared checkout, which may have moved on (another
+    # sweep pushed) by the time the job starts. Python puts the script's dir first on sys.path, so `lib` comes
+    # from the snapshot too; cwd stays the repo root, so outdir/ and data paths resolve as before.
+    code = snapshot(SNAPSHOT_PATHS, Path(".tmpcode") / "-".join(Path(par.savedir).parts[1:-1]))
     minutes = int(par.max_hours * 60) + 30 if par.max_hours else 15  # 30 min slack for startup + final checkpoint
     CPUS_PER_GPU = 12  # 8 GPUs -> all 96 cores; training processes need cores beyond the data workers
     assert par.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={par.n_workers} leaves no core for the training process"
@@ -406,10 +426,10 @@ def runlsf(n:int):
         -gpu "num={par.n_gpus}:mode=exclusive_process" \
         -q gpu_rtx6000 \
         -o {par.savedir}/job_%J.log \
-        uv run torchrun --standalone --nproc_per_node={par.n_gpus} e00_basic.py run {n}
+        uv run torchrun --standalone --nproc_per_node={par.n_gpus} {code}/e00_basic.py run {n}
         """
     subprocess.Popen(cmd, shell=True, stdin=subprocess.DEVNULL, start_new_session=True)
-    print(f"Submitted {RUN_NAME} (allparams()[{n}]) to LSF.")
+    print(f"Submitted {RUN_NAME} (allparams()[{n}], code {code}) to LSF.")
 
 def runmany():
     for i in range(len(allparams())):
