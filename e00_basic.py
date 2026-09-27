@@ -37,7 +37,7 @@ QUEUE_ARCH = {
  "gpu_rtx6000": (768, 32),  # rtx6k-memory/d5: 46% MFU, 55 of 95 GB
  "gpu_h200": (768, 64),     # est. ~110 of 140 GB (b84 peaked at 142); width-defer/d1: 38% MFU at b84
  "gpu_h100": (768, 32),     # est., same 80 GB as A100
- "gpu_b300": (768, 128),    # est. ~220 of 288 GB; untested with displace views
+ "gpu_b300": (1024, 64),    # b300-width/d2: 30.8% MFU, 144 of 288 GB (768 x 128: 27.3%, 215 GB)
 }
  
 # Code copied into .tmpcode/<sweep>/ at submission (runlsf); jobs import only from these. Add files here if
@@ -86,13 +86,14 @@ def on_queue(p: Params, queue: str) -> Params:
 
 def allparams():
     params = []
-    # B300 width sweep, 1 GPU. At width 512 / batch 84 (b300-revisit/d0) B300 is GPU-bound (99% busy) but only
-    # 21.5% MFU vs 34% on H200; wider models raised MFU 5-12 points on every other GPU. Memory per sample
-    # ~1.7 GB (768, measured on H200) and ~2.3 GB (1024, extrapolated) against 288 GB, so 1024 x 128 may OOM
-    # (recorded as an oom row). Also tests QUEUE_ARCH["gpu_b300"] = (768, 128).
-    for i, (w, bs) in enumerate(product([768, 1024], [64, 128])):
+    # Patch embedding as unfold + Linear instead of Conv3d (same math): benchmark the speedup. Each run repeats
+    # an earlier Conv3d measurement exactly, on the same queue:
+    #   d0 B300 w512 b84  (b300-revisit/d0: 1501 ktok/s, 21.5% MFU)   d1 B300 w1024 b64 (b300-width/d2: 632, 30.8%)
+    #   d2 H200 w512 b84  (width-defer/d3: 1036 ktok/s, 33.8% MFU)    d3 A100 w768 b32  (a100/d9: 240, 50.3%)
+    runs = [("gpu_b300", 512, 84), ("gpu_b300", 1024, 64), ("gpu_h200", 512, 84), ("gpu_a100", 768, 32)]
+    for i, (queue, w, bs) in enumerate(runs):
         p = Params()
-        p.savedir = f"outdir/e00/b300-width/d{i}/"
+        p.savedir = f"outdir/e00/patchembed-linear/d{i}/"
         p.data = "hemibrain_eb"
         p.views = "displace"
         p.patch_size = (128, 128, 128)
@@ -104,7 +105,7 @@ def allparams():
         p.batch_size = bs
         p.n_workers = 8
         p.n_gpus = 1
-        p.queue = "gpu_b300"
+        p.queue = queue
         params.append(p)
     # pprint(params)
 
