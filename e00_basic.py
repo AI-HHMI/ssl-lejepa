@@ -70,6 +70,7 @@ class Params:
     defer_image_ops: bool = True  # workers ship uint8 crops; cast + normalize on the GPU (miao.finish_images)
     batch_views: bool = False  # one encoder call per group of same-shape views (2 per step with displace)
     weight_decay: float = 0.0  # AdamW decay on weight matrices (biases/norms excluded); 0 = the original plain Adam
+    adam_beta2: float = 0.999  # Adam second-moment decay; 0.999 = torch default (all runs so far), mia-muvit uses 0.95
     grad_compress: bool = False  # DDP bf16_compress_hook: all-reduce gradients in bf16 (half the bytes)
     queue: str = "gpu_h200"  # LSF queue
     n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); batch_size and n_workers are per GPU
@@ -81,9 +82,9 @@ class Params:
 
 def allparams():
     params = []
-    # NaN hunt: the 4 viewsizes_wd configs that diverged fastest (~4-6k steps, 1-2 h), rerun for 2 h with the
-    # non-finite-gradient skip, which dumps the first bad steps as bad_batch_*.pt for replay_bad_batch().
-    # Same settings as viewsizes_wd, including its 8 h cosine horizon, so lr sits near peak when they diverged.
+    # NaN hunt with Adam beta2 = 0.95 (mia-muvit's value; everything so far used torch's 0.999). Same 4 configs
+    # and settings as e00/nanhunt, where d2, d9 and d15 hit non-finite gradients at 5.7-7.2k steps and d10 didn't.
+    # Still skips and dumps non-finite steps (bad_batch_*.pt), so a divergence stays diagnosable.
     # Run dirs keep their viewsizes index (d2, d9, ...).
     base = (128, 96, 64)
     configs = [base]  # the same 17 (input, global, local) configs, in the same order, as e00/viewsizes
@@ -96,7 +97,7 @@ def allparams():
     for i in [2, 9, 10, 15]:
         inp, g, l = configs[i]
         p = Params()
-        p.savedir = f"outdir/e00/nanhunt/d{i}/"
+        p.savedir = f"outdir/e00/nanhunt_beta95/d{i}/"
         p.data = "hemibrain_wide"
         p.views = "displace"
         p.patch_size = (inp, inp, inp)
@@ -107,6 +108,7 @@ def allparams():
         p.steps_per_epoch = int(8 * 3600 / step_s)
         p.max_hours = 2.0
         p.weight_decay = 0.05
+        p.adam_beta2 = 0.95
         p.cudagraphs = True
         p.batch_views = True
         p.n_workers = 11
@@ -263,7 +265,7 @@ def run(n:int):
     decay = [p for p in model.parameters() if p.ndim >= 2]
     no_decay = [p for p in model.parameters() if p.ndim < 2]
     opt = torch.optim.AdamW([{"params": decay, "weight_decay": par.weight_decay},
-                             {"params": no_decay, "weight_decay": 0.0}], lr=LR)
+                             {"params": no_decay, "weight_decay": 0.0}], lr=LR, betas=(0.9, par.adam_beta2))
     # Warmup then cosine decay over steps_per_epoch, by step count so every rank uses the same lr.
     # For max_hours runs set steps_per_epoch to the expected step count so the schedule completes.
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / LR_WARMUP) * (
