@@ -31,13 +31,14 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # Default (width, batch per GPU) per LSF GPU queue, for displace 128^3 / 96^3 / 64^3 views. Measured runs cited;
-# "est." sizes extrapolate the measured ~1.7 GB/sample at width 768 and haven't been run.
+# "est." sizes extrapolate the measured ~1.7 GB/sample at width 768 and haven't been run. MFU with the Linear
+# patch embedding (patchembed-linear) where measured; older Conv3d-era numbers are marked (conv), 1.1-1.6x lower.
 QUEUE_ARCH = {
- "gpu_a100": (768, 32),     # a100/d9: 50% MFU, 55 of 80 GB
- "gpu_rtx6000": (768, 32),  # rtx6k-memory/d5: 46% MFU, 55 of 95 GB
- "gpu_h200": (768, 64),     # est. ~110 of 140 GB (b84 peaked at 142); width-defer/d1: 38% MFU at b84
+ "gpu_a100": (768, 32),     # patchembed-linear/d3: 54.9% MFU, 262 ktok/s, 55 of 80 GB
+ "gpu_rtx6000": (768, 32),  # rtx6k-memory/d5 (conv): 46% MFU, 55 of 95 GB
+ "gpu_h200": (768, 64),     # est. ~110 of 140 GB; width 512 x 84: patchembed-linear/d2 37.7% MFU (768 x 84 conv: 38%)
  "gpu_h100": (768, 32),     # est., same 80 GB as A100
- "gpu_b300": (1024, 64),    # b300-width/d2: 30.8% MFU, 144 of 288 GB (768 x 128: 27.3%, 215 GB)
+ "gpu_b300": (1024, 64),    # patchembed-linear/d1: 49.3% MFU, 1010 ktok/s, 144 of 288 GB (512 x 84: 29.1%)
 }
  
 # Code copied into .tmpcode/<sweep>/ at submission (runlsf); jobs import only from these. Add files here if
@@ -561,12 +562,8 @@ def plot1():
     repeat = (res.idx_step == 0).groupby(res.savedir).cumsum() - 1
     res["run"] = short_runs(res.savedir) + repeat.map(lambda k: f".{k}" if k else "")
     res["sizes"] = res.patch_size.astype(str) + " " + res.global_size.astype(str) + " " + res.local_size.astype(str)
-    # px.line(res, x="idx_step", y="loss", color="run", line_dash="views", facet_col="n_gpus",
-    #         hover_data=["sizes", "n_workers"], markers=True, log_y=True).show()
-    # px.line(res, x="idx_step", y="loss", facet_col="batch_size", color="width",
-    #         hover_data=["n_gpus"], markers=True, log_y=True, ).show()
-    px.line(res, x="idx_step", y="loss", color="width", facet_col="batch_size",
-            hover_data=["n_gpus"], markers=True, log_y=True,
+    px.line(res, x="idx_step", y="loss", color="width", line_dash="batch_size",
+            hover_data=["width", "batch_size", "queue"], markers=True, log_y=True,
             category_orders={"batch_size": sorted(res.batch_size.unique())}).show()
 
 def plot2():
