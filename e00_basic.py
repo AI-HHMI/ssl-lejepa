@@ -664,76 +664,76 @@ def plot1():
     px.line(res, x="idx_step", y="loss", color="run", line_dash="views", facet_col="n_gpus",
             hover_data=["sizes", "n_workers"], markers=True, log_y=True).show()
 
-def plot2():
-    """ktok/s per GPU: one bar per result row, bars grouped by n_gpus with gaps between groups, colored by width + defer_image_ops."""
-    res = loadJsonTable("performance.json")
-    res["ktok_s_per_gpu"] = res.tokens_per_second / res.n_gpus / 1e3
-    assert len(res), "no performance.json rows for allparams(); run ./pull.sh?"
-    # Bar label: short run name, plus a suffix for repeated rows in one run.
-    repeat = res.groupby("savedir").cumcount()
-    res["run"] = short_runs(res.savedir) + repeat.map(lambda k: f".{k}" if k else "")
-    res["color"] = "width=" + res.width.astype(str) + ", defer=" + res.defer_image_ops.astype(str)
-    res = res.sort_values(["n_gpus", "color", "run"]).reset_index(drop=True)
-    # x positions: consecutive within a group, GROUP_GAP extra slots between groups.
-    GROUP_GAP = 0.8
-    group_idx = res.n_gpus.rank(method="dense").astype(int) - 1
-    res["x"] = res.index + GROUP_GAP * group_idx
-    fig = go.Figure()
-    for color, r in res.groupby("color", sort=False):
-        fig.add_bar(x=r.x, y=r.ktok_s_per_gpu, name=str(color), width=0.9)
-    for g, r in res.groupby("n_gpus"):
-        fig.add_annotation(x=r.x.mean(), y=-0.12, yref="paper", text=f"<b>{g} gpu</b>", showarrow=False)
-    fig.update_xaxes(tickvals=res.x, ticktext=res.run)
-    fig.update_layout(yaxis_title="ktok/s per GPU", legend_title="", margin=dict(b=80))
-    fig.show()
+# def plot2():
+#     """ktok/s per GPU: one bar per result row, bars grouped by n_gpus with gaps between groups, colored by width + defer_image_ops."""
+#     res = loadJsonTable("performance.json")
+#     res["ktok_s_per_gpu"] = res.tokens_per_second / res.n_gpus / 1e3
+#     assert len(res), "no performance.json rows for allparams(); run ./pull.sh?"
+#     # Bar label: short run name, plus a suffix for repeated rows in one run.
+#     repeat = res.groupby("savedir").cumcount()
+#     res["run"] = short_runs(res.savedir) + repeat.map(lambda k: f".{k}" if k else "")
+#     res["color"] = "width=" + res.width.astype(str) + ", defer=" + res.defer_image_ops.astype(str)
+#     res = res.sort_values(["n_gpus", "color", "run"]).reset_index(drop=True)
+#     # x positions: consecutive within a group, GROUP_GAP extra slots between groups.
+#     GROUP_GAP = 0.8
+#     group_idx = res.n_gpus.rank(method="dense").astype(int) - 1
+#     res["x"] = res.index + GROUP_GAP * group_idx
+#     fig = go.Figure()
+#     for color, r in res.groupby("color", sort=False):
+#         fig.add_bar(x=r.x, y=r.ktok_s_per_gpu, name=str(color), width=0.9)
+#     for g, r in res.groupby("n_gpus"):
+#         fig.add_annotation(x=r.x.mean(), y=-0.12, yref="paper", text=f"<b>{g} gpu</b>", showarrow=False)
+#     fig.update_xaxes(tickvals=res.x, ticktext=res.run)
+#     fig.update_layout(yaxis_title="ktok/s per GPU", legend_title="", margin=dict(b=80))
+#     fig.show()
 
-def table():
-    res = loadJsonTable("performance.json")
-    trace = loadJsonTable("trace_summary.json")
-    # Host ms per profiled step in each phase (see lib.util.trace_summary).
-    phases = {"01_DATA_IO_ms": "io ms", "04_FORWARD_AND_LOSS_ms": "fwd ms", "05_BACKWARD_ms": "bwd ms", "06_OPTIMIZER_ms": "opt ms"}
-    for k in ["gpu_busy", "step_ms", *phases]:
-        res[k] = res.savedir.map(dict(zip(trace.savedir, trace[k]))) if k in trace else float("nan")
-    cols = {
-        "savedir": "run",
-        "tbl": "result",  # "throughput", or "oom" for runs that ran out of GPU memory
-        # "views": "views",
-        # "patch_size": "input",
-        # "global_size": "global",
-        # "local_size": "local",
-        # "compile": "compile",
-        # "cudagraphs": "cudagraphs",
-        # "width": "width",
-        # "defer_image_ops": "defer",
-        # "compile_blocks": "blocks",
-        # "grad_compress": "compress",
-        # "batch_views": "batch views",
-        "n_gpus": "gpus",
-        # "batch_size": "batch",
-        # "n_workers": "workers",
-        "gpu_busy": "gpu busy %",
-        "samples_per_second": "samples/s",
-        "tokens_per_second": "tok/s",
-        "tflops_per_second": "TFLOP/s",
-        "mfu": "mfu %",
-        "max_mem_gb": "mem GB",
-        "input_mvox_per_second": "Mvox/s",
-        "step_ms": "prof step ms",
-        **phases,
-    }
-    for k in cols:  # older runs predate some columns
-        if k not in res:
-            res[k] = float("nan")
-    res = res[list(cols)].rename(columns=cols) # type: ignore
-    res["gpu busy %"] *= 100
-    res["mfu %"] *= 100
-    res["TFLOP/s"] /= res["gpus"]
-    res = res.rename(columns={"TFLOP/s": "TFLOP/s/gpu"})
-    res["tok/s"] /= 1e3
-    res.insert(list(res.columns).index("tok/s") + 1, "ktok/s/gpu", res["tok/s"] / res["gpus"])
-    res = res.rename(columns={"tok/s": "ktok/s"}).round(1)
-    print(res.to_string(index=False))
-    return res
+# def table():
+#     res = loadJsonTable("performance.json")
+#     trace = loadJsonTable("trace_summary.json")
+#     # Host ms per profiled step in each phase (see lib.util.trace_summary).
+#     phases = {"01_DATA_IO_ms": "io ms", "04_FORWARD_AND_LOSS_ms": "fwd ms", "05_BACKWARD_ms": "bwd ms", "06_OPTIMIZER_ms": "opt ms"}
+#     for k in ["gpu_busy", "step_ms", *phases]:
+#         res[k] = res.savedir.map(dict(zip(trace.savedir, trace[k]))) if k in trace else float("nan")
+#     cols = {
+#         "savedir": "run",
+#         "tbl": "result",  # "throughput", or "oom" for runs that ran out of GPU memory
+#         # "views": "views",
+#         # "patch_size": "input",
+#         # "global_size": "global",
+#         # "local_size": "local",
+#         # "compile": "compile",
+#         # "cudagraphs": "cudagraphs",
+#         # "width": "width",
+#         # "defer_image_ops": "defer",
+#         # "compile_blocks": "blocks",
+#         # "grad_compress": "compress",
+#         # "batch_views": "batch views",
+#         "n_gpus": "gpus",
+#         # "batch_size": "batch",
+#         # "n_workers": "workers",
+#         "gpu_busy": "gpu busy %",
+#         "samples_per_second": "samples/s",
+#         "tokens_per_second": "tok/s",
+#         "tflops_per_second": "TFLOP/s",
+#         "mfu": "mfu %",
+#         "max_mem_gb": "mem GB",
+#         "input_mvox_per_second": "Mvox/s",
+#         "step_ms": "prof step ms",
+#         **phases,
+#     }
+#     for k in cols:  # older runs predate some columns
+#         if k not in res:
+#             res[k] = float("nan")
+#     res = res[list(cols)].rename(columns=cols) # type: ignore
+#     res["gpu busy %"] *= 100
+#     res["mfu %"] *= 100
+#     res["TFLOP/s"] /= res["gpus"]
+#     res = res.rename(columns={"TFLOP/s": "TFLOP/s/gpu"})
+#     res["tok/s"] /= 1e3
+#     res.insert(list(res.columns).index("tok/s") + 1, "ktok/s/gpu", res["tok/s"] / res["gpus"])
+#     res = res.rename(columns={"tok/s": "ktok/s"}).round(1)
+#     print(res.to_string(index=False))
+#     return res
 
 def test():
     x = lmd.all()
