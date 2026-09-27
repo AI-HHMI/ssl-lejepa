@@ -86,12 +86,13 @@ def on_queue(p: Params, queue: str) -> Params:
 
 def allparams():
     params = []
-    # B300 revisited with every improvement since the first B300 sweeps (bf16 + compile + 8 workers, basic views:
-    # 1333 ktok/s on 1 GPU, 8.1M tok/s on 8). Width 512, batch 84 matches the best H200 runs (width-defer/d3, d5:
-    # 1036 ktok/s on 1 GPU, 7.8M on 8), so both GPU generations compare directly. d0: 1 GPU; d1: full 8-GPU node.
-    for i, ng in enumerate([1, 8]):
+    # B300 width sweep, 1 GPU. At width 512 / batch 84 (b300-revisit/d0) B300 is GPU-bound (99% busy) but only
+    # 21.5% MFU vs 34% on H200; wider models raised MFU 5-12 points on every other GPU. Memory per sample
+    # ~1.7 GB (768, measured on H200) and ~2.3 GB (1024, extrapolated) against 288 GB, so 1024 x 128 may OOM
+    # (recorded as an oom row). Also tests QUEUE_ARCH["gpu_b300"] = (768, 128).
+    for i, (w, bs) in enumerate(product([768, 1024], [64, 128])):
         p = Params()
-        p.savedir = f"outdir/e00/b300-revisit/d{i}/"
+        p.savedir = f"outdir/e00/b300-width/d{i}/"
         p.data = "hemibrain_eb"
         p.views = "displace"
         p.patch_size = (128, 128, 128)
@@ -99,10 +100,10 @@ def allparams():
         p.local_size = (64, 64, 64)
         p.cudagraphs = True
         p.batch_views = True
-        p.width = 512
-        p.batch_size = 84
+        p.width = w
+        p.batch_size = bs
         p.n_workers = 8
-        p.n_gpus = ng  # 8 GPUs x 12 cores = all 96 cores of a B300 node
+        p.n_gpus = 1
         p.queue = "gpu_b300"
         params.append(p)
     # pprint(params)
