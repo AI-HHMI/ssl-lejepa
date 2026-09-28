@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import e00_basic as experiment
+import experiment
 from lib.losses import LejepaOutput
 from lib.models import Lejepa, LejepaConfig
 
@@ -46,7 +46,7 @@ class NanGrad(torch.autograd.Function):
 
 
 def patch_experiment(monkeypatch, tmp_path, params):
-    """Point e00_basic at params, a synthetic dataset and a tiny model, with no cluster, git or GPU."""
+    """Point experiment at params, a synthetic dataset and a tiny model, with no cluster, git or GPU."""
     monkeypatch.setattr(experiment, "allparams", lambda: [params])
     monkeypatch.setattr(experiment.lmd, "get", lambda name: SimpleNamespace(to_miao=lambda **kw: None))
     monkeypatch.setattr(experiment, "MiaoConfig", SimpleNamespace)

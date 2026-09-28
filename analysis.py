@@ -1,8 +1,8 @@
 """Analysis of e00 results (local): figures, tables and summaries built only from pulled artifacts in outdir/, a
-mirror of the cluster's append-only run dirs. Imports no experiment code (e00_basic, lib/ models: nothing that
+mirror of the cluster's append-only run dirs. Imports no experiment code (experiment, lib/ models: nothing that
 builds a Lejepa), only lib.util's entrypoint CLI: artifacts describe themselves (saved params), so every function
 works on any past sweep at HEAD.
-Figures also go to results/ (local, not committed). Run: uv run python e00_analysis.py <function> [args].
+Figures also go to results/ (local, not committed). Run: uv run python analysis.py <function> [args].
 """
 
 import json
@@ -352,7 +352,7 @@ def perf_journey():
     BEGIN, END = "// BEGIN perf_journey() data", "// END perf_journey() data"
     assert html.count(BEGIN) == 1 and html.count(END) == 1, f"{path} needs one {BEGIN!r} ... {END!r} block"
     rows = lambda xs: "[\n" + ",\n".join("  " + json.dumps(x, ensure_ascii=False) for x in xs) + ",\n]"
-    data = (f"{BEGIN}: written by e00_basic.py perf_journey(); edit the lists there, not here.\n"
+    data = (f"{BEGIN}: written by analysis.py perf_journey(); edit the lists there, not here.\n"
             f"const steps = {rows(steps)};\n"
             f"// One label per phase; a new phase starts wherever the GPU type changes.\n"
             f"const phases = {json.dumps([label for label, _ in phases], ensure_ascii=False)};\n"

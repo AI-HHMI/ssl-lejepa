@@ -181,7 +181,7 @@
 
 <script>
 const S1 = "var(--series-1)", S2 = "var(--series-2)";
-// BEGIN perf_journey() data: written by e00_basic.py perf_journey(); edit the lists there, not here.
+// BEGIN perf_journey() data: written by analysis.py perf_journey(); edit the lists there, not here.
 const steps = [
   {"k": "fp32", "g": 1, "v": 267, "hw": "B300", "run": "compile-amp-tok_s/d0", "d": "fp32, batch 42, 4 workers, eager. Attention on fp32 mem-efficient kernel."},
   {"k": "+ bf16", "g": 1, "v": 822, "hw": "B300", "run": "compile-amp-tok_s/d5", "d": "bf16 autocast (SIGReg fp32), batch 84. cuDNN flash attention.", "x": "×3.1"},

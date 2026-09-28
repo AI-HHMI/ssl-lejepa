@@ -1,11 +1,11 @@
-"""Tests for e00_analysis: tables and figures are built from each run's own saved artifacts."""
+"""Tests for analysis: tables and figures are built from each run's own saved artifacts."""
 
 import json
 
 import plotly.express as px
 import pytest
 
-import e00_analysis as analysis
+import analysis
 
 
 def test_load_table_uses_saved_params(tmp_path, monkeypatch):
@@ -43,11 +43,11 @@ def test_profile_device_ms(tmp_path):
 
 
 def test_analysis_imports_no_experiment_code():
-    # Analysis reads outdir/ only and never builds a Lejepa: lib/ and eNN scripts change between commits
+    # Analysis reads outdir/ only and never builds a Lejepa: lib/ and experiment.py change between commits
     # (README: "How this repo works"). lib.util's entrypoint CLI is the one allowed dependency.
     import ast
     from pathlib import Path
     tree = ast.parse(Path(analysis.__file__).read_text())
     names = [a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names]
     names += [n.module or "" for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)]
-    assert not [m for m in names if (m.split(".")[0] == "lib" and m != "lib.util") or m.startswith("e0")], names
+    assert not [m for m in names if (m.split(".")[0] == "lib" and m != "lib.util") or m == "experiment"], names

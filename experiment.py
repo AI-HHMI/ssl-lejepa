@@ -1,5 +1,6 @@
-"""e00: LeJEPA 3D ViT training runs and benchmarks, and their LSF sweeps (allparams). Analysis of the results
-lives in e00_analysis.py."""
+"""Experiment code (remote): LeJEPA 3D ViT training runs, benchmarks, inference (pca) and replays, and their LSF
+sweep (allparams, savedirs under outdir/e00/). Depends on lib/, so it runs only from its experiment's commit.
+Analysis of the results lives in analysis.py."""
 
 from __future__ import annotations
 
@@ -44,7 +45,7 @@ QUEUE_ARCH = {
  
 # Code copied into .tmpcode/<sweep>/ at submission (runlsf); jobs import only from these. Add files here if
 # the experiment starts depending on others. Dependencies (pyproject.toml / uv.lock) are not frozen.
-SNAPSHOT_PATHS = ["e00_basic.py", "lib"]
+SNAPSHOT_PATHS = ["experiment.py", "lib"]
 
 @dataclass(slots=True)
 class Params:
@@ -584,12 +585,12 @@ def runlsf(n:int):
     assert_committed()
     trash(par.savedir)
     minutes = int(par.max_hours * 60) + 30 if par.max_hours else 15  # 30 min slack for startup + final checkpoint
-    bsub(par, "run", minutes, par.n_gpus, f"torchrun --standalone --nproc_per_node={par.n_gpus} {{code}}/e00_basic.py run {n}")
+    bsub(par, "run", minutes, par.n_gpus, f"torchrun --standalone --nproc_per_node={par.n_gpus} {{code}}/experiment.py run {n}")
 
 def pcalsf(n:int):
     """Redo pca(n) on LSF, e.g. after changing pca_maps in this experiment's change (run() already does it once)."""
     assert_committed()
-    bsub(allparams()[n], "pca", 30, 1, f"python {{code}}/e00_basic.py pca {n}")
+    bsub(allparams()[n], "pca", 30, 1, f"python {{code}}/experiment.py pca {n}")
 
 def pcamany():
     for i in range(len(allparams())):
@@ -601,7 +602,7 @@ def replaylsf(n:int):
     dumps = sorted(Path(par.savedir).glob("bad_batch_*.pt"))
     assert dumps, f"no bad_batch_*.pt in {par.savedir}"
     assert_committed()
-    bsub(par, "replay", 30, 1, f"env CUDA_LAUNCH_BLOCKING=1 python {{code}}/e00_basic.py replay_bad_batch {dumps[0]}")
+    bsub(par, "replay", 30, 1, f"env CUDA_LAUNCH_BLOCKING=1 python {{code}}/experiment.py replay_bad_batch {dumps[0]}")
 
 def runmany():
     for i in range(len(allparams())):
