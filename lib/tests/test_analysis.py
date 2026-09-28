@@ -22,6 +22,29 @@ def test_load_table_uses_saved_params(tmp_path, monkeypatch):
     assert "n_layers" not in res  # only what runs saved; no current Params defaults (analysis doesn't import lib/)
 
 
+def test_bench_reports_crashes_with_short_config(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    shown = []
+    monkeypatch.setattr(analysis, "show", lambda fig, name: shown.append(name))
+    ok, crashed, legacy = (tmp_path / f"outdir/e00/b/d{i}" for i in range(3))
+    base = {"queue": "gpu_b300", "width": 512, "compile": True, "cudagraphs": True, "eager_patch_embed": True, "n_gpus": 1}
+    for d, bs in [(ok, 84), (crashed, 64)]:
+        d.mkdir(parents=True)
+        (d / "runs.json").write_text(json.dumps({"fn": "run", "params": {**base, "batch_size": bs, "savedir": str(d)}}) + "\n")
+    legacy.mkdir(parents=True)  # crashed before runs.json had params
+    (ok / "metrics.json").write_text("".join(json.dumps({"idx_step": s, "loss": l}) + "\n" for s, l in [(0, 2.0), (10, 1.5)]))
+    (ok / "performance.json").write_text(json.dumps({"tbl": "throughput", "tokens_per_second": 2e6, "world_size": 2, "mfu": 0.2}) + "\n")
+    (ok / "job_run_1.log").write_text("...\nSuccessfully completed.\n")
+    for d in [crashed, legacy]:
+        (d / "job_run_2.log").write_text("CUDA error: an illegal memory access was encountered\nExited with exit code 1.\n")
+    res = analysis.bench("e00/b")
+    assert list(res.columns) == ["run", "config", "status", "finite", "loss0", "loss_end", "ktok/s/gpu", "mfu %", "mem GB"]
+    assert list(res.config) == ["B300 w512 b84 cudagraphs+eager-pe", "B300 w512 b64 cudagraphs+eager-pe", "? (no saved params)"]
+    assert list(res.status) == ["ok", "exit 1: illegal memory access", "exit 1: illegal memory access"]
+    assert res["ktok/s/gpu"][0] == 1000 and res.finite[0] and res.loss_end[0] == 1.75
+    assert (tmp_path / "results/e00/b/bench.csv").is_file() and shown == ["e00/b/bench_loss", "e00/b/bench_speed"]
+
+
 def test_show_writes_results(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     fig = px.line(x=[0, 1], y=[1, 0])

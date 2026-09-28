@@ -152,5 +152,6 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
     replay = experiment.replay_bad_batch(str(tmp_path / "bad_batch_0000003.pt"))
     runs = [json.loads(l) for l in (tmp_path / "runs.json").read_text().splitlines()]
     assert [r["fn"] for r in runs] == ["run", "replay_bad_batch"] and runs[0]["commit_id"] == "test-commit"
+    assert runs[0]["params"]["savedir"] == params.savedir  # every run dir describes itself, even if it crashes
     assert replay["eager"][0] == pytest.approx(losses[3], rel=1e-5)
     assert replay["as trained"][0] == pytest.approx(losses[3], rel=1e-5)  # compile=False: both paths are eager

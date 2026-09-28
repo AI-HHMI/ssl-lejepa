@@ -2,7 +2,9 @@
 mirror of the cluster's append-only run dirs. Imports no experiment code (experiment, lib/ models: nothing that
 builds a Lejepa), only lib.util's entrypoint CLI: artifacts describe themselves (saved params), so every function
 works on any past sweep at HEAD.
-Figures also go to results/ (local, not committed). Run: uv run python analysis.py <function> [args].
+Figures and tables also go to results/ (local, not committed).
+Each experiment has one entrypoint, named after its sweep (e00/b300-compile -> e00_b300_compile), that makes all of
+its figures and tables: uv run python analysis.py e00_b300_compile. Cross-experiment pages: perf_journey.
 """
 
 import json
@@ -40,6 +42,29 @@ def profile_device_ms(path: str | Path) -> tuple[float, dict[str, float]]:
         if t:
             rows[f[0]] = rows.get(f[0], 0.0) + float(t[1]) * scale[t[2]] / n
     return float(total[1]) * scale[total[2]] / n, rows
+
+def run_dirs(sweep: str) -> list[Path]:
+    """outdir/<sweep>/dN/ run dirs in numeric order."""
+    dirs = [d for d in Path("outdir", sweep).glob("d*/") if re.fullmatch(r"d\d+", d.name)]
+    assert dirs, f"no run dirs in outdir/{sweep}/; run ./pull.sh?"
+    return sorted(dirs, key=lambda d: int(d.name[1:]))
+
+def saved_params(d: Path) -> dict:
+    """A run's own params: runs.json (written first thing, so crashed runs have it too), else performance.json
+    (runs from before runs.json had params), else {}."""
+    for name in ["runs.json", "performance.json"]:
+        f = d / name
+        found = next((r["params"] for r in read_jsonl(f) if "params" in r), None) if f.is_file() else None
+        if found:
+            return found
+    return {}
+
+def save_table(df: pandas.DataFrame, name: str):
+    """Print a table and keep a copy at results/<name>.csv."""
+    path = Path("results") / f"{name}.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False)
+    print(f"{name}:\n{df.to_string(index=False)}\n")
 
 def show(fig, name: str):
     """Display a plotly figure and keep a copy at results/<name>.html, e.g. name = e00/nanhunt_plot."""
@@ -96,16 +121,11 @@ def check_runs(root: str = "outdir/e00"):
 
 def load_table(sweep: str, filename: str) -> pandas.DataFrame:
     """JSON-lines rows of `filename` from every run dir outdir/<sweep>/dN/, each joined with that run's own saved
-    params (the first performance.json row with params), savedir and run name. Params a run predates are
-    missing (NaN in the table)."""
+    params (saved_params), savedir and run name. Params a run predates are missing (NaN in the table)."""
     rows = []
-    run_dirs = [d for d in Path("outdir", sweep).glob("d*/") if re.fullmatch(r"d\d+", d.name)]
-    for d in sorted(run_dirs, key=lambda d: int(d.name[1:])):
-        if not (d / filename).is_file():
-            continue
-        perf = d / "performance.json"
-        saved = next((r["params"] for r in read_jsonl(perf) if "params" in r), {}) if perf.is_file() else {}
-        rows += [{**saved, **r, "savedir": str(d), "run": d.name} for r in read_jsonl(d / filename)]
+    for d in run_dirs(sweep):
+        if (d / filename).is_file():
+            rows += [{**saved_params(d), **r, "savedir": str(d), "run": d.name} for r in read_jsonl(d / filename)]
     assert rows, f"no {filename} in outdir/{sweep}/d*/; run ./pull.sh?"
     return pandas.DataFrame(rows)
 
@@ -124,6 +144,67 @@ def loss_curves(sweep: str):
     show(px.line(res, x="idx_step", y="loss", color="width", line_dash="batch_size",
                  hover_data=["width", "batch_size", "queue"], markers=True, log_y=True,
                  category_orders={"batch_size": sorted(res.batch_size.unique())}), f"{sweep}/loss_curves")
+
+def config_label(p: dict, varying: set) -> str:
+    """Short run label from saved params, e.g. 'B300 w512 b64 cudagraphs+eager-pe'; view sizes and GPU count only
+    if they vary. '?' for runs that crashed before params were saved (runs.json had none until 2026-09-28)."""
+    if not p:
+        return "? (no saved params)"
+    mode = "eager" if not p.get("compile", True) else "cudagraphs" if p.get("cudagraphs") else "dynamic"
+    parts = [p["queue"].removeprefix("gpu_").upper(), f'w{p["width"]}', f'b{p["batch_size"]}',
+             mode + ("+eager-pe" if p.get("eager_patch_embed") else "")]
+    if varying & {"patch_size", "global_size", "local_size"}:
+        parts.append(f'{p["patch_size"][0]}/{p["global_size"][0]}/{p["local_size"][0]}')
+    if "n_gpus" in varying or p.get("n_gpus", 1) > 1:
+        parts.append(f'x{p.get("n_gpus", 1)}')
+    return " ".join(parts)
+
+def bench(sweep: str, *compare: str):
+    """A benchmark sweep, next to any reference sweeps it's compared with: a table (config, LSF outcome, loss sanity,
+    speed), loss vs step, and speed per config. A fast run with a NaN loss is broken, not fast (patchembed-linear/d1):
+    read status and loss first. Outputs: results/<sweep>/bench.csv, bench_loss.html, bench_speed.html."""
+    sweeps = (sweep, *compare)
+    runs = [(sweep, d) for sweep in sweeps for d in run_dirs(sweep)]
+    params = {d: saved_params(d) for _, d in runs}
+    known = [p for p in params.values() if p]
+    varying = {k for k in dict.fromkeys(k for p in known for k in p) if len({json.dumps(p.get(k)) for p in known}) > 1}
+    rows, curves = [], []
+    for s, d in runs:
+        name = f"{s.split('/')[-1]}/{d.name}" if compare else d.name
+        m = read_jsonl(d / "metrics.json") if (d / "metrics.json").is_file() else []
+        tp = [r for r in read_jsonl(d / "performance.json") if r.get("tbl") == "throughput"] if (d / "performance.json").is_file() else []
+        logs = sorted(d.glob("job_run_*.log")) or sorted(d.glob("job_[0-9]*.log"))  # training job logs (older name)
+        text = logs[-1].read_text(errors="ignore") if logs else ""
+        exit_code = re.search(r"Exited with exit code (\d+)", text)
+        b1 = "illegal memory access" in text
+        b2 = "OutOfMemoryError" in text
+        status = ("ok" if "Successfully completed" in text else f"exit {exit_code[1]}" if exit_code else "running?") + \
+                 (": illegal memory access" if b1 else ": OOM" if b2 else "")
+        losses = [r["loss"] for r in m]
+        t = tp[-1] if tp else {}
+        n_gpus = t.get("world_size") or params[d].get("n_gpus", 1)
+        config = config_label(params[d], varying)
+        rows.append({"run": name, "config": config, "status": status,
+                     "finite": all(l == l for l in losses) if losses else None,
+                     "loss0": losses[0] if losses else None, "loss_end": sum(losses[-3:]) / len(losses[-3:]) if losses else None,
+                     "ktok/s/gpu": t["tokens_per_second"] / n_gpus / 1e3 if t else None,
+                     "mfu %": 100 * t["mfu"] if t.get("mfu") else None, "mem GB": t.get("max_mem_gb")})
+        curves += [{"run": f"{name} {config}", "step": r["idx_step"], "loss": r["loss"]} for r in m]
+    res = pandas.DataFrame(rows).round(3)
+    out = f"{sweep}/bench"
+    save_table(res, out)
+    if curves:
+        show(px.line(pandas.DataFrame(curves), x="step", y="loss", color="run", log_y=True,
+                     title=f"Loss per run: {', '.join(sweeps)} (a broken run is missing or diverges from its reference)"), f"{out}_loss")
+    # Crashed runs as zero-length bars, so their status still shows (text outside the bar end).
+    speed = res.assign(label=res["run"] + " " + res["config"], x=res["ktok/s/gpu"].fillna(0),
+                       text=res["mfu %"].map(lambda v: f"{v:.0f}% MFU" if v == v else "").where(res.status.str.startswith("ok"), res.status))
+    fig = px.bar(speed, x="x", y="label", orientation="h", text="text", color="status",
+                 title=f"Benchmark throughput per GPU: {', '.join(sweeps)}")
+    fig.update_traces(textposition="outside", cliponaxis=False).update_yaxes(title="", autorange="reversed")
+    fig.update_xaxes(title="ktok/s per GPU", range=[0, 1.15 * max(speed.x.max(), 1)])  # room for the labels
+    show(fig, f"{out}_speed")
+    return res
 
 # def plot2(sweep: str):
 #     """ktok/s per GPU: one bar per result row, bars grouped by n_gpus with gaps between groups, colored by width + defer_image_ops."""
@@ -359,6 +440,27 @@ def perf_journey():
             f"const scaling = {rows(nodes)};\n")
     path.write_text(html[:html.index(BEGIN)] + data + html[html.index(END):])
     print(f"Wrote {len(steps)} bars and {len(nodes)} node results to {path}")
+
+# One entrypoint per experiment (sweep e00/<name> -> e00_<name>, - -> _): all of its figures and tables.
+
+def e00_nanhunt_flash():
+    """cuDNN attention's NaN gradients vs flash (nanhunt, nanhunt_beta95, nanhunt_flash), and flash's throughput cost."""
+    nanhunt_plot()
+    flash_perf()
+    loss_curves("e00/nanhunt_flash")
+
+def e00_b300_compile():
+    """Is torch.compile broken on B300 for the Linear patch embed at batch 64? (cudagraphs crash or miscompile)"""
+    bench("e00/b300-compile")
+
+def e00_cudagraph_fix():
+    """Do cudagraphs work with PatchEmbed3d out of the compiled graph (eager_patch_embed)? Compare with b300-compile."""
+    bench("e00/cudagraph-fix", "e00/b300-compile")
+
+def e00_b300_train8h_dynamic():
+    """First long 8xB300 runs, width 512 vs 1024, dynamic compile."""
+    bench("e00/b300-train8h-dynamic")
+    loss_curves("e00/b300-train8h-dynamic")
 
 if __name__ == "__main__":
     if len(sys.argv) == 1:
