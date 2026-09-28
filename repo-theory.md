@@ -49,3 +49,16 @@ Goals:
 3. reproducibility -- the artifacts can be reproduced easily. i know the code that built each artifact and can find it quickly and read it and understand it. Most artifacts should have a very concise repro.
     The commands we actually execute on the command line are a notorious place for critical repro data to get lost.
 4. (maybe?) The repros are stored in the REPO. not outside it. Rebuilding the full artifact set can be done by *replaying the repo*.
+
+---
+
+Local runs don't need the concurrency safeguards. for every piece of code we should decide if it's
+running locally or remotely. don't add the concurrency guards to locally running code. But the pca
+should run remotely. Also, because it depends on Lejepa() it is tied to a specific experiment and repo
+state. We should separate code by remote vs local and also by "only depends on outdir/ data" and
+"depends on mutable lib/" code. While it looks like @lib/util.py is append only it is not safe to
+assume so. Classify everything in lib/ as mutable and so anything that runs and depends directly on
+lib/ must be run from a specific experiment commit. Analysis depends on lib/ only transitively via
+savedir/ (outdir/) which we have declared to be an append-only log, thus our analysis code can
+reference old experiments created in prior commits. This helps us understand inference! It depends on
+lib/ and so can't be run retroactively without time travel.
