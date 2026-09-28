@@ -1,5 +1,7 @@
 """Unit tests for lib package modules."""
 
+import json
+
 import pytest
 import torch
 
@@ -136,8 +138,10 @@ def test_config_round_trip():
 
 
 def test_snapshot_copies_once(tmp_path, monkeypatch):
+    import lib.util
     from lib.util import snapshot
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(lib.util, "git_provenance", lambda: {"commit_id": "c0"})  # tmp_path isn't a repo
     (tmp_path / "pkg" / "sub").mkdir(parents=True)
     (tmp_path / "main.py").write_text("x = 1\n")
     (tmp_path / "pkg" / "sub" / "m.py").write_text("y = 2\n")
@@ -149,6 +153,17 @@ def test_snapshot_copies_once(tmp_path, monkeypatch):
     (tmp_path / "main.py").write_text("x = 3\n")
     snapshot(["main.py", "pkg"], tmp_path / "snap")  # changed content: refreshed
     assert (dest / "main.py").read_text() == "x = 3\n"
+    assert json.loads((dest / "provenance.json").read_text()) == {"commit_id": "c0"}
+
+
+def test_trash_keeps_old_results(tmp_path, monkeypatch):
+    from lib.util import trash
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "outdir/e00/x/d0").mkdir(parents=True)
+    (tmp_path / "outdir/e00/x/d0/metrics.json").write_text("{}")
+    assert not any(trash("outdir/e00/x/d0").iterdir())  # emptied for the new run
+    kept = list((tmp_path / "outdir/.trash/e00/x/d0").glob("*/metrics.json"))
+    assert len(kept) == 1 and kept[0].read_text() == "{}"
 
 
 def test_patch_embed_matches_conv3d():

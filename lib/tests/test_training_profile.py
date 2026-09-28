@@ -52,11 +52,9 @@ def patch_experiment(monkeypatch, tmp_path, params):
     monkeypatch.setattr(experiment, "MiaoConfig", SimpleNamespace)
     monkeypatch.setattr(experiment, "VolumeDataset", SyntheticDataset)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    # Keep provenance writes in the test directory and independent of git state.
-    (tmp_path / "_diffs").mkdir()
-    monkeypatch.setattr(experiment, "repo_root", lambda: tmp_path)
-    monkeypatch.setattr(experiment, "git_provenance", lambda: {
-        "commit_id": "test-commit", "diff_hash": "test-diff", "diff": "",
+    # Provenance independent of git state.
+    monkeypatch.setattr(experiment, "code_provenance", lambda: {
+        "commit_id": "test-commit", "subject": "test", "dirty": False, "diff_hash": "test-diff",
     })
 
     def small_model_config(**kwargs):

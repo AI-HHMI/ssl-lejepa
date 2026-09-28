@@ -2,18 +2,27 @@
 
 import inspect
 import json
+import os
 import re
 from hashlib import sha256
 from pathlib import Path
+import socket
 import subprocess
 import sys
+import time
 import numpy as np
 import shutil
 
-def wipedir(path):
-  path = Path(path)
-  if path.exists(): shutil.rmtree(path)
-  path.mkdir(parents=True, exist_ok=True)
+def trash(path) -> Path:
+    """Empty dir `path` (under outdir/) for a fresh run: its old contents move to outdir/.trash/<path>/<time>/,
+    so a resubmission never destroys results. Empty .trash by hand; pull.sh doesn't copy it."""
+    path = Path(path)
+    if path.is_dir() and any(path.iterdir()):
+        dest = Path("outdir/.trash") / path.relative_to("outdir") / time.strftime("%Y%m%d-%H%M%S")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(path, dest)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def snapshot(paths, dest) -> Path:
@@ -21,20 +30,23 @@ def snapshot(paths, dest) -> Path:
 
     Skipped if dest already holds identical content, so repeated calls (one per job in a sweep) don't rewrite
     files a started job may be importing. Each file is written to a temp name and os.replace()d into place.
+    Always (re)writes dest/provenance.json with the commit being copied: see code_provenance().
     """
     dest = Path(dest)
     files = sorted(f for p in map(Path, paths) for f in ([p] if p.is_file() else p.rglob("*.py")) if "__pycache__" not in f.parts)
     assert files, f"nothing to snapshot in {paths}"
     digest = sha256(b"".join(str(f).encode() + b"\0" + f.read_bytes() for f in files)).hexdigest()
     stamp = dest / ".sha256"
-    if stamp.is_file() and stamp.read_text() == digest:
-        return dest
-    for f in files:
-        (dest / f).parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest / f"{f}.tmp"
-        shutil.copy2(f, tmp)
-        tmp.replace(dest / f)
-    stamp.write_text(digest)
+    if not (stamp.is_file() and stamp.read_text() == digest):
+        for f in files:
+            (dest / f).parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest / f"{f}.tmp"
+            shutil.copy2(f, tmp)
+            tmp.replace(dest / f)
+        stamp.write_text(digest)
+    tmp = dest / "provenance.json.tmp"
+    tmp.write_text(json.dumps(git_provenance()))
+    tmp.replace(dest / "provenance.json")
     return dest
 
 
@@ -45,17 +57,40 @@ def repo_root(path=".") -> Path:
     ).strip())
 
 
-def git_provenance(repo="."):
-    """Return HEAD, tracked working-copy diff, and its SHA-256 (Spearmint format).
+def git_provenance(repo=".") -> dict:
+    """HEAD commit, its subject line, and whether tracked files differ from it (dirty) plus that diff's SHA-256.
 
-    Includes staged and unstaged changes; excludes untracked files. Does not log.
+    With jj (colocated), HEAD is the working-copy commit's parent, so dirty means @ has changes; files jj tracks
+    in @ that git doesn't yet know about (new files) don't count. Does not log.
     """
     def git(*args):
         return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
 
-    commit_id = git("rev-parse", "HEAD")
     diff = git("diff", "HEAD")
-    return {"commit_id": commit_id, "diff_hash": sha256(diff.encode()).hexdigest(), "diff": diff}
+    return {"commit_id": git("rev-parse", "HEAD"), "subject": git("log", "-1", "--format=%s"),
+            "dirty": bool(diff), "diff_hash": sha256(diff.encode()).hexdigest()}
+
+
+def code_provenance() -> dict:
+    """git_provenance() of the code actually running: a .tmpcode snapshot's recorded commit (snapshot()) when
+    the script runs from one, since the shared checkout's HEAD may have moved on since submission."""
+    recorded = Path(sys.argv[0]).resolve().parent / "provenance.json"
+    return json.loads(recorded.read_text()) if recorded.is_file() else git_provenance()
+
+
+def log_command(argv: list[str]):
+    """Append one JSON line per entrypoint call to outdir/_log/commands-<host>.jsonl: time, host, argv, LSF
+    job and code_provenance(). One file per host, since appends from several hosts to one NFS file can
+    interleave. Rank 0 only under torchrun. pull.sh copies the cluster's and protects the local one."""
+    if os.environ.get("RANK", "0") != "0":
+        return
+    host = socket.gethostname().split(".")[0]
+    row = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "host": host, "argv": argv,
+           "lsf_job": os.environ.get("LSB_JOBID"), **code_provenance()}
+    path = Path("outdir/_log") / f"commands-{host}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(row) + "\n")
 
 
 def logish_samples(base, factors, final, N):
@@ -174,6 +209,7 @@ def call_entrypoint(name, *args, namespace=None):
             bound.arguments[key] = tuple(convert(v, parameter.annotation) for v in value)
         else:
             bound.arguments[key] = convert(value, parameter.annotation)
+    log_command([sys.argv[0], name, *map(str, args)])
     return fn(*bound.args, **bound.kwargs)
 
 

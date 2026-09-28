@@ -12,5 +12,4 @@ ssh -o ConnectTimeout=15 login1.int.janelia.org \
 [ $# -eq 0 ] && exit 0
 
 CMD=$(printf '%q ' "$@")
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$BRANCH] $CMD" >> experiment.log
 ssh -o ConnectTimeout=15 login1.int.janelia.org "cd ~/proj/ssl-lejepa/ && uv run python $CMD"

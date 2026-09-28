@@ -274,7 +274,7 @@ def run(n:int):
 def runlsf(n:int):
     import subprocess
     par:Params = allparams()[n]
-    wipedir(par.savedir)
+    trash(par.savedir)  # old results -> outdir/.trash/ (was wipedir)
     RUN_NAME = "e00_basic"
     cmd = f""" bsub -J {RUN_NAME} \
         -W 0:15 \
