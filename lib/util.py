@@ -115,6 +115,27 @@ def trace_summary(trace_path: str | Path) -> dict[str, float]:
     }
 
 
+def profile_device_ms(path: str | Path) -> tuple[float, dict[str, float]]:
+    """GPU ms per profiled step from a Benchmark profile.out: the total, and each row of its self-device-time table.
+
+    Rows overlap (a CompiledFxGraph call's time includes its kernels'), so only sum disjoint rows, e.g. kernels
+    picked by name. Row names are truncated by the table.
+    """
+    text = Path(path).read_text()
+    steps = re.search(r"recorded steps \(zero-based\): (\d+)\.\.(\d+)", text)
+    total = re.search(r"Self CUDA time total: ([\d.]+)(us|ms|s)", text)
+    assert steps and total and "SORTED BY SELF DEVICE TIME" in text, f"{path} is not a CUDA Benchmark profile.out"
+    n = int(steps[2]) - int(steps[1]) + 1
+    scale = {"us": 1e-3, "ms": 1.0, "s": 1e3}
+    rows: dict[str, float] = {}
+    for line in text.split("SORTED BY SELF DEVICE TIME")[1].split("Self CPU time total")[0].splitlines():
+        f = re.split(r"\s{2,}", line.strip())  # Name, Self CPU %, Self CPU, ..., Self CUDA (7th), ..., # of Calls
+        t = re.fullmatch(r"([\d.]+)(us|ms|s)", f[6]) if len(f) == 11 else None
+        if t:
+            rows[f[0]] = rows.get(f[0], 0.0) + float(t[1]) * scale[t[2]] / n
+    return float(total[1]) * scale[total[2]] / n, rows
+
+
 def _entrypoints(namespace):
     return {
         name: fn for name, fn in namespace.items()

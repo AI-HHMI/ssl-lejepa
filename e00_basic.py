@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict, fields
 import os, sys
 import json
+import re
 import time
 from pathlib import Path
 
@@ -82,9 +83,10 @@ class Params:
 
 def allparams():
     params = []
-    # NaN hunt with Adam beta2 = 0.95 (mia-muvit's value; everything so far used torch's 0.999). Same 4 configs
-    # and settings as e00/nanhunt, where d2, d9 and d15 hit non-finite gradients at 5.7-7.2k steps and d10 didn't.
-    # Still skips and dumps non-finite steps (bad_batch_*.pt), so a divergence stays diagnosable.
+    # NaN hunt fix check: e00/nanhunt_beta95 rerun with cuDNN attention disabled in run() (flash instead), after
+    # replay_bad_batch showed only cuDNN's attention backward gives NaN grads on d9's failed step. There all 4
+    # configs failed at 2.4-9.4k steps; here they should train for the full 2 h with 0 skipped steps.
+    # Per-config tok/s vs nanhunt_beta95 gives the cost of flash vs cuDNN attention.
     # Run dirs keep their viewsizes index (d2, d9, ...).
     base = (128, 96, 64)
     configs = [base]  # the same 17 (input, global, local) configs, in the same order, as e00/viewsizes
@@ -97,7 +99,7 @@ def allparams():
     for i in [2, 9, 10, 15]:
         inp, g, l = configs[i]
         p = Params()
-        p.savedir = f"outdir/e00/nanhunt_beta95/d{i}/"
+        p.savedir = f"outdir/e00/nanhunt_flash/d{i}/"
         p.data = "hemibrain_wide"
         p.views = "displace"
         p.patch_size = (inp, inp, inp)
@@ -220,6 +222,10 @@ def run(n:int):
     import torch
     import torch.distributed as dist
     torch.set_float32_matmul_precision(par.f32mode)
+    # cuDNN's fused attention backward returns NaN grads on some trained weights where flash and mem-efficient
+    # don't (replay_bad_batch on e00/nanhunt_beta95/d9): the "divergences" of e00/viewsizes* and nanhunt*.
+    # Runs before 2026-09-28 used it (torch's default pick on H200/B300).
+    torch.backends.cuda.enable_cudnn_sdp(False)
 
     # Set by torchrun. Unset (plain `python`, tests) means a single process.
     # Don't seed torch identically across ranks: DataLoader workers derive miao's numpy seed from it.
@@ -396,7 +402,8 @@ def replay_bad_batch(path: str):
        ignored sdpa_kernel (identical losses for every backend). The math backend is left out: it materializes
        Batch Head N N attention and doesn't fit at training batch sizes. CUDA only (fused kernels).
     3. As trained (compiled per the run's Params): does the gradient come out non-finite again? Runs last:
-       its CUDA graph pools stay allocated.
+       its CUDA graph pools stay allocated. Uses torch's default SDPA pick (cuDNN), as runs before run()
+       disabled cuDNN attention did; 1 does too.
     Returns loss and non-finite param count per replay; also prints which params kept finite grads.
     """
     import torch
@@ -753,31 +760,89 @@ def plot1():
 #     return res
 
 def plot3():
-    """NaN hunt: residual norm, grad norm and loss vs step for Adam beta2 0.999 (e00/nanhunt) vs 0.95 (e00/nanhunt_beta95).
+    """NaN hunt: residual norm, grad norm and loss vs step for Adam beta2 0.999 (e00/nanhunt), 0.95
+    (e00/nanhunt_beta95), and 0.95 with cuDNN attention off (e00/nanhunt_flash).
 
     Faster residual growth under 0.95 means earlier failure, but failures hit at no fixed norm, and nothing in the
     curves warns: an x marks each run's first non-finite step, after which grad norm is NaN (the line ends).
+    The cause was cuDNN's attention backward (replay_bad_batch); nanhunt_flash should have no x.
+    Color = sweep; columns = run (view-size config), rows = metric. Loss and grad norm are smoothed.
     """
     rows = []
-    for beta2, sweep in [(0.999, "nanhunt"), (0.95, "nanhunt_beta95")]:
+    for sweep in ["nanhunt", "nanhunt_beta95", "nanhunt_flash"]:
         for f in sorted(Path(f"outdir/e00/{sweep}").glob("d*/metrics.json")):
-            rows += [{**json.loads(l), "run": f.parent.name, "beta2": beta2} for l in f.read_text().splitlines() if l.strip()]
+            rows += [{**json.loads(l), "run": f.parent.name, "sweep": sweep} for l in f.read_text().splitlines() if l.strip()]
     assert rows, "no e00/nanhunt* metrics.json; run ./pull.sh?"
     res = pandas.DataFrame(rows).query("tbl == 'metrics'")
     metrics = ["resid_norm", "grad_norm", "loss"]
-    long = res.melt(id_vars=["idx_step", "run", "beta2"], value_vars=metrics, var_name="metric")
-    fig = px.line(long, x="idx_step", y="value", color="run", line_dash="beta2", facet_row="metric", log_y=True, height=900)
-    fig.update_yaxes(matches=None, title="")
+    # Rolling mean over 20 logged points (200 steps) per run; kept NaN where the raw value is, so lines still end
+    # at the first non-finite step.
+    for m in ["grad_norm", "loss"]:
+        smooth = res.groupby(["sweep", "run"])[m].transform(lambda v: v.rolling(20, min_periods=1).mean())
+        res[m] = smooth.where(res[m].notna())
+    long = res.melt(id_vars=["idx_step", "run", "sweep"], value_vars=metrics, var_name="metric")
+    # print(res)
+    # return
+    # x=idx_step, y="value", color="sweep", yfacet="run"
+    # fig = px.line(long, x="idx_step", y="value", color="run", line_dash="sweep", facet_row="metric", log_y=True, height=900)
+    runs = sorted(res.run.unique(), key=lambda r: int(r[1:]))  # d2 d9 d10 d15
+    fig = px.line(long, x="idx_step", y="value", color="sweep", facet_col="run", facet_row="metric", log_y=True, height=900,
+                  category_orders={"run": runs, "metric": metrics})
+    # One y range per metric row, shared across the run columns. px numbers facet rows from the bottom.
+    fig.update_yaxes(title="")
+    fig.update_xaxes(title="step", row=1)
+    for row in range(1, len(metrics) + 1):
+        first = []  # this row's col-1 y axis, e.g. layout name "yaxis3" -> trace ref "y3"
+        fig.for_each_yaxis(lambda a: first.append(a.plotly_name.replace("axis", "")), row=row, col=1)
+        fig.update_yaxes(matches=first[0], row=row)
     fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
-    fails = res.query("skipped > 0").groupby(["run", "beta2"]).first().reset_index()
+    fails = res.query("skipped > 0").groupby(["run", "sweep"]).first().reset_index()
     for i, metric in enumerate(metrics):
         if metric == "grad_norm":
             continue  # NaN at the first non-finite step
-        # px numbers facet rows from the bottom
-        fig.add_scatter(x=fails.idx_step, y=fails[metric], mode="markers", row=len(metrics) - i, col=1,
-                        marker=dict(symbol="x", size=11, color="black"), name="first non-finite step",
-                        text=fails.run + " beta2=" + fails.beta2.astype(str), showlegend=i == 0)
-    fig.update_layout(title="NaN hunt: Adam beta2 0.999 vs 0.95", xaxis_title="step")
+        for col, run in enumerate(runs, start=1):
+            f = fails[fails.run == run]
+            # Scattergl like px's (WebGL) lines: WebGL draws above all SVG traces, so an SVG marker would hide.
+            fig.add_trace(go.Scattergl(x=f.idx_step, y=f[metric], mode="markers", name="first non-finite step",
+                                       marker=dict(symbol="x", size=11, color="black"), text=f.sweep,
+                                       showlegend=i == 0 and col == 1), row=len(metrics) - i, col=col)
+    fig.update_layout(title="NaN hunt: Adam beta2 0.999 (nanhunt) vs 0.95 (nanhunt_beta95) vs 0.95 + flash attention (nanhunt_flash)")
+    fig.show()
+
+def plot4():
+    """Flash vs cuDNN attention on one H200: e00/nanhunt_flash vs nanhunt and nanhunt_beta95 (cuDNN), same 4 configs.
+
+    Fig 1: ktok/s per GPU, labelled with the change vs nanhunt_beta95 (identical but for the kernel).
+    Fig 2: GPU ms per profiled step, split into attention forward, attention backward and everything else,
+    from each run's profile.out.
+    """
+    ATTN, BWD = r"sdpa|flash|fmha|dot_do_o|convert_dq", r"bprop|bwd|dot_do_o|convert_dq"  # kernel names
+    rows = []
+    for sweep, attention in [("nanhunt", "cuDNN β2=.999"), ("nanhunt_beta95", "cuDNN"), ("nanhunt_flash", "flash")]:
+        for d in sorted(Path(f"outdir/e00/{sweep}").glob("d*/")):
+            perf = [json.loads(l) for l in (d / "performance.json").read_text().splitlines() if l.strip()]
+            r = [x for x in perf if x["tbl"] == "throughput"][-1]
+            total, kernels = profile_device_ms(d / "profile.out")
+            fwd = sum(v for k, v in kernels.items() if re.search(ATTN, k) and not re.search(BWD, k))
+            bwd = sum(v for k, v in kernels.items() if re.search(ATTN, k) and re.search(BWD, k))
+            p = r["params"]
+            rows.append({"attention": attention, "sweep": sweep, "mfu %": 100 * r["mfu"],
+                         "config": f'{d.name} {p["patch_size"][0]}/{p["global_size"][0]}/{p["local_size"][0]} b{p["batch_size"]}',
+                         "ktok/s per GPU": r["tokens_per_second"] / 1e3 / r["world_size"],
+                         "attention fwd": fwd, "attention bwd": bwd, "other": total - fwd - bwd})
+    assert rows, "no e00/nanhunt* results; run ./pull.sh?"
+    res = pandas.DataFrame(rows)
+    res = res.iloc[res.config.map(lambda c: int(c.split()[0][1:])).argsort(kind="stable")]  # d2 d9 d10 d15
+    base = res[res.sweep == "nanhunt_beta95"].set_index("config")["ktok/s per GPU"]
+    res["vs cuDNN"] = (res["ktok/s per GPU"] / res.config.map(base) - 1).map(lambda x: f"{x:+.0%}")
+    px.bar(res, x="config", y="ktok/s per GPU", color="attention", barmode="group", text="vs cuDNN", hover_data=["mfu %"],
+           title="Throughput: flash vs cuDNN attention, one H200 (config = input/global/local, batch)").show()
+    long = res.melt(id_vars=["config", "attention"], value_vars=["attention fwd", "attention bwd", "other"],
+                    var_name="kernels", value_name="GPU ms per step")
+    fig = px.bar(long, x="attention", y="GPU ms per step", color="kernels", facet_col="config",
+                 title="GPU time per step by kernel group (profile.out)")
+    fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+    fig.update_xaxes(title="")
     fig.show()
 
 def test():

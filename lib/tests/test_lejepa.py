@@ -149,3 +149,16 @@ def test_snapshot_copies_once(tmp_path, monkeypatch):
     (tmp_path / "main.py").write_text("x = 3\n")
     snapshot(["main.py", "pkg"], tmp_path / "snap")  # changed content: refreshed
     assert (dest / "main.py").read_text() == "x = 3\n"
+
+
+def test_profile_device_ms(tmp_path):
+    from lib.util import profile_device_ms
+    sep = "  ".join(["-" * 20] * 11)
+    row = lambda name, cuda: "  ".join([name, "0.00%", "0.000us", "0.00%", "0.000us", "0.000us", cuda, "1.00%", cuda, "1.000us", "10"])
+    table = lambda *rows: "\n".join([sep, "Name  Self CPU %  x", sep, *rows, sep, "Self CPU time total: 1.000s", "Self CUDA time total: 2.000s"])
+    (tmp_path / "profile.out").write_text(
+        "Device: cuda:0; recorded steps (zero-based): 61..70\nOPERATORS SORTED BY SELF CPU TIME\n" + table(row("aten::mm", "5.000s"))
+        + "\n\nOPERATORS SORTED BY SELF DEVICE TIME\n" + table(row("flash_bwd", "1.500s"), row("gelu", "300.000ms"), row("flash_bwd", "20us")))
+    total, rows = profile_device_ms(tmp_path / "profile.out")
+    assert total == pytest.approx(200.0)  # 2 s over 10 steps
+    assert rows == pytest.approx({"flash_bwd": 150.002, "gelu": 30.0})  # device table only; truncated names merged
