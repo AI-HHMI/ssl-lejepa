@@ -735,6 +735,34 @@ def plot1():
 #     print(res.to_string(index=False))
 #     return res
 
+def plot3():
+    """NaN hunt: residual norm, grad norm and loss vs step for Adam beta2 0.999 (e00/nanhunt) vs 0.95 (e00/nanhunt_beta95).
+
+    Faster residual growth under 0.95 means earlier failure, but failures hit at no fixed norm, and nothing in the
+    curves warns: an x marks each run's first non-finite step, after which grad norm is NaN (the line ends).
+    """
+    rows = []
+    for beta2, sweep in [(0.999, "nanhunt"), (0.95, "nanhunt_beta95")]:
+        for f in sorted(Path(f"outdir/e00/{sweep}").glob("d*/metrics.json")):
+            rows += [{**json.loads(l), "run": f.parent.name, "beta2": beta2} for l in f.read_text().splitlines() if l.strip()]
+    assert rows, "no e00/nanhunt* metrics.json; run ./pull.sh?"
+    res = pandas.DataFrame(rows).query("tbl == 'metrics'")
+    metrics = ["resid_norm", "grad_norm", "loss"]
+    long = res.melt(id_vars=["idx_step", "run", "beta2"], value_vars=metrics, var_name="metric")
+    fig = px.line(long, x="idx_step", y="value", color="run", line_dash="beta2", facet_row="metric", log_y=True, height=900)
+    fig.update_yaxes(matches=None, title="")
+    fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+    fails = res.query("skipped > 0").groupby(["run", "beta2"]).first().reset_index()
+    for i, metric in enumerate(metrics):
+        if metric == "grad_norm":
+            continue  # NaN at the first non-finite step
+        # px numbers facet rows from the bottom
+        fig.add_scatter(x=fails.idx_step, y=fails[metric], mode="markers", row=len(metrics) - i, col=1,
+                        marker=dict(symbol="x", size=11, color="black"), name="first non-finite step",
+                        text=fails.run + " beta2=" + fails.beta2.astype(str), showlegend=i == 0)
+    fig.update_layout(title="NaN hunt: Adam beta2 0.999 vs 0.95", xaxis_title="step")
+    fig.show()
+
 def test():
     x = lmd.all()
     for xi in x:
