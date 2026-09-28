@@ -73,7 +73,7 @@
     <div class="card tile"><div class="num">5.0×</div><div class="lbl">single-GPU speedup on B300</div><div class="note">267 → 1,333 ktok/s</div></div>
     <div class="card tile"><div class="num">11.5M</div><div class="lbl">tokens/s on one 8×B300 node</div><div class="note">hemibrain 128³, displace views, before the Linear patch embed (8×H200: 7.8M)</div></div>
     <div class="card tile"><div class="num">94–96%</div><div class="lbl">8-GPU scaling efficiency</div><div class="note">H200 / B300; was 76–83% until we shipped uint8 instead of float32</div></div>
-    <div class="card tile"><div class="num">49%</div><div class="lbl">MFU on one B300 at width 1024</div><div class="note">Linear patch embed; width 512: 29% B300, 38% H200; A100 at width 768: 55%</div></div>
+    <div class="card tile"><div class="num">55%</div><div class="lbl">MFU on one A100 at width 768</div><div class="note">Linear patch embed, cuDNN attention; width 512: 29% B300, 38% H200</div></div>
   </div>
 
   <h2>Per-GPU throughput, one change at a time</h2>
@@ -134,7 +134,7 @@
         <div class="res">1 GPU: 1,501 ktok/s. 8 GPUs: <b>11.5M tok/s per node</b>, 1,437 per GPU, 96% scaling.</div></li>
       <li style="--c: var(--series-1)"><div class="h">Patch embedding as a Linear layer</div>
         A Conv3d with stride equal to its kernel is a matmul in disguise, but cuDNN ran it as slow implicit-GEMM kernels, worst on B300. We cut the volume into 8³ patches with a reshape and apply one <code>nn.Linear</code>. The math is the same, and old Conv3d checkpoints still load.
-        <div class="res">B300 width 512: 1,501 → 2,033 ktok/s (<b>1.35×</b>, 29% MFU). B300 width 1024: 632 → 1,010 (<b>1.60×</b>, <b>49% MFU</b>). H200 width 512: 1,036 → 1,156 (1.12×, 38%). A100 width 768: 242 → 262 (1.08×, 55%).</div></li>
+        <div class="res">B300 width 512: 1,501 → 2,033 ktok/s (<b>1.35×</b>, 29% MFU). H200 width 512: 1,036 → 1,156 (1.12×, 38%). A100 width 768: 242 → 262 (1.08×, 55%).</div></li>
     </ol>
   </div>
 
@@ -158,7 +158,8 @@
         <li><b>Check the hardware before comparing.</b> One queue change (B300 → H200) looked like a 30% regression in the view scheme.</li>
         <li><b>Host memory traffic grows with the GPU count.</b> Float32 samples cost nothing on one GPU and 15% of throughput on eight. Ship the smallest dtype the GPU can finish.</li>
         <li><b>Repeats agree to within ~1%</b> for the same config on the same GPU type. Earlier "±5–10%" came from comparing runs that differed in more than the knob under test.</li>
-        <li><b>Profile each new GPU; small layers can dominate.</b> The patch-embedding conv is a tiny share of the FLOPs but took ~15–17% of B300 time. Rewriting it as a Linear gave 1.08× on A100 and 1.60× on B300.</li>
+        <li><b>Profile each new GPU; small layers can dominate.</b> The patch-embedding conv is a tiny share of the FLOPs but took ~15–17% of B300 time. Rewriting it as a Linear gave 1.08× on A100 and 1.35× on B300.</li>
+        <li><b>Check the loss of every benchmark run, not just its speed.</b> A width-1024 B300 run looked like the best result yet (49% MFU), but its loss was NaN from step 0: a compiled kernel was broken, and it ran fast on garbage.</li>
         <li><b>Throughput changes can change training.</b> Rounding crop sizes, dropping padding, and per-rank SIGReg all change what the model learns.</li>
       </ul></div>
     </div>
@@ -166,10 +167,11 @@
 
   <h2>Where the time still goes, and what's next</h2>
   <div class="card">
-    <p>On one H200 we're GPU-bound: 99% busy at about 38% MFU with the Linear patch embed. Much of the remaining GPU time goes to layernorm, GELU, casts and other memory-bound kernels, which a width-512 model can't hide. Wider models hide it better: width 1024 on B300 reaches 49% MFU. At 8 GPUs, scaling is 94–96% now that samples cross the host as uint8. The first two 6-hour training runs (<code>outdir/e00/train6h/</code>) use 8×H200, width 512, EB-only vs. hemibrain crops 002 + 003 (2 Tvox, with EB's validation and test regions cut out). Per-queue default widths and batch sizes are in <code>QUEUE_ARCH</code> in <code>e00_basic.py</code>.</p>
+    <p>On one H200 we're GPU-bound: 99% busy at about 38% MFU with the Linear patch embed. Much of the remaining GPU time goes to layernorm, GELU, casts and other memory-bound kernels, which a width-512 model can't hide. Wider models hide it better: width 768 on A100 reaches 55% MFU. At 8 GPUs, scaling is 94–96% now that samples cross the host as uint8. The first two 6-hour training runs (<code>outdir/e00/train6h/</code>) use 8×H200, width 512, EB-only vs. hemibrain crops 002 + 003 (2 Tvox, with EB's validation and test regions cut out). Per-queue default widths and batch sizes are in <code>QUEUE_ARCH</code> in <code>e00_basic.py</code>.</p>
     <ul>
       <li><b>Measure 8×B300 with the Linear patch embed.</b> Extrapolating from 96% scaling gives ~15.6M tok/s at width 512. That hasn't been measured yet.</li>
-      <li><b>Wider models</b> for the next training run: higher MFU, and usually better SSL features. The first step is fixing the training divergence (non-finite gradients once the residual stream grows).</li>
+      <li><b>Get back the speed the fixes cost.</b> The training "divergence" was cuDNN attention's backward pass returning NaN (e00/nanhunt_flash). Flash attention avoids it but is 12–21% slower on H200 and ~30% on B300. CUDA graphs with the Linear patch embed crash or silently miscompile at some batch sizes (e00/b300-compile), so long runs used dynamic compile until e00/cudagraph-fix confirmed the workaround: running the patch embed outside the compiled graph fixes it at no cost (1,425 vs 1,414 ktok/s at batch 84, B300).</li>
+      <li><b>Wider models</b> for the next training run: higher MFU, and usually better SSL features. Width 1024 on B300 with flash attention: 619 ktok/s at 30.2% MFU (e00/cudagraph-fix/d1), 0.43× width 512's token rate.</li>
       <li><b>Look at the remaining non-matmul kernels</b> (layernorm, GELU, casts) for poorly fused ones.</li>
       <li><b>Before relying on multi-GPU results:</b> compute SIGReg statistics across all GPUs and use SyncBatchNorm in the projector. Both are still per GPU.</li>
       <li><b>Training recipe:</b> the runs use constant-lr Adam (1e-4) with no warmup, schedule or evaluation. That's fine for a sanity run, not for a final model.</li>
@@ -199,7 +201,7 @@ const steps = [
   {"k": "+ uint8", "g": 8, "v": 975, "hw": "H200", "run": "width-defer/d5", "d": "uint8 transfer at 8 GPUs. 7.80M tok/s total. 31.8% MFU.", "x": "94%"},
   {"k": "H200|setup", "g": 1, "v": 1501, "hw": "B300", "run": "b300-revisit/d0", "d": "Everything from the H200 phase, on one B300. Conv3d patch embed ~15–17% of GPU time. 21.5% MFU."},
   {"k": "DDP", "g": 8, "v": 1437, "hw": "B300", "run": "b300-revisit/d1", "d": "8×B300. 11.49M tok/s total. 20.6% MFU.", "x": "96%"},
-  {"k": "+ Linear|embed", "g": 1, "v": 2033, "hw": "B300", "run": "patchembed-linear/d0", "d": "Patch embedding as reshape + one Linear. Width 1024: see patchembed-linear/d1. 29.1% MFU.", "x": "+35%"},
+  {"k": "+ Linear|embed", "g": 1, "v": 2033, "hw": "B300", "run": "patchembed-linear/d0", "d": "Patch embedding as reshape + one Linear (cuDNN attention). 29.1% MFU.", "x": "+35%"},
 ];
 // One label per phase; a new phase starts wherever the GPU type changes.
 const phases = ["B300 · flyliconn, basic views", "H200 · hemibrain EB 128³, displace views", "B300 · H200 setup"];

@@ -34,13 +34,17 @@ import numpy as np
 
 # Default (width, batch per GPU) per LSF GPU queue, for displace 128^3 / 96^3 / 64^3 views. Measured runs cited;
 # "est." sizes extrapolate the measured ~1.7 GB/sample at width 768 and haven't been run. MFU with the Linear
-# patch embedding (patchembed-linear) where measured; older Conv3d-era numbers are marked (conv), 1.1-1.6x lower.
+# patch embedding (patchembed-linear) where measured; older Conv3d-era numbers are marked (conv), 1.1-1.35x lower.
+# All cited speeds used cuDNN attention; runs now use flash (nanhunt_flash), 12-21% slower on H200 and ~30% on B300
+# (b300-compile/d0 vs patchembed-linear/d0).
 QUEUE_ARCH = {
  "gpu_a100": (768, 32),     # patchembed-linear/d3: 54.9% MFU, 262 ktok/s, 55 of 80 GB
  "gpu_rtx6000": (768, 32),  # rtx6k-memory/d5 (conv): 46% MFU, 55 of 95 GB
- "gpu_h200": (768, 64),     # est. ~110 of 140 GB; width 512 x 84: patchembed-linear/d2 37.7% MFU (768 x 84 conv: 38%)
+ "gpu_h200": (768, 64),     # est. ~110 of 140 GB; width 512 x 84: patchembed-linear/d2 37.7% MFU (768 x 84 conv: 38%);
+                            # flash, 512 x 64: cudagraph-fix/d2 32.5% MFU, 995 ktok/s
  "gpu_h100": (768, 32),     # est., same 80 GB as A100
- "gpu_b300": (1024, 64),    # patchembed-linear/d1: 49.3% MFU, 1010 ktok/s, 144 of 288 GB (512 x 84: 29.1%)
+ "gpu_b300": (1024, 64),    # flash: cudagraph-fix/d1 30.2% MFU, 619 ktok/s, 145 of 288 GB (512 x 64: d0 20.5%, 1428).
+                            # (patchembed-linear/d1's 49% was a NaN run: cudagraphs miscompile, see eager_patch_embed)
 }
  
 # Code copied into .tmpcode/<sweep>/ at submission (runlsf); jobs import only from these. Add files here if

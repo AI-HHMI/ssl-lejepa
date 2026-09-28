@@ -314,7 +314,7 @@ def perf_journey():
         ("B300 · H200 setup", [
             ("H200|setup", "b300-revisit/d0", B3, None, "Everything from the H200 phase, on one B300. Conv3d patch embed ~15–17% of GPU time."),
             ("DDP", "b300-revisit/d1", B3, "b300-revisit/d0", "8×B300."),
-            ("+ Linear|embed", "patchembed-linear/d0", B3, "b300-revisit/d0", "Patch embedding as reshape + one Linear. Width 1024: see patchembed-linear/d1."),
+            ("+ Linear|embed", "patchembed-linear/d0", B3, "b300-revisit/d0", "Patch embedding as reshape + one Linear (cuDNN attention)."),
         ]),
     ]
     scaling = [  # (label, run, GPU type, 1-GPU run whose 8x is ideal)
