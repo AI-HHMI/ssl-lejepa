@@ -33,13 +33,14 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # Default (width, batch per GPU) per LSF GPU queue, for displace 128^3 / 96^3 / 64^3 views. Measured runs cited;
-# "est." sizes extrapolate the measured ~1.7 GB/sample at width 768 and haven't been run.
+# "est." sizes extrapolate the measured ~1.7 GB/sample at width 768 and haven't been run. MFU with the Linear
+# patch embedding (patchembed-linear) where measured; older Conv3d-era numbers are marked (conv), 1.1-1.6x lower.
 QUEUE_ARCH = {
- "gpu_a100": (768, 32),     # a100/d9: 50% MFU, 55 of 80 GB
- "gpu_rtx6000": (768, 32),  # rtx6k-memory/d5: 46% MFU, 55 of 95 GB
- "gpu_h200": (768, 64),     # est. ~110 of 140 GB (b84 peaked at 142); width-defer/d1: 38% MFU at b84
+ "gpu_a100": (768, 32),     # patchembed-linear/d3: 54.9% MFU, 262 ktok/s, 55 of 80 GB
+ "gpu_rtx6000": (768, 32),  # rtx6k-memory/d5 (conv): 46% MFU, 55 of 95 GB
+ "gpu_h200": (768, 64),     # est. ~110 of 140 GB; width 512 x 84: patchembed-linear/d2 37.7% MFU (768 x 84 conv: 38%)
  "gpu_h100": (768, 32),     # est., same 80 GB as A100
- "gpu_b300": (768, 128),    # est. ~220 of 288 GB; untested with displace views
+ "gpu_b300": (1024, 64),    # patchembed-linear/d1: 49.3% MFU, 1010 ktok/s, 144 of 288 GB (512 x 84: 29.1%)
 }
  
 # Code copied into .tmpcode/<sweep>/ at submission (runlsf); jobs import only from these. Add files here if
@@ -81,44 +82,41 @@ class Params:
     benchmark_steps: int = 50
     profile_steps: int = 10  # Set to zero to disable trace collection.
 
+def on_queue(p: Params, queue: str) -> Params:
+    """Put p on an LSF GPU queue with that queue's default architecture (QUEUE_ARCH)."""
+    assert queue in QUEUE_ARCH, f"no default architecture for {queue!r}; add it to QUEUE_ARCH"
+    p.queue = queue
+    p.width, p.batch_size = QUEUE_ARCH[queue]
+    return p
+
 def allparams():
     params = []
-    # NaN hunt fix check: e00/nanhunt_beta95 rerun with cuDNN attention disabled in run() (flash instead), after
-    # replay_bad_batch showed only cuDNN's attention backward gives NaN grads on d9's failed step. There all 4
-    # configs failed at 2.4-9.4k steps; here they should train for the full 2 h with 0 skipped steps.
-    # Per-config tok/s vs nanhunt_beta95 gives the cost of flash vs cuDNN attention.
-    # Run dirs keep their viewsizes index (d2, d9, ...).
-    base = (128, 96, 64)
-    configs = [base]  # the same 17 (input, global, local) configs, in the same order, as e00/viewsizes
-    configs += [(p, 96, 64) for p in [104, 160, 192, 256]]
-    configs += [(128, g, 64) for g in [64, 80, 112, 128]]
-    configs += [(128, 96, l) for l in [32, 48, 80, 96]]
-    configs += [(96, 64, 32), (160, 128, 80), (192, 144, 96), (256, 192, 128)]
-    tokens = lambda g, l: 2 * (g // 8) ** 3 + 4 * (l // 8) ** 3
-    flops = lambda g, l: sum(k * (n * (6 * 38.1e6 + 12 * 12 * 512 * n)) for k, n in [(2, (g // 8) ** 3), (4, (l // 8) ** 3)])
-    for i in [2, 9, 10, 15]:
-        inp, g, l = configs[i]
-        p = Params()
-        p.savedir = f"outdir/e00/nanhunt_flash/d{i}/"
+    # First long B300 training runs, with cuDNN attention off (the NaN-gradient fix, e00/nanhunt_flash) and the
+    # Linear patch embed. One full 8xB300 node each, 8 h. Same everything except width: is the 2x-wider model
+    # worth ~half the tokens at equal wall-clock? Batch held at 64 per GPU for both (loss depends on batch via
+    # SIGReg), so compare PCA maps / later evals, and loss at equal steps, not final loss.
+    # AdamW beta2 0.95 + weight decay 0.05, the recipe nanhunt_flash validates.
+    # steps_per_epoch (cosine horizon) from 1-GPU B300 speed at 96% 8-GPU scaling: ~0.20 s/step for width 512
+    # (patchembed-linear/d0; may be data-loader bound at ~2900 samples/s/node), ~0.37 s/step for 1024 (d1).
+    for i, (w, step_s) in enumerate([(512, 0.20), (1024, 0.37)]):
+        p = on_queue(Params(), "gpu_b300")
+        p.savedir = f"outdir/e00/b300-train8h/d{i}/"
+        p.width = w
+        p.batch_size = 64
         p.data = "hemibrain_wide"
         p.views = "displace"
-        p.patch_size = (inp, inp, inp)
-        p.global_size = (g, g, g)
-        p.local_size = (l, l, l)
-        p.batch_size = min(168, max(8, 4 * round(84 * tokens(*base[1:]) / tokens(g, l) / 4)))
-        step_s = 0.45 * (p.batch_size * flops(g, l)) / (84 * flops(*base[1:]))
+        p.patch_size = (128, 128, 128)
+        p.global_size = (96, 96, 96)
+        p.local_size = (64, 64, 64)
+        p.max_hours = 8.0
         p.steps_per_epoch = int(8 * 3600 / step_s)
-        p.max_hours = 2.0
         p.weight_decay = 0.05
         p.adam_beta2 = 0.95
         p.cudagraphs = True
         p.batch_views = True
-        p.n_workers = 11
-        p.n_gpus = 1
-        p.queue = "gpu_h200"
+        p.n_workers = 11  # 12 cores per GPU
+        p.n_gpus = 8
         params.append(p)
-    # pprint(params)
-
     return params
 
 def collate_images(samples):
@@ -336,7 +334,7 @@ def run(n:int):
                             torch.save({"step": idx_step, "params": asdict(par), "model_config": lejepa.cfg.to_kwargs(),
                                         "model": lejepa.state_dict(), "x_uint8": (x.clamp(0, 1) * 255).round().byte().cpu(),
                                         "rng_cpu": rng_cpu, "rng_cuda": rng_cuda}, savedir / f"bad_batch_{idx_step:07d}.pt")
-                    opt.zero_grad()
+                    opt.zero_grad(set_to_none=True)
                     sched.step()
                 with bench.phase("07_LOGGING"):
                     if rank0 and (idx_step % 10 == 0 or idx_step + 1 == par.steps_per_epoch):
@@ -685,8 +683,9 @@ def plot1():
     repeat = (res.idx_step == 0).groupby(res.savedir).cumsum() - 1
     res["run"] = short_runs(res.savedir) + repeat.map(lambda k: f".{k}" if k else "")
     res["sizes"] = res.patch_size.astype(str) + " " + res.global_size.astype(str) + " " + res.local_size.astype(str)
-    px.line(res, x="idx_step", y="loss", color="run", line_dash="views", facet_col="n_gpus",
-            hover_data=["sizes", "n_workers"], markers=True, log_y=True).show()
+    px.line(res, x="idx_step", y="loss", color="width", line_dash="batch_size",
+            hover_data=["width", "batch_size", "queue"], markers=True, log_y=True,
+            category_orders={"batch_size": sorted(res.batch_size.unique())}).show()
 
 # def plot2():
 #     """ktok/s per GPU: one bar per result row, bars grouped by n_gpus with gaps between groups, colored by width + defer_image_ops."""

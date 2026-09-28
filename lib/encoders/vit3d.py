@@ -65,7 +65,12 @@ def get_3d_sincos_pos_embed(
 
 
 class PatchEmbed3d(nn.Module):
-    """3D Volume to Patch Embedding with dynamic padding."""
+    """3D volume -> patch tokens: cut into non-overlapping patches, then one Linear.
+
+    Same math as a Conv3d with stride == kernel, but as one well-shaped matmul: on B300 the conv's
+    implicit-GEMM kernels took ~15-17% of GPU time (e00/b300-*). Checkpoints from the Conv3d version load
+    unchanged (their 5-D proj.weight is flattened in the same C pz py px order).
+    """
 
     def __init__(
         self,
@@ -80,12 +85,13 @@ class PatchEmbed3d(nn.Module):
         self.in_channels = in_channels
         self.embed_dim = embed_dim
 
-        self.proj = nn.Conv3d(
-            in_channels,
-            embed_dim,
-            kernel_size=patch_size,
-            stride=patch_size,
-        )
+        self.proj = nn.Linear(in_channels * patch_size[0] * patch_size[1] * patch_size[2], embed_dim)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        w = state_dict.get(prefix + "proj.weight")
+        if w is not None and w.ndim == 5:  # Conv3d weight: embed_dim C pz py px
+            state_dict[prefix + "proj.weight"] = w.reshape(w.shape[0], -1)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def forward(self, x: Tensor) -> Tuple[Tensor, Tup3Int]:
         """Extract patch tokens from 3D volume.
@@ -100,10 +106,12 @@ class PatchEmbed3d(nn.Module):
         assert all(s % p == 0 for s, p in zip(x.shape[2:], self.patch_size)), (
             f"input {tuple(x.shape)} must be a multiple of patch size {self.patch_size}"
         )
-        feat = self.proj(x)  # (B, embed_dim, G_z, G_y, G_x)
-        grid_size = (feat.shape[2], feat.shape[3], feat.shape[4])
-        tokens = feat.flatten(2).transpose(1, 2)  # (B, N, embed_dim)
-        return tokens, grid_size
+        B, C, Z, Y, X = x.shape
+        pz, py, px = self.patch_size
+        gz, gy, gx = Z // pz, Y // py, X // px
+        # Batch C Z Y X -> Batch (Gz Gy Gx) (C pz py px), matching the Conv3d weight layout
+        patches = x.reshape(B, C, gz, pz, gy, py, gx, px).permute(0, 2, 4, 6, 1, 3, 5, 7).reshape(B, gz * gy * gx, -1)
+        return self.proj(patches), (gz, gy, gx)
 
 
 class Attention(nn.Module):

@@ -151,6 +151,17 @@ def test_snapshot_copies_once(tmp_path, monkeypatch):
     assert (dest / "main.py").read_text() == "x = 3\n"
 
 
+def test_patch_embed_matches_conv3d():
+    from lib.encoders.vit3d import PatchEmbed3d
+    conv = torch.nn.Conv3d(2, 16, kernel_size=(4, 8, 8), stride=(4, 8, 8))
+    embed = PatchEmbed3d(patch_size=(4, 8, 8), in_channels=2, embed_dim=16)
+    embed.load_state_dict(conv.state_dict(prefix="proj."))  # Conv3d-era keys and 5-D weight shape
+    x = torch.randn(3, 2, 8, 16, 24)
+    tokens, grid = embed(x)
+    assert grid == (2, 2, 3)
+    torch.testing.assert_close(tokens, conv(x).flatten(2).transpose(1, 2))
+
+
 def test_profile_device_ms(tmp_path):
     from lib.util import profile_device_ms
     sep = "  ".join(["-" * 20] * 11)

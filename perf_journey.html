@@ -67,28 +67,28 @@
 <body>
 <main>
   <h1>The throughput journey</h1>
-  <p class="sub">ssl-lejepa · LeJEPA (invariance + SIGReg) with a 3D ViT (12 layers, width 512, 8³ patches, ~44M params) on microscopy volumes · sweeps under <code>outdir/e00/</code>, Sep 17–24 2026</p>
+  <p class="sub">ssl-lejepa · LeJEPA (invariance + SIGReg) with a 3D ViT (12 layers, width 512, 8³ patches, ~44M params) on microscopy volumes · sweeps under <code>outdir/e00/</code>, Sep 17–27 2026</p>
 
   <div class="tiles">
     <div class="card tile"><div class="num">5.0×</div><div class="lbl">single-GPU speedup on B300</div><div class="note">267 → 1,333 ktok/s</div></div>
-    <div class="card tile"><div class="num">7.8M</div><div class="lbl">tokens/s on one 8×H200 node</div><div class="note">hemibrain 128³, displace views (8×B300 old setup: 8.1M)</div></div>
-    <div class="card tile"><div class="num">94%</div><div class="lbl">8-GPU scaling efficiency</div><div class="note">was 76–83% until we shipped uint8 instead of float32</div></div>
-    <div class="card tile"><div class="num">33%</div><div class="lbl">MFU on one H200</div><div class="note">GPU-bound, 99% busy; 38% at width 768</div></div>
+    <div class="card tile"><div class="num">11.5M</div><div class="lbl">tokens/s on one 8×B300 node</div><div class="note">hemibrain 128³, displace views, before the Linear patch embed (8×H200: 7.8M)</div></div>
+    <div class="card tile"><div class="num">94–96%</div><div class="lbl">8-GPU scaling efficiency</div><div class="note">H200 / B300; was 76–83% until we shipped uint8 instead of float32</div></div>
+    <div class="card tile"><div class="num">49%</div><div class="lbl">MFU on one B300 at width 1024</div><div class="note">Linear patch embed; width 512: 29% B300, 38% H200; A100 at width 768: 55%</div></div>
   </div>
 
   <h2>Per-GPU throughput, one change at a time</h2>
   <div class="card">
     <p class="chart-title">Encoder tokens per second per GPU (thousands)</p>
-    <p class="chart-sub">Unprofiled 50-step benchmark window. Bars in each hardware phase share a setup and can be compared; the two phases can't (different GPU, dataset, crop sizes and view scheme). Within the H200 phase, the 1-GPU steps come first, then the same steps at 8 GPUs. Labels on 8-GPU bars are per-GPU throughput as a percentage of the best 1-GPU run at that point. Hover a bar for details.</p>
-    <div class="legend"><span style="--c: var(--series-1)">B300 · flyliconn 48×144×144 · basic views</span><span style="--c: var(--series-2)">H200 · hemibrain EB 128³ · displace views</span></div>
-    <svg id="journey" viewBox="0 0 1000 490" role="img" aria-label="Bar chart of per-GPU throughput for each optimization step"></svg>
+    <p class="chart-sub">Unprofiled 50-step benchmark window. Bars in each phase share a setup and can be compared; phases can't be compared with each other (different GPU, or different dataset, crop sizes and view scheme). Within the H200 phase, the 1-GPU steps come first, then the same steps at 8 GPUs; the last phase is in time order. Labels on 8-GPU bars are per-GPU throughput as a percentage of the best 1-GPU run at that point. Hover a bar for details.</p>
+    <div class="legend"><span style="--c: var(--series-1)">B300</span><span style="--c: var(--series-2)">H200</span></div>
+    <svg id="journey" viewBox="0 0 1160 490" role="img" aria-label="Bar chart of per-GPU throughput for each optimization step"></svg>
     <details><summary>Table view</summary><table id="journey-table"></table></details>
   </div>
 
   <h2>Scaling out: one node</h2>
   <div class="card">
     <p class="chart-title">Node throughput with DDP (million tokens/s)</p>
-    <p class="chart-sub">Solid bars are measured; the outlined bar behind each 8-GPU result is perfect 8× scaling of the matching 1-GPU run.</p>
+    <p class="chart-sub">"B300 old" is the flyliconn / basic-views setup; the other bars use hemibrain EB 128³ with displace views, before the Linear patch embed. Solid bars are measured; the outlined bar behind each 8-GPU result is perfect 8× scaling of the matching 1-GPU run.</p>
     <svg id="scaling" viewBox="0 0 1000 330" role="img" aria-label="Bar chart of node throughput for 1 and 8 GPUs with ideal scaling outlines"></svg>
     <details><summary>Table view</summary><table id="scaling-table"></table></details>
   </div>
@@ -129,6 +129,12 @@
       <li style="--c: var(--series-2)"><div class="h">Count FLOPs: MFU, and wider models</div>
         Each step now logs model training FLOPs from the actual view shapes (6 × params per token, plus attention), TFLOP/s, MFU against the GPU's dense bf16 peak, and peak memory. Width 512 runs at 33% MFU on one H200. Width 768 reaches 38% (larger matmuls) but peaks at 142 GB at batch 84, right at the H200's limit. Width 1024 ran out of memory at batch 84.
         <div class="res">Wider is more efficient per FLOP but costs ~2× per token. The first 6 h training runs use width 512.</div></li>
+      <li style="--c: var(--series-1)"><div class="h">Back to B300 with the H200 setup</div>
+        We reran the H200 setup (hemibrain 128³, displace views, CUDA graphs, batched views, uint8) on B300. It's fast, but at only 21.5% MFU: B300's peak is 2.3× the H200's, so the same width-512 model uses less of it. Widening helped less than on H200: 768 reached 27%, and 1024 × 64 reached 31% (632 ktok/s). 1024 × 128 did not finish. The profile showed the patch-embedding Conv3d taking ~15–17% of GPU time.
+        <div class="res">1 GPU: 1,501 ktok/s. 8 GPUs: <b>11.5M tok/s per node</b>, 1,437 per GPU, 96% scaling.</div></li>
+      <li style="--c: var(--series-1)"><div class="h">Patch embedding as a Linear layer</div>
+        A Conv3d with stride equal to its kernel is a matmul in disguise, but cuDNN ran it as slow implicit-GEMM kernels, worst on B300. We cut the volume into 8³ patches with a reshape and apply one <code>nn.Linear</code>. The math is the same, and old Conv3d checkpoints still load.
+        <div class="res">B300 width 512: 1,501 → 2,033 ktok/s (<b>1.35×</b>, 29% MFU). B300 width 1024: 632 → 1,010 (<b>1.60×</b>, <b>49% MFU</b>). H200 width 512: 1,036 → 1,156 (1.12×, 38%). A100 width 768: 242 → 262 (1.08×, 55%).</div></li>
     </ol>
   </div>
 
@@ -152,6 +158,7 @@
         <li><b>Check the hardware before comparing.</b> One queue change (B300 → H200) looked like a 30% regression in the view scheme.</li>
         <li><b>Host memory traffic grows with the GPU count.</b> Float32 samples cost nothing on one GPU and 15% of throughput on eight. Ship the smallest dtype the GPU can finish.</li>
         <li><b>Repeats agree to within ~1%</b> for the same config on the same GPU type. Earlier "±5–10%" came from comparing runs that differed in more than the knob under test.</li>
+        <li><b>Profile each new GPU; small layers can dominate.</b> The patch-embedding conv is a tiny share of the FLOPs but took ~15–17% of B300 time. Rewriting it as a Linear gave 1.08× on A100 and 1.60× on B300.</li>
         <li><b>Throughput changes can change training.</b> Rounding crop sizes, dropping padding, and per-rank SIGReg all change what the model learns.</li>
       </ul></div>
     </div>
@@ -159,10 +166,11 @@
 
   <h2>Where the time still goes, and what's next</h2>
   <div class="card">
-    <p>On one H200 we're GPU-bound: 99% busy at about 33% MFU. Matmuls and attention take only about 58% of GPU time; the rest is layernorm, GELU, casts and other memory-bound kernels, which a width-512 model can't hide. At 8 GPUs, scaling is 94% now that samples cross the host as uint8. The first two 6-hour training runs (<code>outdir/e00/train6h/</code>) use this setup: 8×H200, width 512, EB-only vs. hemibrain crops 002 + 003 (2 Tvox, with EB's validation and test regions cut out).</p>
+    <p>On one H200 we're GPU-bound: 99% busy at about 38% MFU with the Linear patch embed. Much of the remaining GPU time goes to layernorm, GELU, casts and other memory-bound kernels, which a width-512 model can't hide. Wider models hide it better: width 1024 on B300 reaches 49% MFU. At 8 GPUs, scaling is 94–96% now that samples cross the host as uint8. The first two 6-hour training runs (<code>outdir/e00/train6h/</code>) use 8×H200, width 512, EB-only vs. hemibrain crops 002 + 003 (2 Tvox, with EB's validation and test regions cut out). Per-queue default widths and batch sizes are in <code>QUEUE_ARCH</code> in <code>e00_basic.py</code>.</p>
     <ul>
-      <li><b>Wider models</b> (768, batch 64 for memory headroom) for the next training run: higher MFU, and usually better SSL features.</li>
-      <li><b>Look at the non-matmul ~40%</b> of GPU time (patch-embed conv, layernorm, GELU) for poorly fused kernels.</li>
+      <li><b>Measure 8×B300 with the Linear patch embed.</b> Extrapolating from 96% scaling gives ~15.6M tok/s at width 512. That hasn't been measured yet.</li>
+      <li><b>Wider models</b> for the next training run: higher MFU, and usually better SSL features. The first step is fixing the training divergence (non-finite gradients once the residual stream grows).</li>
+      <li><b>Look at the remaining non-matmul kernels</b> (layernorm, GELU, casts) for poorly fused ones.</li>
       <li><b>Before relying on multi-GPU results:</b> compute SIGReg statistics across all GPUs and use SyncBatchNorm in the projector. Both are still per GPU.</li>
       <li><b>Training recipe:</b> the runs use constant-lr Adam (1e-4) with no warmup, schedule or evaluation. That's fine for a sanity run, not for a final model.</li>
     </ul>
@@ -183,16 +191,24 @@ const steps = [
   {k: "+ CUDA|graphs", g: 1, v: 990, hw: "H200", run: "allreduce/d0 (≈ cudagraphs/d4)", d: "compile(mode='reduce-overhead'): replay recorded kernel sequences. 99% GPU busy.", x: "+12%"},
   {k: "+ batch|views", g: 1, v: 1023, hw: "H200", run: "batchviews/d1", d: "2 encoder calls per step (all globals, all locals) instead of 6.", x: "+3%"},
   {k: "+ uint8", g: 1, v: 1036, hw: "H200", run: "width-defer/d3", d: "defer_image_ops: workers ship uint8, GPU normalizes. 33.8% MFU.", x: "+1%"},
+  {k: "+ Linear|embed", g: 1, v: 1156, hw: "H200", run: "patchembed-linear/d2", d: "Patch embedding as reshape + one Linear instead of Conv3d. 37.7% MFU.", x: "+12%"},
   {k: "DDP", g: 8, v: 759, hw: "H200", run: "cudagraphs/d7", d: "8×H200 with CUDA graphs, 72 cores. 6.07M tok/s total.", x: "77%"},
   {k: "+ full|node", g: 8, v: 812, hw: "H200", run: "allreduce/d2", d: "12 cores/GPU → all 96 cores. 6.50M tok/s total. bf16 grad compression: no further gain.", x: "83%"},
   {k: "+ batch|views", g: 8, v: 835, hw: "H200", run: "batchviews/d3", d: "Batched encoder calls at 8 GPUs. 6.68M tok/s total.", x: "82%"},
   {k: "+ uint8", g: 8, v: 975, hw: "H200", run: "width-defer/d5", d: "uint8 transfer at 8 GPUs: 7.80M tok/s total, 31.8% MFU.", x: "94%"},
+  {k: "H200|setup", g: 1, v: 1501, hw: "B300", run: "b300-revisit/d0", d: "Everything from the H200 phase, on one B300. 21.5% MFU; Conv3d patch embed ~15–17% of GPU time."},
+  {k: "DDP", g: 8, v: 1437, hw: "B300", run: "b300-revisit/d1", d: "8×B300: 11.49M tok/s total, 96% of the 1-GPU rate per GPU. 20.6% MFU.", x: "96%"},
+  {k: "+ Linear|embed", g: 1, v: 2033, hw: "B300", run: "patchembed-linear/d0", d: "Patch embedding as reshape + one Linear. 29.1% MFU. Width 1024: 632 → 1,010 ktok/s, 49.3% MFU.", x: "+35%"},
 ];
+// Phases of the journey chart: a new phase starts wherever the GPU type changes.
+const phases = ["B300 · flyliconn, basic views", "H200 · hemibrain EB 128³, displace views", "B300 · H200 setup"];
 const scaling = [
-  {k: "B300 · 1 GPU", v: 1.333, hw: "B300", run: "ddp/d0"},
-  {k: "B300 · 8 GPUs", v: 8.111, hw: "B300", ideal: 8 * 1.333, run: "ddp/d3"},
+  {k: "B300 old · 1 GPU", v: 1.333, hw: "B300", run: "ddp/d0"},
+  {k: "B300 old · 8 GPUs", v: 8.111, hw: "B300", ideal: 8 * 1.333, run: "ddp/d3"},
   {k: "H200 · 1 GPU", v: 1.036, hw: "H200", run: "width-defer/d3"},
   {k: "H200 · 8 GPUs", v: 7.799, hw: "H200", ideal: 8 * 1.036, run: "width-defer/d5"},
+  {k: "B300 · 1 GPU", v: 1.501, hw: "B300", run: "b300-revisit/d0"},
+  {k: "B300 · 8 GPUs", v: 11.494, hw: "B300", ideal: 8 * 1.501, run: "b300-revisit/d1"},
 ];
 
 const NS = "http://www.w3.org/2000/svg";
@@ -215,8 +231,8 @@ function axes(svg, m, W, H, ymax, ticks, fmt) {
 // Journey chart
 (function () {
   const svg = document.getElementById("journey");
-  const m = {l: 56, r: 12, t: 58, b: 78}, W = 1000 - m.l - m.r, H = 490 - m.t - m.b, ymax = 1500;
-  axes(svg, m, W, H, ymax, [0, 250, 500, 750, 1000, 1250, 1500], t => t.toLocaleString());
+  const VW = 1160, m = {l: 56, r: 12, t: 58, b: 78}, W = VW - m.l - m.r, H = 490 - m.t - m.b, ymax = 2250;
+  axes(svg, m, W, H, ymax, [0, 250, 500, 750, 1000, 1250, 1500, 1750, 2000, 2250], t => t.toLocaleString());
   // x layout: a big gap where the hardware phase changes, a small one where 1 GPU -> 8 GPUs.
   const PHASE_GAP = 40, GROUP_GAP = 14;
   const gaps = steps.map((s, i) => i === 0 ? 0 : s.hw !== steps[i - 1].hw ? PHASE_GAP : s.g !== steps[i - 1].g ? GROUP_GAP : 0);
@@ -224,13 +240,15 @@ function axes(svg, m, W, H, ymax, ticks, fmt) {
   const xs = []; let acc = m.l;
   steps.forEach((s, i) => { acc += gaps[i]; xs.push(acc + 5); acc += slot; });
   const yOf = v => m.t + H - H * v / ymax;
-  const split = steps.findIndex(s => s.hw === "H200");
-  const xd = xs[split] - 5 - PHASE_GAP / 2;
-  el("line", {x1: xd, x2: xd, y1: 16, y2: m.t + H, stroke: "var(--axis)", "stroke-width": 1, "stroke-dasharray": "3 4"}, svg);
-  el("text", {x: m.l + 4, y: 20, "font-size": 12.5, "font-weight": 600, fill: "var(--text-secondary)"}, svg, "B300 · one GPU, then 8");
-  el("text", {x: xd + 10, y: 20, "font-size": 12.5, "font-weight": 600, fill: "var(--text-secondary)"}, svg, "H200 · new data + views (new baseline)");
+  const starts = gaps.flatMap((g, i) => i === 0 || g === PHASE_GAP ? [i] : []);
+  console.assert(starts.length === phases.length, "one label per phase");
+  starts.forEach((a, p) => {
+    const xd = xs[a] - 5 - PHASE_GAP / 2;
+    if (p > 0) el("line", {x1: xd, x2: xd, y1: 16, y2: m.t + H, stroke: "var(--axis)", "stroke-width": 1, "stroke-dasharray": "3 4"}, svg);
+    el("text", {x: p === 0 ? m.l + 4 : xd + 10, y: 20, "font-size": 12.5, "font-weight": 600, fill: "var(--text-secondary)"}, svg, phases[p]);
+  });
   // Best 1-GPU result per phase as a dashed reference across that phase.
-  for (const [a, b] of [[0, split], [split, steps.length]]) {
+  for (const [a, b] of starts.map((a, p) => [a, starts[p + 1] ?? steps.length])) {
     const best = Math.max(...steps.slice(a, b).filter(s => s.g === 1).map(s => s.v));
     el("line", {x1: xs[a] - 5, x2: xs[b - 1] + bw + 5, y1: yOf(best), y2: yOf(best), stroke: "var(--text-muted)", "stroke-width": 1, "stroke-dasharray": "2 3", opacity: .6}, svg);
     el("text", {x: xs[a], y: yOf(best) - 6, "text-anchor": "start", "font-size": 11, fill: "var(--text-muted)"}, svg, "best 1-GPU");
@@ -247,7 +265,7 @@ function axes(svg, m, W, H, ymax, ticks, fmt) {
     el("text", {x: x + bw / 2, y: m.t + H + 50, "text-anchor": "middle", "font-size": 10.5, fill: "var(--text-muted)"}, g, s.g === 8 ? "8 GPUs" : "1 GPU");
     const html = `<b>${s.k.replace("|", " ")} · ${s.g} GPU${s.g > 1 ? "s" : ""} · ${s.v.toLocaleString()} ktok/s/GPU</b>${s.d}<br><span class="k">${s.hw} · outdir/e00/${s.run}</span>`;
     g.addEventListener("mousemove", ev => showTip(ev, html)); g.addEventListener("mouseleave", hideTip);
-    g.addEventListener("focus", () => { const r = svg.getBoundingClientRect(); showTip({clientX: r.left + (x / 1000) * r.width, clientY: r.top + (y / 490) * r.height}, html); });
+    g.addEventListener("focus", () => { const r = svg.getBoundingClientRect(); showTip({clientX: r.left + (x / VW) * r.width, clientY: r.top + (y / 490) * r.height}, html); });
     g.addEventListener("blur", hideTip);
   });
   el("text", {x: 14, y: m.t + H / 2, transform: `rotate(-90 14 ${m.t + H / 2})`, "text-anchor": "middle", "font-size": 12, fill: "var(--text-muted)"}, svg, "ktok/s per GPU");
@@ -259,8 +277,8 @@ function axes(svg, m, W, H, ymax, ticks, fmt) {
 // Scaling chart
 (function () {
   const svg = document.getElementById("scaling");
-  const m = {l: 56, r: 12, t: 20, b: 44}, W = 1000 - m.l - m.r, H = 330 - m.t - m.b, ymax = 12;
-  axes(svg, m, W, H, ymax, [0, 2, 4, 6, 8, 10, 12], t => t + "M");
+  const m = {l: 56, r: 12, t: 20, b: 44}, W = 1000 - m.l - m.r, H = 330 - m.t - m.b, ymax = 14;
+  axes(svg, m, W, H, ymax, [0, 2, 4, 6, 8, 10, 12, 14], t => t + "M");
   const slot = W / scaling.length, bw = Math.min(120, slot - 60);
   const yOf = v => m.t + H - H * v / ymax;
   scaling.forEach((s, i) => {
