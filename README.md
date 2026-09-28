@@ -17,7 +17,7 @@ uv run python analysis.py loss_curves e00/nanhunt_flash   # analysis of any pull
 Remote workflow (experiments run on the Janelia cluster, `login1.int.janelia.org:~/proj/ssl-lejepa`):
 - VCS is **jj** (colocated with git). Remotes: `origin` (GitHub) and `janelia` (the cluster checkout).
 - `./push.sh` pushes `main` to the `janelia` remote and runs `jj new main` on the cluster. It does not touch `origin`: moving `main@origin` makes those commits immutable in jj.
-- `sh jrun.sh <bookmark> experiment.py runmany` pushes the bookmark to `janelia`, runs `jj new <bookmark>` on the cluster, then `uv run python experiment.py runmany` on the login node.
+- `sh jrun.sh <bookmark> experiment.py runmany` pushes the bookmark to `janelia`, runs `jj new <bookmark>` on the cluster, then `uv run python experiment.py runmany` on the login node. For experiments the bookmark is `exp` (see below).
 - `./pull.sh` rsyncs the small result files (`*.json`, `*.jsonl`, `*.log`, `*.png`, `profile.out`) from the cluster's `outdir/` into local `outdir/` with `--delete`. It skips large `profile.json` traces and `outdir/.trash/`.
 
 ## How this repo works
@@ -31,7 +31,11 @@ Every piece of code is either **remote** or **local**, and depends either on **m
 | **glue** | either | neither | `jrun.sh`, `pull.sh`, `gpufree.sh` | |
 
 - **An experiment is one jj change**, described `exp: e00/<name>. <question>`. Its `allparams()` writes only to `outdir/e00/<name>/d{i}/`. The change ID stays the same while you fix it: cancel jobs, amend, resubmit. Each run records the commit hash it actually ran.
-- **Keep experiment changes thin**: `allparams()` plus comments. Model, training and lib changes go in their own commits underneath. Concurrent experiments are sibling changes, merged into `main` soon after. On merge, `allparams()` is the only conflict: keep the newest experiment's.
+- **Keep experiment changes thin, and don't merge them.** An `exp:` change holds `allparams()` plus comments. Model, training, lib and analysis changes go in their own commits on `main`, underneath. `main` carries only those, never experiments.
+  - Each experiment stays an **unmerged leaf** on the `main` commit it branched from. Concurrent experiments are sibling leaves. Before leaving one, move any other code it picked up onto `main` (`jj split`, then rebase).
+  - **Find experiments by description**, not bookmarks: `jj log -r 'description(glob:"exp: e00/b300*")'`.
+  - **Never `jj abandon` an experiment that has runs.** Leaves stay visible heads, which is what keeps description search working. An abandoned commit still resolves by ID, but revsets no longer see it. If finished leaves clutter `jj log`, hide them from the default view in `.jj/repo/config.toml`, e.g. `[revsets] log = "@ | ancestors(immutable_heads().., 2) | trunk() | ~description(glob:'exp:*')"` (untested).
+  - **Don't amend an `exp:` change after its jobs ran.** Fixes before submission are fine. After that, make a new change on top, so the commit `runs.json` records is the one you find.
 - **Remote code gets the concurrency guards; local code gets none.**
   - Only committed code is submitted: `bsub` jobs come from `runlsf` (train), `pcalsf` (redo PCA maps) and `replaylsf` (replay a bad batch). Each first calls `assert_committed()`.
   - Each job runs a snapshot of the code plus its commit (`.tmpcode/<sweep>/`, `provenance.json`), and records that commit, argv and LSF job ID in `runs.json`. Repro for any run: *commit X, `experiment.py run n`*.
@@ -42,7 +46,7 @@ Every piece of code is either **remote** or **local**, and depends either on **m
   - `outdir/` is an exact mirror of the cluster's append-only run dirs, written only by remote runs, never locally. That's why `./pull.sh --delete` is safe. Never edit or `rm` experiment dirs.
   - `results/` is local analysis output (figures, tables, summaries, screenshots) and is not committed. `results/perf_journey.html` is the one tracked file: the hand-written page that `perf_journey()` fills in.
 - **Analysis reads each run's saved `params`, never the current `allparams()`**, so fixing a figure means rerunning it at HEAD. Name analysis functions after what they study. `lib/tests/test_analysis.py` checks `analysis.py` imports neither `experiment.py` nor anything from `lib/` except `lib.util`.
-- **Replaying an experiment**: point a bookmark at its commit (`jj bookmark create replay -r <commit>`), then `sh jrun.sh replay experiment.py runmany`. It writes to the same savedirs, so the original results move to `.trash/`.
+- **Launching and replaying**: one reusable bookmark, `exp`, marks what's being launched: `jj bookmark set exp -r <change>`, then `sh jrun.sh exp experiment.py runmany`. No per-experiment bookmarks. Once pushed, a commit exists both locally and in the cluster's repo, even after `exp` moves on. Replaying an old experiment is the same with its commit, e.g. `jj bookmark set exp -r <commit id from runs.json>`. It writes to the same savedirs, so the original results move to `.trash/`.
 
 ## experiment.py
 
