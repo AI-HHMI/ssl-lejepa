@@ -71,6 +71,7 @@ class Params:
     compile_blocks: bool = False  # compile each transformer block separately so DDP can overlap all-reduce with backward
     defer_image_ops: bool = True  # workers ship uint8 crops; cast + normalize on the GPU (miao.finish_images)
     batch_views: bool = False  # one encoder call per group of same-shape views (2 per step with displace)
+    eager_patch_embed: bool = False  # keep PatchEmbed3d out of torch.compile (see compile_model)
     weight_decay: float = 0.0  # AdamW decay on weight matrices (biases/norms excluded); 0 = the original plain Adam
     adam_beta2: float = 0.999  # Adam second-moment decay; 0.999 = torch default (all runs so far), mia-muvit uses 0.95
     grad_compress: bool = False  # DDP bf16_compress_hook: all-reduce gradients in bf16 (half the bytes)
@@ -161,6 +162,12 @@ def compile_model(model: Lejepa, par: Params):
     # start all-reducing until backward is done. Per-block compile releases each block's grads as it finishes.
     for m in (model.encoder.blocks if par.compile_blocks else [model.encoder]):
         m.compile(**kwargs)
+    if par.eager_patch_embed:
+        # Inductor's fused patchify kernel (triton_poi_fused__to_copy__unsafe_view_clone_permute_view_0: the input's
+        # reshape/permute + bf16 cast) hits an illegal memory access under static shapes at batch 64 on B300 and
+        # H200 (e00/b300-compile, replay of b300-train8h/d0 with CUDA_LAUNCH_BLOCKING). Run it eagerly instead.
+        pe = model.encoder.patch_embed
+        setattr(pe, "forward", torch.compiler.disable(pe.forward))  # instance override; nn.Module.__call__ uses it
 
 def save_view_pngs(par: Params, dataset, n_samples: int = 3):
     """Save what the model sees: for n_samples fresh samples, the input and each of its views, as
