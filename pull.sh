@@ -1,10 +1,9 @@
 set -eo pipefail
 mkdir -p outdir/
 # -i itemizes changes (--no-group: cluster groups can't be set locally, so every file looked changed); drop directory lines (cd = new dir, .d = dir timestamp) so only file changes print.
-# .trash/ holds resubmitted runs' old results (lib.util.trash), cluster-only. _log/ has one commands-<host>.jsonl
-# per host (lib.util.log_command); excluding this machine's own keeps --delete off it (oc-rsync ignores 'P').
+# .trash/ holds resubmitted runs' old results (lib.util.trash), cluster-only. _log/ holds the cluster's
+# commands-<host>.jsonl (lib.util.log_command). Nothing local writes outdir/, so --delete is safe.
 oc-rsync -azi --no-group --delete \
-  --exclude="_log/commands-$(hostname -s).jsonl" \
   --exclude='.trash/' \
   --include='*/' \
   --include='**/profile.out' \

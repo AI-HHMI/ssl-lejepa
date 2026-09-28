@@ -118,6 +118,12 @@ def allparams():
         params.append(p)
     return params
 
+def record(savedir, fn: str):
+    """Append one row to savedir/runs.json: which experiment function ran (fn), code_provenance(), argv, LSF job.
+    Repro for the dir's artifacts: that commit + argv. Also logged per host in outdir/_log/ (log_command)."""
+    with open(Path(savedir) / "runs.json", "a") as f:
+        f.write(json.dumps({"fn": fn, **code_provenance(), "argv": sys.argv, "lsf_job": os.environ.get("LSB_JOBID")}) + "\n")
+
 def collate_images(samples):
     import torch
     return torch.stack([s["img"] for s in samples])
@@ -242,8 +248,7 @@ def run(n:int):
     savedir = Path(par.savedir)
 
     if rank0:  # repro: this commit + this command (runlsf only submits committed code)
-        with open(savedir / "runs.json", 'a') as rfile:
-            rfile.write(json.dumps({**code_provenance(), "argv": sys.argv, "lsf_job": os.environ.get("LSB_JOBID")}) + "\n")
+        record(savedir, "run")
 
     model = Lejepa(lejepa_config(par))
     if rank0: pprint(model)
@@ -381,7 +386,7 @@ def run(n:int):
         raise
     save_checkpoint(idx_step + 1)
     if rank0 and par.max_hours:  # training runs (not benchmarks): PCA maps of the last finite checkpoint
-        pca(str(savedir))
+        pca(n)
     if world_size > 1:
         dist.destroy_process_group()
 
@@ -404,6 +409,10 @@ def replay_bad_batch(path: str):
     import torch
     from contextlib import nullcontext
     from torch.nn.attention import SDPBackend, sdpa_kernel
+    # Like training, replay depends on lib/: only for dumps of this commit's own experiment (replaylsf submits it).
+    ours = {Path(p.savedir).resolve() for p in allparams()}
+    assert Path(path).resolve().parent in ours, f"{path} isn't from this commit's allparams(): replay it from its experiment's commit"
+    record(Path(path).parent, "replay_bad_batch")
     dump = torch.load(path, map_location="cpu", weights_only=False)
     par = Params(**dump["params"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -446,29 +455,23 @@ def replay_bad_batch(path: str):
     res["as trained"] = step("as trained", compiled=True)
     return res
 
-def pca(run: str):
-    """PCA maps (pca_maps) of a run's latest checkpoint. Runs automatically at the end of training runs.
+def pca(n:int):
+    """PCA maps (pca_maps) of allparams()[n]'s latest checkpoint. Runs at the end of training; pcalsf(n) redoes it.
 
-    `run` is an index into allparams() or any run's savedir. The model is rebuilt from the checkpoint's own
-    LejepaConfig (strict state_dict load, so architecture drift fails loudly) and the eval settings from its
-    saved Params, so old sweeps work without being in allparams().
+    Inference depends on lib/, so like training it only runs for this commit's own experiment: for an older
+    sweep, go back to its commit (jj new <commit>). The checkpoint's saved params must match allparams()[n].
     """
     import torch
-    savedir = Path(allparams()[int(run)].savedir if run.isdigit() else run)
-    # Newest numbered checkpoint; runs from before numbered checkpoints saved a single checkpoint.pt.
-    paths = sorted((savedir / "checkpoints").glob("step_*.pt")) or [savedir / "checkpoint.pt"]
-    assert paths[-1].is_file(), f"no checkpoint under {savedir}"
+    par = allparams()[n]
+    paths = sorted((Path(par.savedir) / "checkpoints").glob("step_*.pt"))
+    assert paths, f"no checkpoints in {par.savedir}"
     ckpt = torch.load(paths[-1], map_location="cpu", weights_only=False)
-    saved = ckpt["params"]
-    unknown = saved.keys() - {f.name for f in fields(Params)}
-    assert not unknown, f"{paths[-1]} has params no longer in Params: {sorted(unknown)}"
-    par = Params(**saved)  # fields added since the run take their defaults
-    # Checkpoints from before model_config was saved rebuild it from Params with the current lejepa_config.
-    cfg = LejepaConfig(**ckpt["model_config"]) if "model_config" in ckpt else lejepa_config(par)
-    model = Lejepa(cfg)
-    model.load_state_dict(ckpt["model"])
+    assert json_equal(ckpt["params"], asdict(par)), f"{paths[-1]} was made by other params: run pca from its experiment's commit"
+    model = Lejepa(lejepa_config(par))
+    model.load_state_dict(ckpt["model"])  # strict: architecture drift fails loudly
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pca_maps(model.encoder.to(device), par, savedir, ckpt["step"])
+    record(par.savedir, "pca")  # argv says whether it ran inside `run n` or on its own (pcalsf)
+    pca_maps(model.encoder.to(device), par, Path(par.savedir), ckpt["step"])
 
 def pca_maps(encoder, par: Params, savedir: Path, step: int):
     """PCA maps of patch-token embeddings on a held-out EB val crop -> savedir/pca.png, pca.json.
@@ -549,46 +552,56 @@ def pca_maps(encoder, par: Params, savedir: Path, step: int):
     print(f"{savedir}: step {step}, effective rank {erank:.1f}, top-3 variance {sum(var[:3]):.2f}, "
           f"between-tile variance {between_tile:.2f}, norm outliers (>2x median) {stats['norm_outliers']}/{norms.numel()}; wrote pca.png")
 
-def run_pcasweep(sweepdir: str):
-    cmd = f"""bsub -P miaai -q gpu_a100 -n 12 -gpu "num=1" -W 1:00 \
-          -o {sweepdir}/pca_%J.log uv run python e00_basic.py pca_sweep {sweepdir}
-          """
-    subprocess.Popen(cmd, shell=True)
-    print(f"Submitted pca_sweep {sweepdir} to LSF.")
+def bsub(par: Params, job: str, minutes: int, n_gpus: int, cmd: str):
+    """Submit `uv run <cmd>` for par's run dir to LSF as job <sweep>-<dN>-<job>, logging to savedir/job_<job>_%J.log.
 
-def pca_sweep(sweepdir: str):
-    """pca() for every run dir (d0, d1, ...) under sweepdir that has a checkpoint."""
-    for d in sorted(Path(sweepdir).glob("d*"), key=lambda d: int(d.name[1:])):
-        if (d / "checkpoints").is_dir() or (d / "checkpoint.pt").is_file():
-            pca(str(d))
-
-def runlsf(n:int):
+    {code} in cmd is this commit's code snapshot (.tmpcode/<sweep>/), which the job runs instead of the shared
+    checkout: that may have moved on (another sweep pushed) by the time the job starts. Python puts the script's
+    dir first on sys.path, so `lib` comes from the snapshot too; cwd stays the repo root, so outdir/ and data paths
+    resolve as before. Callers assert_committed() first.
+    """
     import subprocess
-    par:Params = allparams()[n]
-    # Jobs record the commit they ran (runs.json), so it must be the code: commit first (jj new / jj commit).
-    assert not git_provenance()["dirty"], "uncommitted changes to tracked files; commit them before submitting"
-    trash(par.savedir)
-    # Job name from the savedir, e.g. outdir/e00/nanhunt/d9/ -> e00-nanhunt-d9, so bjobs shows which run is which.
-    RUN_NAME = "-".join(Path(par.savedir).parts[1:])
-    # The job runs a per-sweep snapshot of this code, not the shared checkout, which may have moved on (another
-    # sweep pushed) by the time the job starts. Python puts the script's dir first on sys.path, so `lib` comes
-    # from the snapshot too; cwd stays the repo root, so outdir/ and data paths resolve as before.
+    name = "-".join(Path(par.savedir).parts[1:]) + f"-{job}"  # e.g. e00-nanhunt-d9-run, so bjobs shows which is which
     code = snapshot(SNAPSHOT_PATHS, Path(".tmpcode") / "-".join(Path(par.savedir).parts[1:-1]))
-    minutes = int(par.max_hours * 60) + 30 if par.max_hours else 15  # 30 min slack for startup + final checkpoint
     CPUS_PER_GPU = 12  # 8 GPUs -> all 96 cores; training processes need cores beyond the data workers
     assert par.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={par.n_workers} leaves no core for the training process"
-    cmd = f""" bsub -J {RUN_NAME} \
+    full = f""" bsub -J {name} \
         -W {minutes // 60}:{minutes % 60:02d} \
         -P miaai \
-        -n {par.n_gpus * CPUS_PER_GPU} \
+        -n {n_gpus * CPUS_PER_GPU} \
         -R "span[hosts=1]" \
-        -gpu "num={par.n_gpus}:mode=exclusive_process" \
+        -gpu "num={n_gpus}:mode=exclusive_process" \
         -q {par.queue} \
-        -o {par.savedir}/job_%J.log \
-        uv run torchrun --standalone --nproc_per_node={par.n_gpus} {code}/e00_basic.py run {n}
+        -o {par.savedir}/job_{job}_%J.log \
+        uv run {cmd.format(code=code)}
         """
-    subprocess.Popen(cmd, shell=True, stdin=subprocess.DEVNULL, start_new_session=True)
-    print(f"Submitted {RUN_NAME} (allparams()[{n}], code {code}) to LSF.")
+    subprocess.Popen(full, shell=True, stdin=subprocess.DEVNULL, start_new_session=True)
+    print(f"Submitted {name} (code {code}) to LSF.")
+
+def runlsf(n:int):
+    """Train allparams()[n] on LSF, in a fresh savedir (old contents -> outdir/.trash/)."""
+    par:Params = allparams()[n]
+    assert_committed()
+    trash(par.savedir)
+    minutes = int(par.max_hours * 60) + 30 if par.max_hours else 15  # 30 min slack for startup + final checkpoint
+    bsub(par, "run", minutes, par.n_gpus, f"torchrun --standalone --nproc_per_node={par.n_gpus} {{code}}/e00_basic.py run {n}")
+
+def pcalsf(n:int):
+    """Redo pca(n) on LSF, e.g. after changing pca_maps in this experiment's change (run() already does it once)."""
+    assert_committed()
+    bsub(allparams()[n], "pca", 30, 1, f"python {{code}}/e00_basic.py pca {n}")
+
+def pcamany():
+    for i in range(len(allparams())):
+        pcalsf(i)
+
+def replaylsf(n:int):
+    """replay_bad_batch on LSF for allparams()[n]'s first bad_batch dump. CUDA_LAUNCH_BLOCKING names a crashing kernel."""
+    par = allparams()[n]
+    dumps = sorted(Path(par.savedir).glob("bad_batch_*.pt"))
+    assert dumps, f"no bad_batch_*.pt in {par.savedir}"
+    assert_committed()
+    bsub(par, "replay", 30, 1, f"env CUDA_LAUNCH_BLOCKING=1 python {{code}}/e00_basic.py replay_bad_batch {dumps[0]}")
 
 def runmany():
     for i in range(len(allparams())):
@@ -622,4 +635,5 @@ if __name__ == "__main__":
     if len(sys.argv) == 1:
         pick_entrypoint()
     else:
+        log_command(sys.argv)  # experiment code: every CLI call -> outdir/_log/commands-<host>.jsonl
         call_entrypoint(sys.argv[1], *sys.argv[2:])

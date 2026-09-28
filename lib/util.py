@@ -71,6 +71,11 @@ def git_provenance(repo=".") -> dict:
             "dirty": bool(diff), "diff_hash": sha256(diff.encode()).hexdigest()}
 
 
+def assert_committed():
+    """Before submitting remote jobs: they record the commit they ran (code_provenance), so it must be the code."""
+    assert not git_provenance()["dirty"], "uncommitted changes to tracked files; commit them (jj new / jj commit) first"
+
+
 def code_provenance() -> dict:
     """git_provenance() of the code actually running: a .tmpcode snapshot's recorded commit (snapshot()) when
     the script runs from one, since the shared checkout's HEAD may have moved on since submission."""
@@ -80,8 +85,9 @@ def code_provenance() -> dict:
 
 def log_command(argv: list[str]):
     """Append one JSON line per entrypoint call to outdir/_log/commands-<host>.jsonl: time, host, argv, LSF
-    job and code_provenance(). One file per host, since appends from several hosts to one NFS file can
-    interleave. Rank 0 only under torchrun. pull.sh copies the cluster's and protects the local one."""
+    job and code_provenance(). Called by experiment scripts' __main__ (remote code), not by call_entrypoint, so
+    local analysis never writes outdir/. One file per cluster host, since appends from several hosts to one NFS
+    file can interleave. Rank 0 only under torchrun."""
     if os.environ.get("RANK", "0") != "0":
         return
     host = socket.gethostname().split(".")[0]
@@ -150,27 +156,6 @@ def trace_summary(trace_path: str | Path) -> dict[str, float]:
     }
 
 
-def profile_device_ms(path: str | Path) -> tuple[float, dict[str, float]]:
-    """GPU ms per profiled step from a Benchmark profile.out: the total, and each row of its self-device-time table.
-
-    Rows overlap (a CompiledFxGraph call's time includes its kernels'), so only sum disjoint rows, e.g. kernels
-    picked by name. Row names are truncated by the table.
-    """
-    text = Path(path).read_text()
-    steps = re.search(r"recorded steps \(zero-based\): (\d+)\.\.(\d+)", text)
-    total = re.search(r"Self CUDA time total: ([\d.]+)(us|ms|s)", text)
-    assert steps and total and "SORTED BY SELF DEVICE TIME" in text, f"{path} is not a CUDA Benchmark profile.out"
-    n = int(steps[2]) - int(steps[1]) + 1
-    scale = {"us": 1e-3, "ms": 1.0, "s": 1e3}
-    rows: dict[str, float] = {}
-    for line in text.split("SORTED BY SELF DEVICE TIME")[1].split("Self CPU time total")[0].splitlines():
-        f = re.split(r"\s{2,}", line.strip())  # Name, Self CPU %, Self CPU, ..., Self CUDA (7th), ..., # of Calls
-        t = re.fullmatch(r"([\d.]+)(us|ms|s)", f[6]) if len(f) == 11 else None
-        if t:
-            rows[f[0]] = rows.get(f[0], 0.0) + float(t[1]) * scale[t[2]] / n
-    return float(total[1]) * scale[total[2]] / n, rows
-
-
 def _entrypoints(namespace):
     return {
         name: fn for name, fn in namespace.items()
@@ -209,7 +194,6 @@ def call_entrypoint(name, *args, namespace=None):
             bound.arguments[key] = tuple(convert(v, parameter.annotation) for v in value)
         else:
             bound.arguments[key] = convert(value, parameter.annotation)
-    log_command([sys.argv[0], name, *map(str, args)])
     return fn(*bound.args, **bound.kwargs)
 
 

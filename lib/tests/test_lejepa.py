@@ -175,16 +175,3 @@ def test_patch_embed_matches_conv3d():
     tokens, grid = embed(x)
     assert grid == (2, 2, 3)
     torch.testing.assert_close(tokens, conv(x).flatten(2).transpose(1, 2))
-
-
-def test_profile_device_ms(tmp_path):
-    from lib.util import profile_device_ms
-    sep = "  ".join(["-" * 20] * 11)
-    row = lambda name, cuda: "  ".join([name, "0.00%", "0.000us", "0.00%", "0.000us", "0.000us", cuda, "1.00%", cuda, "1.000us", "10"])
-    table = lambda *rows: "\n".join([sep, "Name  Self CPU %  x", sep, *rows, sep, "Self CPU time total: 1.000s", "Self CUDA time total: 2.000s"])
-    (tmp_path / "profile.out").write_text(
-        "Device: cuda:0; recorded steps (zero-based): 61..70\nOPERATORS SORTED BY SELF CPU TIME\n" + table(row("aten::mm", "5.000s"))
-        + "\n\nOPERATORS SORTED BY SELF DEVICE TIME\n" + table(row("flash_bwd", "1.500s"), row("gelu", "300.000ms"), row("flash_bwd", "20us")))
-    total, rows = profile_device_ms(tmp_path / "profile.out")
-    assert total == pytest.approx(200.0)  # 2 s over 10 steps
-    assert rows == pytest.approx({"flash_bwd": 150.002, "gelu": 30.0})  # device table only; truncated names merged

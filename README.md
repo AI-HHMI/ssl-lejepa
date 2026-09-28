@@ -9,7 +9,7 @@ Uses `uv` for everything; `mise.toml` loads `.env` (sets `LMD_DATA_ROOT`).
 ```sh
 uv run pytest                                    # all tests (testpaths = lib/tests)
 uv run pytest lib/tests/test_lejepa.py::test_lejepa_config   # single test
-uv run python e00_basic.py                       # fzf picker over top-level fns
+uv run python e00_basic.py                       # fzf picker over top-level fns (experiment code)
 uv run python e00_basic.py run 3                 # call run(3) directly (single process, no DDP)
 uv run python e00_analysis.py loss_curves e00/nanhunt_flash   # analysis of any pulled sweep
 ```
@@ -22,15 +22,26 @@ Remote workflow (experiments run on the Janelia cluster, `login1.int.janelia.org
 
 ## How this repo works
 
+Every piece of code is either **remote** or **local**, and depends either on **mutable `lib/`** or **only on `outdir/`** data.
+
+| class | runs | depends on | examples | rule |
+|---|---|---|---|---|
+| **experiment** | remote (LSF) | `lib/` (treat all of it as mutable, `util.py` included) | `e00_basic.py`: `run`, `pca`, `replay_bad_batch`; submitted by `runlsf`/`pcalsf`/`replaylsf` | Only for **this commit's own `allparams()`**, run from its committed snapshot. Training, inference (`pca`) and replays of an old sweep need time travel: `jj new <its commit>`. |
+| **analysis** | local | only `outdir/` (saved artifacts); never builds a `Lejepa`: imports no `eNN` script or `lib/` model code, only `lib.util`'s entrypoint CLI | `e00_analysis.py`: `loss_curves`, `nanhunt_plot`, `flash_perf`, `perf_journey`, `check_runs` | Runs at HEAD on **any** past sweep. It depends on `lib/` only transitively, through `outdir/`, which is an append-only log. |
+| **glue** | either | neither | `jrun.sh`, `pull.sh`, `gpufree.sh` | |
+
 - **An experiment is one jj change**, described `exp: e00/<name>. <question>`. Its `allparams()` writes only to `outdir/e00/<name>/d{i}/`. The change ID stays the same while you fix it: cancel jobs, amend, resubmit. Each run records the commit hash it actually ran.
 - **Keep experiment changes thin**: `allparams()` plus comments. Model, training and lib changes go in their own commits underneath. Concurrent experiments are sibling changes, merged into `main` soon after. On merge, `allparams()` is the only conflict: keep the newest experiment's.
-- **Only committed code runs on the cluster.** `runlsf` asserts there are no uncommitted changes to tracked files, and snapshots the code plus its commit into `.tmpcode/<sweep>/` (`provenance.json`). Each job then records that commit in its `runs.json`, along with argv and LSF job ID. Repro for any run: *commit X, `e00_basic.py run n`*.
-- **Resubmitting never destroys results.** `runlsf` moves an existing savedir to `outdir/.trash/<path>/<time>/` (`lib.util.trash`). Empty `.trash` by hand. Never edit or `rm` experiment dirs otherwise.
-- **Every entrypoint call is logged** by `call_entrypoint`, to `outdir/_log/commands-<host>.jsonl`: time, host, argv, LSF job, commit, subject, dirty. That's one file per host, so cluster logs arrive with `./pull.sh`, and this machine's own file is excluded from `--delete`.
+- **Remote code gets the concurrency guards; local code gets none.**
+  - Only committed code is submitted: `bsub` jobs come from `runlsf` (train), `pcalsf` (redo PCA maps) and `replaylsf` (replay a bad batch). Each first calls `assert_committed()`.
+  - Each job runs a snapshot of the code plus its commit (`.tmpcode/<sweep>/`, `provenance.json`), and records that commit, argv and LSF job ID in `runs.json`. Repro for any run: *commit X, `e00_basic.py run n`*.
+  - Every CLI call of an experiment script (`e00_basic.py <fn> ...`, via `log_command` in its `__main__`) is logged to `outdir/_log/commands-<host>.jsonl`, one file per host. This covers the login-node `runmany`/`pcalsf`/`replaylsf` calls and each job's `run`/`pca`/`replay_bad_batch`. Analysis doesn't log.
+  - Resubmitting moves the old savedir to `outdir/.trash/<path>/<time>/` (`lib.util.trash`) instead of deleting it. Empty `.trash` by hand.
+- **`pca` and `replay_bad_batch` assert they're working on this commit's own runs.** `pca(n)` checks the checkpoint's saved params equal `allparams()[n]`. `replay_bad_batch` checks the dump sits in one of this commit's savedirs.
 - **Two artifact places**:
-  - `outdir/` is an exact mirror of the cluster's, written only by runs and never edited locally, so `--delete` is safe.
+  - `outdir/` is an exact mirror of the cluster's append-only run dirs, written only by remote runs, never locally. That's why `./pull.sh --delete` is safe. Never edit or `rm` experiment dirs.
   - `results/` is local analysis output (figures, tables, summaries, screenshots) and is not committed. `results/perf_journey.html` is the one tracked file: the hand-written page that `perf_journey()` fills in.
-- **Artifacts describe themselves, so analysis runs at HEAD.** `e00_analysis.py` reads only pulled artifacts, each run's saved `params`, never the current `allparams()`. Any analysis works on any past sweep, and fixing a figure means rerunning it at HEAD. Name analysis functions after what they study (`nanhunt_plot`, `flash_perf`). Old checkpoints must keep loading in `lib`, e.g. `PatchEmbed3d`'s Conv3d hook. Where that's impossible, branch off the old commit.
+- **Analysis reads each run's saved `params`, never the current `allparams()`**, so fixing a figure means rerunning it at HEAD. Name analysis functions after what they study. `lib/tests/test_analysis.py` checks `e00_analysis.py` imports no `eNN` script and nothing from `lib/` except `lib.util`.
 - **Replaying an experiment**: point a bookmark at its commit (`jj bookmark create replay -r <commit>`), then `sh jrun.sh replay e00_basic.py runmany`. It writes to the same savedirs, so the original results move to `.trash/`.
 
 ## Experiment scripts (`eNN_*.py`)
@@ -51,7 +62,7 @@ The pattern in `e00_basic.py`:
 - Outputs go to the savedir as append-only JSON-lines:
   - `metrics.json`: loss every 10 steps.
   - `performance.json`: from the benchmark window. `samples_per_second`, `tokens_per_second`, `tokens_per_sample`, `input_mvox_per_second`, `world_size`.
-  - `runs.json`: commit, subject, dirty flag and diff hash (`code_provenance`), argv and LSF job ID.
+  - `runs.json`: one row per experiment function that ran on this dir (`record`: `fn` = `run` / `pca` / `replay_bad_batch`). Each row has commit, subject, dirty flag and diff hash (`code_provenance`), argv and LSF job ID. This overlaps with `outdir/_log/commands-<host>.jsonl` on purpose: the run dir is self-contained, and the global log covers calls with no run dir (`runmany`, `pcalsf`).
   - `profile.json` / `profile.out`: from `torch.profiler`.
   - `trace_summary.json`: from `lib.util.trace_summary`. GPU busy fraction (union of kernel intervals) and per-phase host ms over the profiled steps.
 
@@ -71,7 +82,7 @@ Data comes from `lmd_catalog` (the volume catalog) → `.to_miao()` → `miao.Vo
 - `views/maker.py`: `ViewMaker` makes crops without resizing, each flipped per sample and per axis. Each view is one batched advanced-indexing gather.
   - `basic`: each view draws a volume fraction from `global_scale` / `local_scale`. Sides are rounded to multiples of the patch size, which gives 9 distinct shapes for a 48×144×144 patch.
   - `displace`: fixed `global_size` / `local_size`. Each local sits inside a randomly chosen global of the same sample, at a uniformly random displacement. Every step has the same shapes and token count.
-- `util.py`: entrypoint CLI and command log, `snapshot` / `code_provenance` / `trash`, `trace_summary`, `profile_device_ms`.
+- `util.py`: entrypoint CLI and command log, `snapshot` / `code_provenance` / `assert_committed` / `trash`, `trace_summary`.
 - `benchmark.py`: `Benchmark`, which owns the training loop's timed window (`performance.json`) and profiled window (`profile.json`/`.out`, `trace_summary.json`). `run()` calls `begin`/`phase`/`count`/`end` each step. Also holds `PEAK_BF16_TFLOPS`.
 - `lib/__init__.py` monkeypatches a no-arg `torch.rand()`.
 

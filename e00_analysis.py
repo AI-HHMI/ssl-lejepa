@@ -1,9 +1,10 @@
-"""Analysis of e00 results: figures, tables and summaries built only from pulled artifacts (outdir/, a mirror of
-the cluster's), never from the current allparams(), so every function works on any past sweep at HEAD.
+"""Analysis of e00 results (local): figures, tables and summaries built only from pulled artifacts in outdir/, a
+mirror of the cluster's append-only run dirs. Imports no experiment code (e00_basic, lib/ models: nothing that
+builds a Lejepa), only lib.util's entrypoint CLI: artifacts describe themselves (saved params), so every function
+works on any past sweep at HEAD.
 Figures also go to results/ (local, not committed). Run: uv run python e00_analysis.py <function> [args].
 """
 
-from dataclasses import asdict
 import json
 import os
 import re
@@ -14,11 +15,31 @@ import pandas
 import plotly.express as px
 import plotly.graph_objects as go
 
-from e00_basic import Params
-from lib.util import call_entrypoint, pick_entrypoint, profile_device_ms
+from lib.util import call_entrypoint, pick_entrypoint
+
 
 def read_jsonl(path) -> list[dict]:
     return [json.loads(l) for l in Path(path).read_text().splitlines() if l.strip()]
+
+def profile_device_ms(path: str | Path) -> tuple[float, dict[str, float]]:
+    """GPU ms per profiled step from a Benchmark profile.out: the total, and each row of its self-device-time table.
+
+    Rows overlap (a CompiledFxGraph call's time includes its kernels'), so only sum disjoint rows, e.g. kernels
+    picked by name. Row names are truncated by the table.
+    """
+    text = Path(path).read_text()
+    steps = re.search(r"recorded steps \(zero-based\): (\d+)\.\.(\d+)", text)
+    total = re.search(r"Self CUDA time total: ([\d.]+)(us|ms|s)", text)
+    assert steps and total and "SORTED BY SELF DEVICE TIME" in text, f"{path} is not a CUDA Benchmark profile.out"
+    n = int(steps[2]) - int(steps[1]) + 1
+    scale = {"us": 1e-3, "ms": 1.0, "s": 1e3}
+    rows: dict[str, float] = {}
+    for line in text.split("SORTED BY SELF DEVICE TIME")[1].split("Self CPU time total")[0].splitlines():
+        f = re.split(r"\s{2,}", line.strip())  # Name, Self CPU %, Self CPU, ..., Self CUDA (7th), ..., # of Calls
+        t = re.fullmatch(r"([\d.]+)(us|ms|s)", f[6]) if len(f) == 11 else None
+        if t:
+            rows[f[0]] = rows.get(f[0], 0.0) + float(t[1]) * scale[t[2]] / n
+    return float(total[1]) * scale[total[2]] / n, rows
 
 def show(fig, name: str):
     """Display a plotly figure and keep a copy at results/<name>.html, e.g. name = e00/nanhunt_plot."""
@@ -31,7 +52,8 @@ def check_runs(root: str = "outdir/e00"):
     """Flag run dirs a job wrote under the wrong name (e.g. the shared-checkout race), or that lack results.
 
     Conflicts: a row whose params.savedir isn't the dir it sits in, a job log whose run wrote elsewhere, or
-    more than one runs.json row (two jobs wrote here). Several job logs alone are just resubmissions.
+    more than one training row in runs.json (two training jobs wrote here; pca/replay rows are fine). Rows from
+    before runs.json had "fn" count as training. Several job logs alone are just resubmissions.
     Missing: every run dir needs at least a job log and metrics.json (pending or still-running jobs show up too).
     Different: within a sweep, a run lacking file names (top level, excluding IGNORED) that other runs have.
     """
@@ -60,9 +82,9 @@ def check_runs(root: str = "outdir/e00"):
             if saved and Path(saved) != d:
                 issues.append(f"row for {saved}")
         runs = d / "runs.json"
-        n = len(runs.read_text().splitlines()) if runs.is_file() else 0
+        n = sum(r.get("fn", "run") == "run" for r in read_jsonl(runs)) if runs.is_file() else 0
         if n > 1:
-            issues.append(f"{n} runs.json rows")
+            issues.append(f"{n} training rows in runs.json")
         for log in d.glob("job_*.log"):
             m = re.search(r"input \+ view slices to (\S+)/views", log.read_text(errors="ignore"))
             if m and Path(m.group(1)) != d:
@@ -74,8 +96,8 @@ def check_runs(root: str = "outdir/e00"):
 
 def load_table(sweep: str, filename: str) -> pandas.DataFrame:
     """JSON-lines rows of `filename` from every run dir outdir/<sweep>/dN/, each joined with that run's own saved
-    Params (the first performance.json row with params; current defaults for fields added since), savedir and
-    run name. Artifacts describe themselves, so this works for any past sweep, whatever allparams() is now."""
+    params (the first performance.json row with params), savedir and run name. Params a run predates are
+    missing (NaN in the table)."""
     rows = []
     run_dirs = [d for d in Path("outdir", sweep).glob("d*/") if re.fullmatch(r"d\d+", d.name)]
     for d in sorted(run_dirs, key=lambda d: int(d.name[1:])):
@@ -83,7 +105,7 @@ def load_table(sweep: str, filename: str) -> pandas.DataFrame:
             continue
         perf = d / "performance.json"
         saved = next((r["params"] for r in read_jsonl(perf) if "params" in r), {}) if perf.is_file() else {}
-        rows += [{**asdict(Params()), **saved, **r, "savedir": str(d), "run": d.name} for r in read_jsonl(d / filename)]
+        rows += [{**saved, **r, "savedir": str(d), "run": d.name} for r in read_jsonl(d / filename)]
     assert rows, f"no {filename} in outdir/{sweep}/d*/; run ./pull.sh?"
     return pandas.DataFrame(rows)
 
@@ -342,4 +364,4 @@ if __name__ == "__main__":
     if len(sys.argv) == 1:
         pick_entrypoint()
     else:
-        call_entrypoint(sys.argv[1], *sys.argv[2:])
+        call_entrypoint(sys.argv[1], *sys.argv[2:])  # no log_command: local, and outdir/ is the cluster's mirror
