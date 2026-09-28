@@ -388,19 +388,27 @@ def run(n:int):
 def replay_bad_batch(path: str):
     """Replay a skipped (non-finite gradient) training step from its bad_batch_*.pt dump.
 
-    1. As trained (compiled per the run's Params): does the gradient come out non-finite again?
-    2. Eager under torch.autograd.detect_anomaly: raises at the first backward op that produced NaN/inf, with
+    1. Eager under torch.autograd.detect_anomaly: raises at the first backward op that produced NaN/inf, with
        the traceback of the forward op that created it. Eager kernels can differ numerically from compiled
-       ones, so 2 may not reproduce what 1 does. Returns the two losses.
+       ones, so 1 may not reproduce what 3 does.
+    2. Eager, with SDPA forced to each fused attention backend in turn (cuDNN, flash, mem-efficient). If only
+       cuDNN gives non-finite grads, its attention backward is the culprit. Eager because compiled replays
+       ignored sdpa_kernel (identical losses for every backend). The math backend is left out: it materializes
+       Batch Head N N attention and doesn't fit at training batch sizes. CUDA only (fused kernels).
+    3. As trained (compiled per the run's Params): does the gradient come out non-finite again? Runs last:
+       its CUDA graph pools stay allocated.
+    Returns loss and non-finite param count per replay; also prints which params kept finite grads.
     """
     import torch
+    from contextlib import nullcontext
+    from torch.nn.attention import SDPBackend, sdpa_kernel
     dump = torch.load(path, map_location="cpu", weights_only=False)
     par = Params(**dump["params"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.set_float32_matmul_precision(par.f32mode)
     x = dump["x_uint8"].to(device).float() / 255  # Batch C Z Y X, exactly the training input
 
-    def step(compiled: bool) -> float:
+    def step(label: str, compiled: bool, backend: SDPBackend | None = None) -> tuple[float, int]:
         model = Lejepa(LejepaConfig(**dump["model_config"]))
         model.load_state_dict(dump["model"])  # the pre-step weights
         model.to(device).train()
@@ -412,20 +420,29 @@ def replay_bad_batch(path: str):
         torch.set_rng_state(dump["rng_cpu"])
         if device.type == "cuda" and dump["rng_cuda"] is not None:
             torch.cuda.set_rng_state(dump["rng_cuda"], device)
-        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.amp):
-            out = model(x)
-        assert isinstance(out, LejepaOutput)
-        out.loss.backward()
+        with sdpa_kernel(backend) if backend else nullcontext():
+            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.amp):
+                out = model(x)
+            assert isinstance(out, LejepaOutput)
+            out.loss.backward()
         bad = [n for n, p in model.named_parameters() if p.grad is not None and not torch.isfinite(p.grad).all()]
-        print(f"{'compiled' if compiled else 'eager'}: loss {out.loss.item():.6f}, {len(bad)} params with non-finite grads"
-              + (f", e.g. {bad[:3]}" if bad else ""), flush=True)
-        return out.loss.item()
+        # NaN flows backward from where it starts, so the params that stay finite locate the source.
+        good = [n for n, p in model.named_parameters() if p.grad is not None and torch.isfinite(p.grad).all()]
+        print(f"{label}: loss {out.loss.item():.6f}, {len(bad)} params with non-finite grads"
+              + (f", e.g. {bad[:3]}; finite: {good}" if bad else ""), flush=True)
+        return out.loss.item(), len(bad)
 
     print(f"Replaying step {dump['step']} of {par.savedir}", flush=True)
-    compiled_loss = step(compiled=True)
-    with torch.autograd.detect_anomaly(check_nan=True):
-        eager_loss = step(compiled=False)
-    return {"compiled": compiled_loss, "eager": eager_loss}
+    try:
+        with torch.autograd.detect_anomaly(check_nan=True):
+            res = {"eager": step("eager, detect_anomaly", compiled=False)}
+    except RuntimeError as err:  # the forward traceback of the culprit op was printed as a warning just before
+        print(f"eager, detect_anomaly: {err}", flush=True)
+        res = {"eager": (math.nan, -1)}
+    for backend in [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION] * (device.type == "cuda"):
+        res[backend.name] = step(f"eager, {backend.name}", compiled=False, backend=backend)
+    res["as trained"] = step("as trained", compiled=True)
+    return res
 
 def pca(run: str):
     """PCA maps (pca_maps) of a run's latest checkpoint. Runs automatically at the end of training runs.
