@@ -91,31 +91,32 @@ def on_queue(p: Params, queue: str) -> Params:
 
 def allparams():
     params = []
-    # First long B300 training runs, with cuDNN attention off (the NaN-gradient fix, e00/nanhunt_flash) and the
-    # Linear patch embed. One full 8xB300 node each, 8 h. Same everything except width: is the 2x-wider model
-    # worth ~half the tokens at equal wall-clock? Batch held at 64 per GPU for both (loss depends on batch via
-    # SIGReg), so compare PCA maps / later evals, and loss at equal steps, not final loss.
-    # AdamW beta2 0.95 + weight decay 0.05, the recipe nanhunt_flash validates.
-    # steps_per_epoch (cosine horizon) from 1-GPU B300 speed at 96% 8-GPU scaling: ~0.20 s/step for width 512
-    # (patchembed-linear/d0; may be data-loader bound at ~2900 samples/s/node), ~0.37 s/step for 1024 (d1).
-    for i, (w, step_s) in enumerate([(512, 0.20), (1024, 0.37)]):
-        p = on_queue(Params(), "gpu_b300")
-        p.savedir = f"outdir/e00/b300-train8h/d{i}/"
+    # Is torch.compile broken on B300 for the Linear patch embed at batch 64? patchembed-linear/d1 (B300 w1024 b64)
+    # had NaN loss from step 0, and b300-train8h (B300 b64, 8 GPUs) gave NaN at step 0 then an illegal memory
+    # access, while b84 (patchembed-linear/d0) was fine, and so was an eager replay of the b64 step. 1-GPU
+    # benchmarks (71 steps), settings as patchembed-linear/d0, with flash attention (cuDNN off since nanhunt_flash).
+    # Pass: finite loss every step, step-0 loss close to d3's (eager).
+    #   d0 B300 w512  b84 cudagraphs (repeat of patchembed-linear/d0)   d1 B300 w512  b64 cudagraphs
+    #   d2 B300 w512  b64 compile(dynamic), no cudagraphs               d3 B300 w512  b64 eager
+    #   d4 B300 w1024 b64 cudagraphs (repeat of patchembed-linear/d1)   d5 H200 w512  b64 cudagraphs (B300-only?)
+    runs = [("gpu_b300", 512, 84, "cudagraphs"), ("gpu_b300", 512, 64, "cudagraphs"), ("gpu_b300", 512, 64, "dynamic"),
+            ("gpu_b300", 512, 64, "eager"), ("gpu_b300", 1024, 64, "cudagraphs"), ("gpu_h200", 512, 64, "cudagraphs")]
+    for i, (queue, w, bs, mode) in enumerate(runs):
+        p = Params()
+        p.savedir = f"outdir/e00/b300-compile/d{i}/"
+        p.queue = queue
         p.width = w
-        p.batch_size = 64
-        p.data = "hemibrain_wide"
+        p.batch_size = bs
+        p.data = "hemibrain_eb"
         p.views = "displace"
         p.patch_size = (128, 128, 128)
         p.global_size = (96, 96, 96)
         p.local_size = (64, 64, 64)
-        p.max_hours = 8.0
-        p.steps_per_epoch = int(8 * 3600 / step_s)
-        p.weight_decay = 0.05
-        p.adam_beta2 = 0.95
-        p.cudagraphs = True
+        p.compile = mode != "eager"
+        p.cudagraphs = mode == "cudagraphs"
         p.batch_views = True
-        p.n_workers = 11  # 12 cores per GPU
-        p.n_gpus = 8
+        p.n_workers = 8
+        p.n_gpus = 1
         params.append(p)
     return params
 
