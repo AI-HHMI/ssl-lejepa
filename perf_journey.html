@@ -79,7 +79,7 @@
   <h2>Per-GPU throughput, one change at a time</h2>
   <div class="card">
     <p class="chart-title">Encoder tokens per second per GPU (thousands)</p>
-    <p class="chart-sub">Unprofiled 50-step benchmark window. Bars in each phase share a setup and can be compared; phases can't be compared with each other (different GPU, or different dataset, crop sizes and view scheme). Within the H200 phase, the 1-GPU steps come first, then the same steps at 8 GPUs; the last phase is in time order. Labels on 8-GPU bars are per-GPU throughput as a percentage of the best 1-GPU run at that point. Hover a bar for details.</p>
+    <p class="chart-sub">Unprofiled 50-step benchmark window. Bars in each phase share a setup and can be compared; phases can't be compared with each other (different GPU, or different dataset, crop sizes and view scheme). Within the H200 phase, the 1-GPU steps come first, then the same steps at 8 GPUs; the last phase is in time order. Labels on 1-GPU bars are the change from the previous step; labels on 8-GPU bars are per-GPU throughput as a percentage of the matching 1-GPU run. Hover a bar for details.</p>
     <div class="legend"><span style="--c: var(--series-1)">B300</span><span style="--c: var(--series-2)">H200</span></div>
     <svg id="journey" viewBox="0 0 1160 490" role="img" aria-label="Bar chart of per-GPU throughput for each optimization step"></svg>
     <details><summary>Table view</summary><table id="journey-table"></table></details>
@@ -181,35 +181,37 @@
 
 <script>
 const S1 = "var(--series-1)", S2 = "var(--series-2)";
+// BEGIN perf_journey() data: written by e00_basic.py perf_journey(); edit the lists there, not here.
 const steps = [
-  {k: "fp32", g: 1, v: 267, hw: "B300", run: "compile-amp-tok_s/d0", d: "fp32, batch 42, 4 workers, eager. Attention on fp32 mem-efficient kernel."},
-  {k: "+ bf16", g: 1, v: 822, hw: "B300", run: "compile-amp-tok_s/d5", d: "bf16 autocast (SIGReg fp32), batch 84. cuDNN flash attention.", x: "×3.1"},
-  {k: "+ compile", g: 1, v: 935, hw: "B300", run: "compile-amp-tok_s/d7", d: "torch.compile(dynamic=True) on the encoder. Now data-loader bound (~170 samples/s).", x: "+14%"},
-  {k: "+ 8|workers", g: 1, v: 1333, hw: "B300", run: "ddp/d0 (≈ workers/d1)", d: "8 DataLoader workers: data wait gone, 88% GPU busy.", x: "+43%"},
-  {k: "DDP", g: 8, v: 1014, hw: "B300", run: "ddp/d3", d: "8×B300, 8.1M tok/s total, 76% of the 1-GPU rate per GPU.", x: "76%"},
-  {k: "new|setup", g: 1, v: 881, hw: "H200", run: "cudagraphs/d0", d: "H200, hemibrain EB 128³, displace 96³/64³, compile(dynamic), workers active through profile."},
-  {k: "+ CUDA|graphs", g: 1, v: 990, hw: "H200", run: "allreduce/d0 (≈ cudagraphs/d4)", d: "compile(mode='reduce-overhead'): replay recorded kernel sequences. 99% GPU busy.", x: "+12%"},
-  {k: "+ batch|views", g: 1, v: 1023, hw: "H200", run: "batchviews/d1", d: "2 encoder calls per step (all globals, all locals) instead of 6.", x: "+3%"},
-  {k: "+ uint8", g: 1, v: 1036, hw: "H200", run: "width-defer/d3", d: "defer_image_ops: workers ship uint8, GPU normalizes. 33.8% MFU.", x: "+1%"},
-  {k: "+ Linear|embed", g: 1, v: 1156, hw: "H200", run: "patchembed-linear/d2", d: "Patch embedding as reshape + one Linear instead of Conv3d. 37.7% MFU.", x: "+12%"},
-  {k: "DDP", g: 8, v: 759, hw: "H200", run: "cudagraphs/d7", d: "8×H200 with CUDA graphs, 72 cores. 6.07M tok/s total.", x: "77%"},
-  {k: "+ full|node", g: 8, v: 812, hw: "H200", run: "allreduce/d2", d: "12 cores/GPU → all 96 cores. 6.50M tok/s total. bf16 grad compression: no further gain.", x: "83%"},
-  {k: "+ batch|views", g: 8, v: 835, hw: "H200", run: "batchviews/d3", d: "Batched encoder calls at 8 GPUs. 6.68M tok/s total.", x: "82%"},
-  {k: "+ uint8", g: 8, v: 975, hw: "H200", run: "width-defer/d5", d: "uint8 transfer at 8 GPUs: 7.80M tok/s total, 31.8% MFU.", x: "94%"},
-  {k: "H200|setup", g: 1, v: 1501, hw: "B300", run: "b300-revisit/d0", d: "Everything from the H200 phase, on one B300. 21.5% MFU; Conv3d patch embed ~15–17% of GPU time."},
-  {k: "DDP", g: 8, v: 1437, hw: "B300", run: "b300-revisit/d1", d: "8×B300: 11.49M tok/s total, 96% of the 1-GPU rate per GPU. 20.6% MFU.", x: "96%"},
-  {k: "+ Linear|embed", g: 1, v: 2033, hw: "B300", run: "patchembed-linear/d0", d: "Patch embedding as reshape + one Linear. 29.1% MFU. Width 1024: 632 → 1,010 ktok/s, 49.3% MFU.", x: "+35%"},
+  {"k": "fp32", "g": 1, "v": 267, "hw": "B300", "run": "compile-amp-tok_s/d0", "d": "fp32, batch 42, 4 workers, eager. Attention on fp32 mem-efficient kernel."},
+  {"k": "+ bf16", "g": 1, "v": 822, "hw": "B300", "run": "compile-amp-tok_s/d5", "d": "bf16 autocast (SIGReg fp32), batch 84. cuDNN flash attention.", "x": "×3.1"},
+  {"k": "+ compile", "g": 1, "v": 935, "hw": "B300", "run": "compile-amp-tok_s/d7", "d": "torch.compile(dynamic=True) on the encoder. Now data-loader bound (~170 samples/s).", "x": "+14%"},
+  {"k": "+ 8|workers", "g": 1, "v": 1333, "hw": "B300", "run": "ddp/d0", "d": "8 DataLoader workers: data wait gone, 88% GPU busy (≈ workers/d1).", "x": "+42%"},
+  {"k": "DDP", "g": 8, "v": 1014, "hw": "B300", "run": "ddp/d3", "d": "8×B300 with DDP. 8.11M tok/s total.", "x": "76%"},
+  {"k": "new|setup", "g": 1, "v": 881, "hw": "H200", "run": "cudagraphs/d0", "d": "H200, hemibrain EB 128³, displace 96³/64³, compile(dynamic), workers active through profile."},
+  {"k": "+ CUDA|graphs", "g": 1, "v": 990, "hw": "H200", "run": "cudagraphs/d4", "d": "compile(mode='reduce-overhead'): replay recorded kernel sequences. 99% GPU busy.", "x": "+12%"},
+  {"k": "+ batch|views", "g": 1, "v": 1023, "hw": "H200", "run": "batchviews/d1", "d": "2 encoder calls per step (all globals, all locals) instead of 6. 33.4% MFU.", "x": "+3%"},
+  {"k": "+ uint8", "g": 1, "v": 1036, "hw": "H200", "run": "width-defer/d3", "d": "defer_image_ops: workers ship uint8, GPU normalizes. 33.8% MFU.", "x": "+1%"},
+  {"k": "+ Linear|embed", "g": 1, "v": 1156, "hw": "H200", "run": "patchembed-linear/d2", "d": "Patch embedding as reshape + one Linear instead of Conv3d. 37.7% MFU.", "x": "+12%"},
+  {"k": "DDP", "g": 8, "v": 759, "hw": "H200", "run": "cudagraphs/d7", "d": "8×H200 with CUDA graphs, 72 cores. 6.07M tok/s total.", "x": "77%"},
+  {"k": "+ full|node", "g": 8, "v": 812, "hw": "H200", "run": "allreduce/d2", "d": "12 cores/GPU → all 96 cores. bf16 grad compression: no further gain. 6.50M tok/s total.", "x": "82%"},
+  {"k": "+ batch|views", "g": 8, "v": 835, "hw": "H200", "run": "batchviews/d3", "d": "Batched encoder calls at 8 GPUs. 6.68M tok/s total. 27.2% MFU.", "x": "82%"},
+  {"k": "+ uint8", "g": 8, "v": 975, "hw": "H200", "run": "width-defer/d5", "d": "uint8 transfer at 8 GPUs. 7.80M tok/s total. 31.8% MFU.", "x": "94%"},
+  {"k": "H200|setup", "g": 1, "v": 1501, "hw": "B300", "run": "b300-revisit/d0", "d": "Everything from the H200 phase, on one B300. Conv3d patch embed ~15–17% of GPU time. 21.5% MFU."},
+  {"k": "DDP", "g": 8, "v": 1437, "hw": "B300", "run": "b300-revisit/d1", "d": "8×B300. 11.49M tok/s total. 20.6% MFU.", "x": "96%"},
+  {"k": "+ Linear|embed", "g": 1, "v": 2033, "hw": "B300", "run": "patchembed-linear/d0", "d": "Patch embedding as reshape + one Linear. Width 1024: see patchembed-linear/d1. 29.1% MFU.", "x": "+35%"},
 ];
-// Phases of the journey chart: a new phase starts wherever the GPU type changes.
+// One label per phase; a new phase starts wherever the GPU type changes.
 const phases = ["B300 · flyliconn, basic views", "H200 · hemibrain EB 128³, displace views", "B300 · H200 setup"];
 const scaling = [
-  {k: "B300 old · 1 GPU", v: 1.333, hw: "B300", run: "ddp/d0"},
-  {k: "B300 old · 8 GPUs", v: 8.111, hw: "B300", ideal: 8 * 1.333, run: "ddp/d3"},
-  {k: "H200 · 1 GPU", v: 1.036, hw: "H200", run: "width-defer/d3"},
-  {k: "H200 · 8 GPUs", v: 7.799, hw: "H200", ideal: 8 * 1.036, run: "width-defer/d5"},
-  {k: "B300 · 1 GPU", v: 1.501, hw: "B300", run: "b300-revisit/d0"},
-  {k: "B300 · 8 GPUs", v: 11.494, hw: "B300", ideal: 8 * 1.501, run: "b300-revisit/d1"},
+  {"k": "B300 old · 1 GPU", "v": 1.333, "hw": "B300", "run": "ddp/d0"},
+  {"k": "B300 old · 8 GPUs", "v": 8.111, "hw": "B300", "run": "ddp/d3", "ideal": 10.661},
+  {"k": "H200 · 1 GPU", "v": 1.036, "hw": "H200", "run": "width-defer/d3"},
+  {"k": "H200 · 8 GPUs", "v": 7.799, "hw": "H200", "run": "width-defer/d5", "ideal": 8.291},
+  {"k": "B300 · 1 GPU", "v": 1.501, "hw": "B300", "run": "b300-revisit/d0"},
+  {"k": "B300 · 8 GPUs", "v": 11.494, "hw": "B300", "run": "b300-revisit/d1", "ideal": 12.006},
 ];
+// END perf_journey() data
 
 const NS = "http://www.w3.org/2000/svg";
 const el = (tag, attrs, parent, text) => { const e = document.createElementNS(NS, tag); for (const a in attrs) e.setAttribute(a, attrs[a]); if (text != null) e.textContent = text; parent.appendChild(e); return e; };
