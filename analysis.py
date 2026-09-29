@@ -207,6 +207,42 @@ def run_compute(d: Path) -> tuple[int | None, float | None]:
     tflop_per_step = t["tflops_per_second"] * t["seconds_per_step"] if t.get("tflops_per_second") else None
     return steps, tflop_per_step * steps / 1e6 if tflop_per_step and steps else None
 
+def job_text(d: Path, *prefixes: str) -> str:
+    """Latest job log's text for a run dir: the first prefix with a job_<prefix>_*.log (e.g. "run", "probe"),
+    else the older job_<jobid>.log name. "" if the run dir has no job log yet (still queued)."""
+    for prefix in prefixes:
+        logs = sorted(d.glob(f"job_{prefix}_*.log"))
+        if logs:
+            return logs[-1].read_text(errors="ignore")
+    logs = sorted(d.glob("job_[0-9]*.log"))
+    return logs[-1].read_text(errors="ignore") if logs else ""
+
+def job_walltime_s(text: str) -> float | None:
+    """LSF wall-clock run time in seconds, from a job log's "Resource usage summary" footer. None if the job
+    hasn't finished (no footer yet)."""
+    m = re.search(r"Run time\s*:\s*([\d.]+) sec", text)
+    return float(m[1]) if m else None
+
+def fmt_duration(seconds: float | None) -> str | None:
+    """Wall-clock duration as e.g. "8h 13m" (minutes only past 1h; seconds only under 1m). None passes through,
+    so a missing walltime stays NaN in a table rather than becoming the string "None"."""
+    if seconds is None:
+        return None
+    m, s = divmod(round(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m" if h else f"{m}m {s}s" if m else f"{s}s"
+
+def probe_walltime_s(d: Path) -> float | None:
+    """Wall-clock time spent probing, not pretraining: a dedicated probe job's LSF run time when probe ran as its
+    own job (job_probe_*.log, e.g. probe-test/probemany), else, when probe ran inline at the end of the training
+    job (e.g. viewsizes-v2, no separate job log to read), the time from metrics.json's last write (training done)
+    to probe.json's (probe done) -- both pulled with rsync -a, so mtimes are the cluster's. None if neither applies."""
+    probe_logs = sorted(d.glob("job_probe_*.log"))
+    if probe_logs:
+        return job_walltime_s(probe_logs[-1].read_text(errors="ignore"))
+    metrics, probe = d / "metrics.json", d / "probe.json"
+    return probe.stat().st_mtime - metrics.stat().st_mtime if metrics.is_file() and probe.is_file() else None
+
 def varying_params(params: list[dict]) -> set:
     """Param names whose values differ between runs (runs without saved params are left out)."""
     known = [p for p in params if p]
@@ -226,11 +262,13 @@ def config_label(p: dict, varying: set) -> str:
         parts.append(f'x{p.get("n_gpus", 1)}')
     return " ".join(parts)
 
-def bench(sweep: str, *compare: str):
-    """A benchmark sweep, next to any reference sweeps it's compared with: a table (config, LSF outcome, training steps
-    and total compute, loss sanity, speed), loss vs step, and speed per config. EFLOP = the benchmark window's
-    TFLOP/s x s/step (FLOPs per step, all GPUs; fixed with displace views) x steps trained (metrics.json). A fast run with a NaN loss is broken, not fast (patchembed-linear/d1):
-    read status and loss first. Outputs: results/<sweep>/bench.csv, bench_loss.html, bench_speed.html."""
+def bench_rows(sweep: str, *compare: str) -> tuple[list[dict], list[dict]]:
+    """Per-run bench_table rows (config, LSF outcome, training steps, walltime, total compute, loss sanity, speed)
+    and loss curve points (one per logged metrics.json step), for a benchmark sweep next to any reference sweeps
+    it's compared with. walltime is the training job's LSF wall-clock run time (its job log's resource-usage
+    footer), not the sum of GPU-seconds across n_gpus. EFLOP is the benchmark window's TFLOP/s x s/step (FLOPs per
+    step, all GPUs; fixed with displace views) x steps trained. A fast run with a NaN loss is broken, not fast
+    (patchembed-linear/d1): read status and loss first."""
     sweeps = (sweep, *compare)
     runs = [(sweep, d) for sweep in sweeps for d in run_dirs(sweep)]
     params = {d: saved_params(d) for _, d in runs}
@@ -240,8 +278,7 @@ def bench(sweep: str, *compare: str):
         name = f"{s.split('/')[-1]}/{d.name}" if compare else d.name
         m = read_jsonl(d / "metrics.json") if (d / "metrics.json").is_file() else []
         tp = [r for r in read_jsonl(d / "performance.json") if r.get("tbl") == "throughput"] if (d / "performance.json").is_file() else []
-        logs = sorted(d.glob("job_run_*.log")) or sorted(d.glob("job_[0-9]*.log"))  # training job logs (older name)
-        text = logs[-1].read_text(errors="ignore") if logs else ""
+        text = job_text(d, "run")
         exit_code = re.search(r"Exited with exit code (\d+)", text)
         b1 = "illegal memory access" in text
         b2 = "OutOfMemoryError" in text
@@ -254,32 +291,55 @@ def bench(sweep: str, *compare: str):
         n_gpus = t.get("world_size") or params[d].get("n_gpus", 1)
         config = config_label(params[d], varying)
         steps, eflop = run_compute(d)
+        walltime = job_walltime_s(text)
         rows.append({"run": name, "config": config, "status": status, "steps": steps, "EFLOP": eflop,
+                     "walltime": fmt_duration(walltime),
                      "finite": all(l == l for l in losses) if losses else None,
                      "loss0": losses[0] if losses else None, "loss_end": sum(losses[-3:]) / len(losses[-3:]) if losses else None,
                      "ktok/s/gpu": t["tokens_per_second"] / n_gpus / 1e3 if t else None,
                      "mfu %": 100 * t["mfu"] if t.get("mfu") else None, "mem GB": t.get("max_mem_gb")})
         curves += [{"run": f"{name} {config}", "step": r["idx_step"], "loss": r["loss"]} for r in m]
+    return rows, curves
+
+def bench_table(sweep: str, *compare: str) -> pandas.DataFrame:
+    """A benchmark sweep's per-run table (bench_rows), next to any reference sweeps it's compared with.
+    Output: results/<sweep>/bench.csv."""
+    rows, _ = bench_rows(sweep, *compare)
     res = pandas.DataFrame(rows).round(3)
-    out = f"{sweep}/bench"
-    save_table(res, out)
-    if curves:
-        show(px.line(pandas.DataFrame(curves), x="step", y="loss", color="run", log_y=True,
-                     title=f"Loss per run: {', '.join(sweeps)} (a broken run is missing or diverges from its reference)"), f"{out}_loss")
-    # Crashed runs as zero-length bars, so their status still shows (text outside the bar end).
+    save_table(res, f"{sweep}/bench")
+    return res
+
+def bench_loss(sweep: str, *compare: str):
+    """Loss vs step for a benchmark sweep, next to any reference sweeps it's compared with: one line per run. A
+    broken run is missing (crashed before metrics.json) or diverges from its reference.
+    Output: results/<sweep>/bench_loss.html."""
+    sweeps = (sweep, *compare)
+    _, curves = bench_rows(sweep, *compare)
+    assert curves, f"no metrics.json in {sweeps}; run ./pull.sh?"
+    show(px.line(pandas.DataFrame(curves), x="step", y="loss", color="run", log_y=True,
+                 title=f"Loss per run: {', '.join(sweeps)} (a broken run is missing or diverges from its reference)"), f"{sweep}/bench_loss")
+
+def bench_speed(sweep: str, *compare: str):
+    """Benchmark throughput per GPU for a sweep, next to any reference sweeps it's compared with: one bar per run.
+    Crashed runs draw as zero-length bars, so their status still shows (text outside the bar end).
+    Output: results/<sweep>/bench_speed.html."""
+    sweeps = (sweep, *compare)
+    rows, _ = bench_rows(sweep, *compare)
+    res = pandas.DataFrame(rows).round(3)
     speed = res.assign(label=res["run"] + " " + res["config"], x=res["ktok/s/gpu"].fillna(0),
                        text=res["mfu %"].map(lambda v: f"{v:.0f}% MFU" if v == v else "").where(res.status == "ok", res.status))
     fig = px.bar(speed, x="x", y="label", orientation="h", text="text", color="status",
                  title=f"Benchmark throughput per GPU: {', '.join(sweeps)}")
     fig.update_traces(textposition="outside", cliponaxis=False).update_yaxes(title="", autorange="reversed")
     fig.update_xaxes(title="ktok/s per GPU", range=[0, 1.15 * max(speed.x.max(), 1)])  # room for the labels
-    show(fig, f"{out}_speed")
-    return res
+    show(fig, f"{sweep}/bench_speed")
 
 def probe_table(sweep: str) -> pandas.DataFrame:
-    """One row per run with a probe.json: config, the checkpoint step it probed, test-block boundary AP (mean of the
-    3 short-range channels, then each short and long channel) and mean short-range BCE. Higher AP is better;
-    compare against a near-random encoder's run (e.g. probe-test/d1)."""
+    """One row per run with a probe.json: config, the pretraining checkpoint step it probed, how many steps the
+    linear probe itself trained for (probe_fit.json, fixed at fit_probe's STEPS unless a run crashed mid-fit) and
+    its own walltime (probe_walltime_s: excludes pretraining), test-block boundary AP (mean of the 3 short-range
+    channels, then each short and long channel) and mean short-range BCE. Higher AP is better; compare against a
+    near-random encoder's run (e.g. probe-test/d1)."""
     dirs = [d for d in run_dirs(sweep) if (d / "probe.json").is_file()]
     assert dirs, f"no probe.json in outdir/{sweep}/d*/; run ./pull.sh?"
     params = {d: saved_params(d) for d in dirs}
@@ -287,10 +347,13 @@ def probe_table(sweep: str) -> pandas.DataFrame:
     rows = []
     for d in dirs:
         st = read_jsonl(d / "probe.json")[-1]
+        fit = read_jsonl(d / "probe_fit.json") if (d / "probe_fit.json").is_file() else []
         aps = {k.removeprefix("boundary_ap_"): v for k, v in st.items() if k.startswith("boundary_ap_(")}
         bce = [v for k, v in st.items() if k.startswith("bce_(")][:3]
+        walltime = probe_walltime_s(d)
         rows.append({"run": d.name, "config": config_label(params[d], varying) + f' steps={params[d].get("steps_per_epoch")}',
-                     "probe step": st["step"], "boundary AP short": st["boundary_ap_short"],
+                     "probe steps": fit[-1]["step"] + 1 if fit else None,
+                     "walltime": fmt_duration(walltime), "boundary AP short": st["boundary_ap_short"],
                      **{f"AP {k}": v for k, v in aps.items()}, "BCE short": sum(bce) / len(bce)})
     res = pandas.DataFrame(rows).round(3)
     save_table(res, f"{sweep}/probe")
@@ -649,15 +712,21 @@ def e00_nanhunt_flash():
 
 def e00_b300_compile():
     """Is torch.compile broken on B300 for the Linear patch embed at batch 64? (cudagraphs crash or miscompile)"""
-    bench("e00/b300-compile")
+    bench_table("e00/b300-compile")
+    bench_loss("e00/b300-compile")
+    bench_speed("e00/b300-compile")
 
 def e00_cudagraph_fix():
     """Do cudagraphs work with PatchEmbed3d out of the compiled graph (eager_patch_embed)? Compare with b300-compile."""
-    bench("e00/cudagraph-fix", "e00/b300-compile")
+    bench_table("e00/cudagraph-fix", "e00/b300-compile")
+    bench_loss("e00/cudagraph-fix", "e00/b300-compile")
+    bench_speed("e00/cudagraph-fix", "e00/b300-compile")
 
 def e00_b300_train8h_dynamic():
     """First long 8xB300 runs, width 512 vs 1024, dynamic compile."""
-    bench("e00/b300-train8h-dynamic")
+    bench_table("e00/b300-train8h-dynamic")
+    bench_loss("e00/b300-train8h-dynamic")
+    bench_speed("e00/b300-train8h-dynamic")
     loss_curves("e00/b300-train8h-dynamic")
 
 def e00_probe_test():
@@ -669,12 +738,14 @@ def e00_probe_test():
 
 def e00_viewsizes_v2():
     """View-size study with the fixed stack: training loss, probe scores per config (d0-d16 and repeats d17-d33)."""
-    # bench("e00/viewsizes-v2")
-    # loss_curves("e00/viewsizes-v2")
-    # probe_table("e00/viewsizes-v2")
-    probe_curves("e00/viewsizes-v2")
-    # probe_vs_compute("e00/viewsizes-v2", "e00/probe-test")
-    # probe_short_vs_long("e00/viewsizes-v2", "e00/probe-test")
+    # bench_table("e00/viewsizes-v2")
+    bench_loss("e00/viewsizes-v2")
+    # bench_speed("e00/viewsizes-v2")
+    # loss_curves("e00/viewsizes-v2") ## TOO SLOW
+    # probe_table("e00/viewsizes-v2") ## good
+    # probe_curves("e00/viewsizes-v2") ## info sparse
+    # probe_vs_compute("e00/viewsizes-v2", "e00/probe-test") ## only useful to show that FLOPS does not explain performance.
+    # probe_short_vs_long("e00/viewsizes-v2", "e00/probe-test") ## good
 
 if __name__ == "__main__":
     if len(sys.argv) == 1:
