@@ -282,9 +282,15 @@ def probe_table(sweep: str) -> pandas.DataFrame:
     return res
 
 def probe_curves(sweep: str):
-    """The probe's fit curve per run (training BCE every 100 steps): flat by the end means it converged."""
+    """The probe's fit curves per run, every 100 steps: training BCE, and BCE and boundary AP on held-out test-block
+    tokens. Flat by the end means the fit converged; AP is the binary boundary-vs-same-object metric."""
     res = load_table(sweep, "probe_fit.json")
-    show(px.line(res, x="step", y="loss", color="run", log_y=True, title=f"Linear probe fit: {sweep}"), f"{sweep}/probe_fit")
+    metrics = [m for m in ["loss", "held_bce", "held_boundary_ap"] if m in res]  # held_* since the held-out eval (probe-test)
+    long = res.melt(id_vars=["step", "run"], value_vars=metrics, var_name="metric")
+    fig = px.line(long, x="step", y="value", color="run", facet_row="metric", height=250 * len(metrics),
+                  category_orders={"metric": metrics}, title=f"Linear probe fit: {sweep}")
+    fig.update_yaxes(matches=None, title="").for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+    show(fig, f"{sweep}/probe_fit")
 
 # def plot2(sweep: str):
 #     """ktok/s per GPU: one bar per result row, bars grouped by n_gpus with gaps between groups, colored by width + defer_image_ops."""
@@ -543,9 +549,9 @@ def e00_b300_train8h_dynamic():
     loss_curves("e00/b300-train8h-dynamic")
 
 def e00_probe_test():
-    """First real linear affinity probe: 30 min of training (d0) vs a near-random encoder (d1). The images are in
-    outdir/e00/probe-test/d*/probe.png (EM | true boundaries | predicted boundaries)."""
-    loss_curves("e00/probe-test")
+    """Linear affinity probe on a known-good trained encoder (d0: viewsizes/d0, 8 h) vs a random one (d1), probe only:
+    fit curves (training BCE, held-out BCE and boundary AP) and test-block boundary AP per channel.
+    Images: outdir/e00/probe-test/d*/probe.png (EM | true boundaries | predicted boundaries)."""
     probe_table("e00/probe-test")
     probe_curves("e00/probe-test")
 

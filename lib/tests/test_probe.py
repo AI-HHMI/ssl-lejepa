@@ -36,11 +36,13 @@ def test_fit_probe_learns_a_linear_target():
     targets = feats @ w > 0
     valid = torch.ones_like(targets)
     valid[:, 0] = False  # an ignored column must not matter
-    head, curve = fit_probe(feats, targets, valid)
+    held = (feats[:200], targets[:200], valid[:200])  # (not really held out here; just exercising the curve)
+    head, curve = fit_probe(feats, targets, valid, held)
     with torch.no_grad():
         acc = ((head(feats) > 0) == targets)[:, 1:].float().mean()
     assert acc > 0.95
-    assert curve[0][0] == 0 and curve[-1][0] == 2999 and curve[-1][1] < curve[0][1]  # the fit curve goes down
+    assert curve[0]["step"] == 0 and curve[-1]["step"] == 2999 and curve[-1]["loss"] < curve[0]["loss"]  # goes down
+    assert curve[-1]["held_bce"] < curve[0]["held_bce"] and curve[-1]["held_boundary_ap"] > 0.9
 
 
 def test_average_precision():
@@ -81,3 +83,19 @@ def test_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch):
     assert (tmp_path / "run/probe.png").is_file() and (tmp_path / "run/probe/fit/hemibrain_eb_fit.zarr").is_dir()
     fit = [json.loads(l) for l in (tmp_path / "run/probe_fit.json").read_text().splitlines()]
     assert fit[0]["step"] == 0 and fit[-1]["step"] == 2999 and all(f["tbl"] == "probe_fit" for f in fit)
+    assert all(0 <= f["held_boundary_ap"] <= 1 and f["held_bce"] > 0 for f in fit)
+
+
+def test_load_checkpoint_init_from(tmp_path, monkeypatch):
+    monkeypatch.setattr(experiment, "lejepa_config", lambda par: LejepaConfig(n_layers=1, width=16, num_heads=2, patch_size=(4, 4, 4),
+                                                                              proj_hidden=16, proj_dim=8))
+    a, step = experiment.load_checkpoint(experiment.Params(init_from="random", n_layers=1, width=16))
+    b, _ = experiment.load_checkpoint(experiment.Params(init_from="random", n_layers=1, width=16))
+    assert step == 0 and all(torch.equal(x, y) for x, y in zip(a.state_dict().values(), b.state_dict().values()))  # seeded
+    # Another run's checkpoint: loaded into par's architecture even though its saved params differ from par's.
+    other = tmp_path / "old/d0"
+    (other / "checkpoints").mkdir(parents=True)
+    trained = {k: v + 1 if v.is_floating_point() else v for k, v in a.state_dict().items()}
+    torch.save({"step": 42, "params": {"savedir": str(other), "width": 16}, "model": trained}, other / "checkpoints/step_0000042.pt")
+    c, step = experiment.load_checkpoint(experiment.Params(savedir=str(tmp_path / "new/d0"), init_from=str(other), n_layers=1, width=16))
+    assert step == 42 and all(torch.equal(x, trained[k]) for k, x in c.state_dict().items())

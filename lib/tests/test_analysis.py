@@ -70,7 +70,8 @@ def test_probe_table_and_curves(tmp_path, monkeypatch):
         (d / "runs.json").write_text(json.dumps({"fn": "run", "params": {"queue": "gpu_h200", "width": 512, "batch_size": 64, "steps_per_epoch": steps}}) + "\n")
         st = {"tbl": "probe", "step": steps, "boundary_ap_short": ap, "boundary_ap_(1, 0, 0)": ap, "bce_(1, 0, 0)": 0.1, "bce_(0, 1, 0)": 0.3}
         (d / "probe.json").write_text(json.dumps(st) + "\n")
-        (d / "probe_fit.json").write_text("".join(json.dumps({"tbl": "probe_fit", "step": s, "loss": 1 / (s + 1)}) + "\n" for s in [0, 100]))
+        (d / "probe_fit.json").write_text("".join(json.dumps({"tbl": "probe_fit", "step": s, "loss": 1 / (s + 1), "held_bce": 0.5,
+                                                              "held_boundary_ap": ap}) + "\n" for s in [0, 100]))
     res = analysis.probe_table("e00/p")
     assert list(res["boundary AP short"]) == [0.8, 0.3] and list(res["BCE short"]) == [0.2, 0.2]
     assert res.config[1].endswith("steps=100") and "AP (1, 0, 0)" in res

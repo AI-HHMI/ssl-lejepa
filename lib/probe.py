@@ -34,14 +34,22 @@ def to_voxels(tok: Tensor, grid: tuple[int, ...], p: int) -> Tensor:
     C = tok.shape[1] // p ** 3
     return tok.reshape(gz, gy, gx, C, p, p, p).permute(3, 0, 4, 1, 5, 2, 6).reshape(C, gz * p, gy * p, gx * p)
 
-def fit_probe(feats: Tensor, targets: Tensor, valid: Tensor) -> tuple[nn.Linear, list[tuple[int, float]]]:
+def fit_probe(feats: Tensor, targets: Tensor, valid: Tensor,
+              held: tuple[Tensor, Tensor, Tensor] | None = None) -> tuple[nn.Linear, list[dict]]:
     """Linear(D, K) from frozen token features (N D) to binary token targets (N K), BCE over the valid entries.
-    Random token batches, Adam at a fixed lr; seeded, so a refit gives the same probe. Also returns the batch loss
-    every 100 steps (the fit curve: flat by the end means STEPS was enough)."""
+    Random token batches, Adam at a fixed lr; seeded, so a refit gives the same probe.
+
+    Also returns the fit curve, every 100 steps: the batch loss, and on held (feats, targets, valid of held-out
+    tokens) the BCE and the AP of predicting target 0 (for affinities: boundary, different objects). Monitoring only.
+    """
     STEPS, BATCH, LR = 3000, 4096, 1e-3
     head = nn.Linear(feats.shape[1], targets.shape[1]).to(feats.device)
     opt = torch.optim.Adam(head.parameters(), lr=LR)
     g = torch.Generator(device=feats.device).manual_seed(0)
+    entries = None
+    if held is not None:  # a fixed subset of the valid held-out (token, output) entries (AP sorts them)
+        entries = held[2].nonzero()
+        entries = entries[torch.randperm(len(entries), device=entries.device, generator=g)[:2_000_000]]
     curve = []
     for step in range(STEPS):
         i = torch.randint(len(feats), (BATCH,), device=feats.device, generator=g)
@@ -52,7 +60,14 @@ def fit_probe(feats: Tensor, targets: Tensor, valid: Tensor) -> tuple[nn.Linear,
         opt.step()
         opt.zero_grad(set_to_none=True)
         if step % 100 == 0 or step == STEPS - 1:
-            curve.append((step, loss.item()))
+            row = {"step": step, "loss": loss.item()}
+            if held is not None and entries is not None:
+                with torch.no_grad():  # the head on all held-out tokens once (a few k x K), then the sampled entries
+                    z = head(held[0].float())[entries[:, 0], entries[:, 1]]
+                    t = held[1][entries[:, 0], entries[:, 1]].float()
+                    row["held_bce"] = float(F.binary_cross_entropy_with_logits(z, t))
+                    row["held_boundary_ap"] = average_precision(-z, 1 - t)
+            curve.append(row)
     return head, curve
 
 def average_precision(scores: Tensor, labels: Tensor) -> float:

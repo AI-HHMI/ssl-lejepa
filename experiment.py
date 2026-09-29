@@ -50,6 +50,7 @@ QUEUE_ARCH = {
 # Code copied into .tmpcode/<sweep>/ at submission (runlsf); jobs import only from these. Add files here if
 # the experiment starts depending on others. Dependencies (pyproject.toml / uv.lock) are not frozen.
 SNAPSHOT_PATHS = ["experiment.py", "lib"]
+CPUS_PER_GPU = 12  # LSF slots per GPU: 8 GPUs -> all 96 cores; training processes need cores beyond the data workers
 
 @dataclass(slots=True)
 class Params:
@@ -81,6 +82,9 @@ class Params:
     grad_compress: bool = False  # DDP bf16_compress_hook: all-reduce gradients in bf16 (half the bytes)
     queue: str = "gpu_h200"  # LSF queue
     n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); batch_size and n_workers are per GPU
+
+    # evals
+    init_from: str = ""  # weights pca/probe evaluate: "" this run's checkpoint; a run dir, its latest one; "random" untrained
 
     # profiling params
     warmup_steps: int = 10
@@ -239,6 +243,7 @@ def train(n:int):
     b2 = ".tmpcode" not in Path(__file__).resolve().parts
     assert not (b1 and b2), f"LSF job running {__file__} from the shared checkout; submit via runlsf (code snapshot)"
     par : Params = allparams()[n]
+    assert not par.init_from, f"{par.savedir}: init_from={par.init_from!r} is a probe-only run (training ignores it); use probe"
     if int(os.environ.get("RANK", 0)) == 0:  # first thing, so even a run that crashes early describes itself
         record(par, "run")
     import torch
@@ -483,19 +488,28 @@ def replay_bad_batch(path: str):
     return res
 
 def load_checkpoint(par: Params):
-    """(model on the GPU if any, step) from par's latest checkpoint, for inference (pca, probe).
+    """(model on the GPU if any, step) for inference (pca, probe): the weights par.init_from names.
 
-    Inference depends on lib/, so like training it only runs for this commit's own experiment: for an older
-    sweep, go back to its commit (jj new <commit>). The checkpoint's saved params must match par.
+    "" (default): par's own latest checkpoint, whose saved params must match par. Inference depends on lib/, so
+    like training it only runs for this commit's own experiment: for an older sweep, go back to its commit.
+    A run dir (e.g. outdir/e00/viewsizes/d0): that run's latest checkpoint, loaded strictly into par's architecture,
+    so an incompatible one fails loudly (Conv3d-era patch embeds load, see PatchEmbed3d). The run dir is an
+    artifact in outdir/'s append-only log, so this is how a probe reuses a known-good older model.
+    "random": untrained weights, seeded (the baseline every trained encoder must beat). Step 0.
     """
     import torch
-    paths = sorted((Path(par.savedir) / "checkpoints").glob("step_*.pt"))
-    assert paths, f"no checkpoints in {par.savedir}"
-    ckpt = torch.load(paths[-1], map_location="cpu", weights_only=False)
-    assert json_equal(ckpt["params"], asdict(par)), f"{paths[-1]} was made by other params: run from its experiment's commit"
     model = Lejepa(lejepa_config(par))
-    model.load_state_dict(ckpt["model"])  # strict: architecture drift fails loudly
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if par.init_from == "random":
+        torch.manual_seed(0)
+        return Lejepa(lejepa_config(par)).to(device).eval(), 0
+    src = Path(par.init_from or par.savedir)
+    paths = sorted((src / "checkpoints").glob("step_*.pt")) or sorted(src.glob("checkpoint.pt"))
+    assert paths, f"no checkpoints in {src}"
+    ckpt = torch.load(paths[-1], map_location="cpu", weights_only=False)
+    if not par.init_from:
+        assert json_equal(ckpt["params"], asdict(par)), f"{paths[-1]} was made by other params: run from its experiment's commit"
+    model.load_state_dict(ckpt["model"])  # strict: architecture drift fails loudly
     return model.to(device).eval(), ckpt["step"]
 
 def pca(n:int):
@@ -604,7 +618,9 @@ def probe(n:int):
     Frozen encoder; one Linear per token from its features to mia-evals' 6 affinity channels at every voxel of its
     patch (lib.probe), fitted on HEMIBRAIN_EB_PROBE_BOXES["train"] against proofread-cell-hemibrain-v1.2. Then:
       savedir/probe.json          test-block BCE and boundary AP per channel (cheap, immediate)
-      savedir/probe_fit.json      the probe's fit curve (training BCE every 100 steps)
+      savedir/probe_fit.json      the probe's fit curve every 100 steps: training BCE, and BCE and boundary AP on
+                                  a fixed held-out sample of test-block tokens (monitoring only, nothing selects on it)
+    Weights: par.init_from (load_checkpoint): this run's checkpoint, an older run's, or random (the baseline).
       savedir/probe/{fit,test}/hemibrain_eb_{split}.zarr   mia-evals affinity artifacts, (6, X, Y, Z) float16, for
                                   `mia-evals score` with truth_kind = "instances" (reads the GT from the store)
       savedir/probe.png           test block, middle z: EM | true boundaries | predicted boundaries
@@ -642,17 +658,23 @@ def probe(n:int):
         return feats.reshape(-1, feats.shape[-1]), labels.contiguous(), em
 
     assert len(set(p)) == 1, f"patch {p} must be cubic"
+    test = block(HEMIBRAIN_EB_PROBE_BOXES["test"])  # reused for the predictions below
+    aff, valid = affinities(test[1], offsets)
+    g = torch.Generator(device=device).manual_seed(0)
+    i = torch.randperm(len(test[0]), device=device, generator=g)[:16384]  # held-out tokens, for the fit curve only
+    held = (test[0][i], to_tokens(aff, p[0])[i], to_tokens(valid, p[0])[i])
+    del aff, valid
     feats, labels, _ = block(HEMIBRAIN_EB_PROBE_BOXES["train"])
     aff, valid = affinities(labels, offsets)
     del labels
-    head, curve = fit_probe(feats, to_tokens(aff, p[0]), to_tokens(valid, p[0]))
-    del feats, aff, valid
-    (Path(par.savedir) / "probe_fit.json").write_text("".join(json.dumps({"tbl": "probe_fit", "step": s, "loss": l}) + "\n" for s, l in curve))
+    head, curve = fit_probe(feats, to_tokens(aff, p[0]), to_tokens(valid, p[0]), held)
+    del feats, aff, valid, held
+    (Path(par.savedir) / "probe_fit.json").write_text("".join(json.dumps({"tbl": "probe_fit", **c}) + "\n" for c in curve))
     run_name = "-".join(Path(par.savedir).parts[1:])  # mia-evals row name: letters, digits, _ and - only
     stats = {"tbl": "probe", "step": step, "run": run_name}
     for split in ["fit", "test"]:
         box = HEMIBRAIN_EB_PROBE_BOXES[split]
-        feats, labels, em = block(box)
+        feats, labels, em = test if split == "test" else block(box)
         with torch.no_grad():
             prob = torch.cat([torch.sigmoid(head(f.float())).half() for f in feats.split(65536)])
         grid = tuple(s // p[0] for s in labels.shape)
@@ -680,7 +702,8 @@ def probe(n:int):
                        kind="affinity", origin=(x0, y0, z0), convention="sigmoid(logit), linear probe on frozen tokens",
                        run=run_name, step=step, axes="xyz", source_path=vol.path, source_label_key=HEMIBRAIN_EB_LABELS,
                        native_box=box, annotated_box=HEMIBRAIN_EB_PROBE_ANNOTATED[split], covers_full_box=False)
-        del pred, labels
+        del pred, labels, em
+    del test
     (Path(par.savedir) / "probe.json").write_text(json.dumps(stats) + "\n")
     print(f"{par.savedir}: probe at step {step}: boundary AP (short-range mean) {stats['boundary_ap_short']:.3f}; wrote probe/", flush=True)
 
@@ -695,8 +718,6 @@ def bsub(par: Params, job: str, minutes: int, n_gpus: int, cmd: str):
     import subprocess
     name = "-".join(Path(par.savedir).parts[1:]) + f"-{job}"  # e.g. e00-nanhunt-d9-run, so bjobs shows which is which
     code = snapshot(SNAPSHOT_PATHS, Path(".tmpcode") / "-".join(Path(par.savedir).parts[1:-1]))
-    CPUS_PER_GPU = 12  # 8 GPUs -> all 96 cores; training processes need cores beyond the data workers
-    assert par.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={par.n_workers} leaves no core for the training process"
     full = f""" bsub -J {name} \
         -W {minutes // 60}:{minutes % 60:02d} \
         -P miaai \
@@ -713,6 +734,8 @@ def bsub(par: Params, job: str, minutes: int, n_gpus: int, cmd: str):
 def runlsf(n:int):
     """Train allparams()[n] on LSF, in a fresh savedir (old contents -> outdir/.trash/)."""
     par:Params = allparams()[n]
+    assert not par.init_from, f"{par.savedir}: init_from={par.init_from!r} is a probe-only run (training ignores it); submit with probemany"
+    assert par.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={par.n_workers} leaves no core for the training process"
     assert_committed()
     trash(par.savedir)
     minutes = int(par.max_hours * 60) + 60 if par.max_hours else 15  # slack: startup, final checkpoint, pca + probe
@@ -724,9 +747,15 @@ def pcalsf(n:int):
     bsub(allparams()[n], "pca", 30, 1, f"python {{code}}/experiment.py pca {n}")
 
 def probelsf(n:int):
-    """Redo probe(n) on LSF, e.g. after changing the probe in this experiment's change (run() already does it once)."""
+    """probe(n) as its own LSF job: redo a training run's probe, or a probe-only run (par.init_from set)."""
+    par = allparams()[n]
     assert_committed()
-    bsub(allparams()[n], "probe", 60, 1, f"python {{code}}/experiment.py probe {n}")
+    Path(par.savedir).mkdir(parents=True, exist_ok=True)  # a probe-only run has no training job to create it
+    bsub(par, "probe", 60, 1, f"python {{code}}/experiment.py probe {n}")
+
+def probemany():
+    for i in range(len(allparams())):
+        probelsf(i)
 
 def pcamany():
     for i in range(len(allparams())):

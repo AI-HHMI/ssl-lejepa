@@ -166,3 +166,12 @@ def test_run_trains_then_evals_training_runs_only(monkeypatch, max_hours, evals)
     monkeypatch.delenv("RANK", raising=False)
     experiment.run(0)
     assert calls == ["train", *evals]  # evals after train() has torn down the process group, benchmarks skip them
+
+
+def test_runlsf_refuses_probe_only_runs(tmp_path, monkeypatch):
+    # init_from runs are evaluated with probemany; training would silently ignore init_from and start from scratch.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(experiment, "allparams", lambda: [experiment.Params(savedir="outdir/e00/x/d0", init_from="random")])
+    with pytest.raises(AssertionError, match="probemany"):
+        experiment.runlsf(0)
+    assert not (tmp_path / "outdir").exists()  # refused before trash() or bsub
