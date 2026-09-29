@@ -558,6 +558,8 @@ def perf_journey():
                 vs_tok, vs_g, _ = perf(vs)
                 r = (tok / g) / (vs_tok / vs_g)
                 step["x"] = f"{r:.0%}" if g != vs_g else f"×{r:.1f}" if r >= 2 else f"{r - 1:+.0%}"
+                if g != vs_g:  # the 1-GPU run this bar's scaling % is against, drawn as an outline behind it
+                    step["ref"] = round(vs_tok / vs_g / 1e3)
             steps.append(step)
     nodes = []
     for k, run, hw, vs in scaling:

@@ -79,7 +79,7 @@
   <h2>Per-GPU throughput, one change at a time</h2>
   <div class="card">
     <p class="chart-title">Encoder tokens per second per GPU (thousands)</p>
-    <p class="chart-sub">Unprofiled 50-step benchmark window. Bars in each phase share a setup and can be compared; phases can't be compared with each other (different GPU, or different dataset, crop sizes and view scheme). Within the H200 phase, the 1-GPU steps come first, then the same steps at 8 GPUs; the last phase is in time order. Labels on 1-GPU bars are the change from the previous step; labels on 8-GPU bars are per-GPU throughput as a percentage of the matching 1-GPU run. Hover a bar for details.</p>
+    <p class="chart-sub">Unprofiled 50-step benchmark window. Bars in each phase share a setup and can be compared; phases can't be compared with each other (different GPU, or different dataset, crop sizes and view scheme). Within the H200 phase, the 1-GPU steps come first, then the same steps at 8 GPUs; the last phase is in time order. Labels on 1-GPU bars are the change from the previous step. Each 8-GPU bar is drawn over a dashed outline of its matching 1-GPU run (same config, one GPU), and its label is its per-GPU throughput as a percentage of that outline. Hover a bar for details.</p>
     <div class="legend"><span style="--c: var(--series-1)">B300</span><span style="--c: var(--series-2)">H200</span></div>
     <svg id="journey" viewBox="0 0 1160 490" role="img" aria-label="Bar chart of per-GPU throughput for each optimization step"></svg>
     <details><summary>Table view</summary><table id="journey-table"></table></details>
@@ -189,18 +189,18 @@ const steps = [
   {"k": "+ bf16", "g": 1, "v": 822, "hw": "B300", "run": "compile-amp-tok_s/d5", "d": "bf16 autocast (SIGReg fp32), batch 84. cuDNN flash attention.", "x": "×3.1"},
   {"k": "+ compile", "g": 1, "v": 935, "hw": "B300", "run": "compile-amp-tok_s/d7", "d": "torch.compile(dynamic=True) on the encoder. Now data-loader bound (~170 samples/s).", "x": "+14%"},
   {"k": "+ 8|workers", "g": 1, "v": 1333, "hw": "B300", "run": "ddp/d0", "d": "8 DataLoader workers: data wait gone, 88% GPU busy (≈ workers/d1).", "x": "+42%"},
-  {"k": "DDP", "g": 8, "v": 1014, "hw": "B300", "run": "ddp/d3", "d": "8×B300 with DDP. 8.11M tok/s total.", "x": "76%"},
+  {"k": "DDP", "g": 8, "v": 1014, "hw": "B300", "run": "ddp/d3", "d": "8×B300 with DDP. 8.11M tok/s total.", "x": "76%", "ref": 1333},
   {"k": "new|setup", "g": 1, "v": 881, "hw": "H200", "run": "cudagraphs/d0", "d": "H200, hemibrain EB 128³, displace 96³/64³, compile(dynamic), workers active through profile."},
   {"k": "+ CUDA|graphs", "g": 1, "v": 990, "hw": "H200", "run": "cudagraphs/d4", "d": "compile(mode='reduce-overhead'): replay recorded kernel sequences. 99% GPU busy.", "x": "+12%"},
   {"k": "+ batch|views", "g": 1, "v": 1023, "hw": "H200", "run": "batchviews/d1", "d": "2 encoder calls per step (all globals, all locals) instead of 6. 33.4% MFU.", "x": "+3%"},
   {"k": "+ uint8", "g": 1, "v": 1036, "hw": "H200", "run": "width-defer/d3", "d": "defer_image_ops: workers ship uint8, GPU normalizes. 33.8% MFU.", "x": "+1%"},
   {"k": "+ Linear|embed", "g": 1, "v": 1156, "hw": "H200", "run": "patchembed-linear/d2", "d": "Patch embedding as reshape + one Linear instead of Conv3d. 37.7% MFU.", "x": "+12%"},
-  {"k": "DDP", "g": 8, "v": 759, "hw": "H200", "run": "cudagraphs/d7", "d": "8×H200 with CUDA graphs, 72 cores. 6.07M tok/s total.", "x": "77%"},
-  {"k": "+ full|node", "g": 8, "v": 812, "hw": "H200", "run": "allreduce/d2", "d": "12 cores/GPU → all 96 cores. bf16 grad compression: no further gain. 6.50M tok/s total.", "x": "82%"},
-  {"k": "+ batch|views", "g": 8, "v": 835, "hw": "H200", "run": "batchviews/d3", "d": "Batched encoder calls at 8 GPUs. 6.68M tok/s total. 27.2% MFU.", "x": "82%"},
-  {"k": "+ uint8", "g": 8, "v": 975, "hw": "H200", "run": "width-defer/d5", "d": "uint8 transfer at 8 GPUs. 7.80M tok/s total. 31.8% MFU.", "x": "94%"},
+  {"k": "DDP", "g": 8, "v": 759, "hw": "H200", "run": "cudagraphs/d7", "d": "8×H200 with CUDA graphs, 72 cores. 6.07M tok/s total.", "x": "77%", "ref": 990},
+  {"k": "+ full|node", "g": 8, "v": 812, "hw": "H200", "run": "allreduce/d2", "d": "12 cores/GPU → all 96 cores. bf16 grad compression: no further gain. 6.50M tok/s total.", "x": "82%", "ref": 984},
+  {"k": "+ batch|views", "g": 8, "v": 835, "hw": "H200", "run": "batchviews/d3", "d": "Batched encoder calls at 8 GPUs. 6.68M tok/s total. 27.2% MFU.", "x": "82%", "ref": 1023},
+  {"k": "+ uint8", "g": 8, "v": 975, "hw": "H200", "run": "width-defer/d5", "d": "uint8 transfer at 8 GPUs. 7.80M tok/s total. 31.8% MFU.", "x": "94%", "ref": 1036},
   {"k": "H200|setup", "g": 1, "v": 1501, "hw": "B300", "run": "b300-revisit/d0", "d": "Everything from the H200 phase, on one B300. Conv3d patch embed ~15–17% of GPU time. 21.5% MFU."},
-  {"k": "DDP", "g": 8, "v": 1437, "hw": "B300", "run": "b300-revisit/d1", "d": "8×B300. 11.49M tok/s total. 20.6% MFU.", "x": "96%"},
+  {"k": "DDP", "g": 8, "v": 1437, "hw": "B300", "run": "b300-revisit/d1", "d": "8×B300. 11.49M tok/s total. 20.6% MFU.", "x": "96%", "ref": 1501},
   {"k": "+ Linear|embed", "g": 1, "v": 2033, "hw": "B300", "run": "patchembed-linear/d0", "d": "Patch embedding as reshape + one Linear (cuDNN attention). 29.1% MFU.", "x": "+35%"},
 ];
 // One label per phase; a new phase starts wherever the GPU type changes.
@@ -251,23 +251,21 @@ function axes(svg, m, W, H, ymax, ticks, fmt) {
     if (p > 0) el("line", {x1: xd, x2: xd, y1: 16, y2: m.t + H, stroke: "var(--axis)", "stroke-width": 1, "stroke-dasharray": "3 4"}, svg);
     el("text", {x: p === 0 ? m.l + 4 : xd + 10, y: 20, "font-size": 12.5, "font-weight": 600, fill: "var(--text-secondary)"}, svg, phases[p]);
   });
-  // Best 1-GPU result per phase as a dashed reference across that phase.
-  for (const [a, b] of starts.map((a, p) => [a, starts[p + 1] ?? steps.length])) {
-    const best = Math.max(...steps.slice(a, b).filter(s => s.g === 1).map(s => s.v));
-    el("line", {x1: xs[a] - 5, x2: xs[b - 1] + bw + 5, y1: yOf(best), y2: yOf(best), stroke: "var(--text-muted)", "stroke-width": 1, "stroke-dasharray": "2 3", opacity: .6}, svg);
-    el("text", {x: xs[a], y: yOf(best) - 6, "text-anchor": "start", "font-size": 11, fill: "var(--text-muted)"}, svg, "best 1-GPU");
-  }
   steps.forEach((s, i) => {
     const x = xs[i], y = yOf(s.v), h = m.t + H - y;
     const g = el("g", {tabindex: 0}, svg);
     el("rect", {x: x - 5, y: m.t, width: bw + 10, height: H, fill: "transparent"}, g); // hit target
+    if (s.ref) {  // the matching 1-GPU run, per GPU: what the scaling % is against
+      const yr = yOf(s.ref);
+      el("path", {d: topRounded(x, yr, bw, m.t + H - yr, 4), fill: "none", stroke: "var(--ghost)", "stroke-width": 2, "stroke-dasharray": "4 3"}, g);
+    }
     el("path", {d: topRounded(x, y, bw, h, 4), fill: color(s.hw)}, g);
     el("text", {x: x + bw / 2, y: y - 8, "text-anchor": "middle", "font-size": 12.5, "font-weight": 650, fill: "var(--text-primary)"}, g, s.v.toLocaleString());
     if (s.x) el("text", {x: x + bw / 2, y: y - 24, "text-anchor": "middle", "font-size": 11, fill: "var(--text-muted)"}, g, s.x);
     s.k.split("|").forEach((line, j) =>
       el("text", {x: x + bw / 2, y: m.t + H + 17 + 14 * j, "text-anchor": "middle", "font-size": 11.5, fill: "var(--text-secondary)"}, g, line));
     el("text", {x: x + bw / 2, y: m.t + H + 50, "text-anchor": "middle", "font-size": 10.5, fill: "var(--text-muted)"}, g, s.g === 8 ? "8 GPUs" : "1 GPU");
-    const html = `<b>${s.k.replace("|", " ")} · ${s.g} GPU${s.g > 1 ? "s" : ""} · ${s.v.toLocaleString()} ktok/s/GPU</b>${s.d}<br><span class="k">${s.hw} · outdir/e00/${s.run}</span>`;
+    const html = `<b>${s.k.replace("|", " ")} · ${s.g} GPU${s.g > 1 ? "s" : ""} · ${s.v.toLocaleString()} ktok/s/GPU</b>${s.d}${s.ref ? ` Matching 1-GPU run: ${s.ref.toLocaleString()} ktok/s.` : ""}<br><span class="k">${s.hw} · outdir/e00/${s.run}</span>`;
     g.addEventListener("mousemove", ev => showTip(ev, html)); g.addEventListener("mouseleave", hideTip);
     g.addEventListener("focus", () => { const r = svg.getBoundingClientRect(); showTip({clientX: r.left + (x / VW) * r.width, clientY: r.top + (y / 490) * r.height}, html); });
     g.addEventListener("blur", hideTip);
