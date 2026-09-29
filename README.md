@@ -26,7 +26,7 @@ Every piece of code is either **remote** or **local**, and depends either on **m
 
 | class | runs | depends on | examples | rule |
 |---|---|---|---|---|
-| **experiment** | remote (LSF) | `lib/` (treat all of it as mutable, `util.py` included) | `experiment.py`: `run`, `pca`, `replay_bad_batch`; submitted by `runlsf`/`pcalsf`/`replaylsf` | Only for **this commit's own `allparams()`**, run from its committed snapshot. Training, inference (`pca`) and replays of an old sweep need time travel: `jj new <its commit>`. |
+| **experiment** | remote (LSF) | `lib/` (treat all of it as mutable, `util.py` included) | `experiment.py`: `run`, `pca`, `probe`, `replay_bad_batch`; submitted by `runlsf`/`pcalsf`/`probelsf`/`replaylsf` | Only for **this commit's own `allparams()`**, run from its committed snapshot. Training, inference (`pca`) and replays of an old sweep need time travel: `jj new <its commit>`. |
 | **analysis** | local | only `outdir/` (saved artifacts); never builds a `Lejepa`: imports neither `experiment.py` nor `lib/` model code, only `lib.util`'s entrypoint CLI | `analysis.py`: `loss_curves`, `nanhunt_plot`, `flash_perf`, `perf_journey`, `check_runs` | Runs at HEAD on **any** past sweep. It depends on `lib/` only transitively, through `outdir/`, which is an append-only log. |
 | **glue** | either | neither | `jrun.sh`, `pull.sh`, `gpufree.sh` | |
 
@@ -72,6 +72,9 @@ The pattern in `experiment.py`:
   - `runs.json`: one row per experiment function that ran on this dir (`record`: `fn` = `run` / `pca` / `replay_bad_batch`). Each row has commit, subject, dirty flag and diff hash (`code_provenance`), argv and LSF job ID. The command that submitted the job is in `outdir/_log/commands.jsonl`.
     Rows from before 2026-09-28 have only `commit_id` + `diff_hash`. Their uncommitted diffs are in `outdir/_log/diffs-legacy.json`, keyed by `diff_hash`: the frozen old `_diffs/diffs.json` from the cluster.
   - `profile.json` / `profile.out`: from `torch.profiler`.
+  - `probe.json`, `probe.png`, `probe/{fit,test}/hemibrain_eb_{split}.zarr`: the linear affinity probe (`probe`, `lib/probe.py`). It runs at the end of training after `pca`.
+    - It fits one Linear per frozen token to mia-evals' 6 neuron affinities on an EB val-slab block, then predicts mia-evals' `gary_comparison` fit and test blocks (`lib/data.py` `HEMIBRAIN_EB_PROBE_BOXES`).
+    - `probe.json` holds test-block boundary AP and BCE. The `.zarr` files are mia-evals affinity artifacts for `mia-evals score` with `truth_kind = "instances"`, which reads the ground truth from the store. They stay on the cluster.
   - `trace_summary.json`: from `lib.util.trace_summary`. GPU busy fraction (union of kernel intervals) and per-phase host ms over the profiled steps.
 
 - `analysis.load_table(sweep, filename)` joins every run dir's rows with that run's saved `Params` (current defaults for fields added since) into a pandas DataFrame.

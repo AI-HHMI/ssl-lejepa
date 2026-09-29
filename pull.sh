@@ -3,9 +3,10 @@ mkdir -p outdir/
 # -i itemizes changes (--no-group: cluster groups can't be set locally, so every file looked changed); drop directory lines (cd = new dir, .d = dir timestamp) so only file changes print.
 # .trash/ holds resubmitted runs' old results (lib.util.trash), cluster-only. _log/ holds the cluster's
 # commands.jsonl (lib.util.log_command; older per-host commands-<host>.jsonl). Nothing local writes outdir/,
-# so --delete is safe.
+# so --delete is safe. *.zarr/ (probe affinity artifacts, GBs each) stay on the cluster.
 oc-rsync -azi --no-group --delete \
   --exclude='.trash/' \
+  --exclude='*.zarr/' \
   --include='*/' \
   --include='**/profile.out' \
   --exclude='**/profile.json' \

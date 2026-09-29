@@ -15,7 +15,7 @@ from itertools import product
 
 # local
 
-from lib.data import HEMIBRAIN_EB, TRAIN_BOXES
+from lib.data import HEMIBRAIN_EB, HEMIBRAIN_EB_LABELS, HEMIBRAIN_EB_PROBE_ANNOTATED, HEMIBRAIN_EB_PROBE_BOXES, TRAIN_BOXES
 from lib.benchmark import Benchmark
 from lib.losses import LejepaOutput
 from lib.models import Lejepa, LejepaConfig
@@ -400,8 +400,9 @@ def run(n:int):
                 f.write(json.dumps(row) + "\n")
         raise
     save_checkpoint(idx_step + 1)
-    if rank0 and par.max_hours:  # training runs (not benchmarks): PCA maps of the last finite checkpoint
+    if rank0 and par.max_hours:  # training runs (not benchmarks): evals of the last finite checkpoint
         pca(n)
+        probe(n)
     if world_size > 1:
         dist.destroy_process_group()
 
@@ -470,23 +471,28 @@ def replay_bad_batch(path: str):
     res["as trained"] = step("as trained", compiled=True)
     return res
 
-def pca(n:int):
-    """PCA maps (pca_maps) of allparams()[n]'s latest checkpoint. Runs at the end of training; pcalsf(n) redoes it.
+def load_checkpoint(par: Params):
+    """(model on the GPU if any, step) from par's latest checkpoint, for inference (pca, probe).
 
     Inference depends on lib/, so like training it only runs for this commit's own experiment: for an older
-    sweep, go back to its commit (jj new <commit>). The checkpoint's saved params must match allparams()[n].
+    sweep, go back to its commit (jj new <commit>). The checkpoint's saved params must match par.
     """
     import torch
-    par = allparams()[n]
     paths = sorted((Path(par.savedir) / "checkpoints").glob("step_*.pt"))
     assert paths, f"no checkpoints in {par.savedir}"
     ckpt = torch.load(paths[-1], map_location="cpu", weights_only=False)
-    assert json_equal(ckpt["params"], asdict(par)), f"{paths[-1]} was made by other params: run pca from its experiment's commit"
+    assert json_equal(ckpt["params"], asdict(par)), f"{paths[-1]} was made by other params: run from its experiment's commit"
     model = Lejepa(lejepa_config(par))
     model.load_state_dict(ckpt["model"])  # strict: architecture drift fails loudly
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return model.to(device).eval(), ckpt["step"]
+
+def pca(n:int):
+    """PCA maps (pca_maps) of allparams()[n]'s latest checkpoint. Runs at the end of training; pcalsf(n) redoes it."""
+    par = allparams()[n]
+    model, step = load_checkpoint(par)
     record(par, "pca")  # argv says whether it ran inside `run n` or on its own (pcalsf)
-    pca_maps(model.encoder.to(device), par, Path(par.savedir), ckpt["step"])
+    pca_maps(model.encoder, par, Path(par.savedir), step)
 
 def pca_maps(encoder, par: Params, savedir: Path, step: int):
     """PCA maps of patch-token embeddings on a held-out EB val crop -> savedir/pca.png, pca.json.
@@ -567,6 +573,104 @@ def pca_maps(encoder, par: Params, savedir: Path, step: int):
     print(f"{savedir}: step {step}, effective rank {erank:.1f}, top-3 variance {sum(var[:3]):.2f}, "
           f"between-tile variance {between_tile:.2f}, norm outliers (>2x median) {stats['norm_outliers']}/{norms.numel()}; wrote pca.png")
 
+def tile_features(encoder, img, tile):
+    """Encoder tokens (after its final LayerNorm) of img (Z Y X in [0, 1], on the encoder's device, a multiple of
+    tile), from non-overlapping tiles at the training global-view size, stitched: Gz Gy Gx D, bf16."""
+    import torch
+    p = encoder.patch_embed.patch_size
+    assert all(s % t == 0 for s, t in zip(img.shape, tile)), f"{tuple(img.shape)} must tile by {tile}"
+    g = [t // q for t, q in zip(tile, p)]  # tokens per tile side
+    feats = torch.empty(*(s // q for s, q in zip(img.shape, p)), encoder.embed_dim, dtype=torch.bfloat16, device=img.device)
+    with torch.no_grad(), torch.autocast(img.device.type, dtype=torch.bfloat16, enabled=img.device.type == "cuda"):
+        for z, y, x in product(*(range(0, s, t) for s, t in zip(img.shape, tile))):
+            t = encoder.forward_features(img[None, None, z:z + tile[0], y:y + tile[1], x:x + tile[2]])
+            feats[z // p[0]:z // p[0] + g[0], y // p[1]:y // p[1] + g[1], x // p[2]:x // p[2] + g[2]] = t[0].reshape(*g, -1)
+    return feats
+
+def probe(n:int):
+    """Linear affinity probe of allparams()[n]'s latest checkpoint, scored as mia-evals' neuron-instance task.
+
+    Frozen encoder; one Linear per token from its features to mia-evals' 6 affinity channels at every voxel of its
+    patch (lib.probe), fitted on HEMIBRAIN_EB_PROBE_BOXES["train"] against proofread-cell-hemibrain-v1.2. Then:
+      savedir/probe.json          test-block BCE and boundary AP per channel (cheap, immediate)
+      savedir/probe/{fit,test}/hemibrain_eb_{split}.zarr   mia-evals affinity artifacts, (6, X, Y, Z) float16, for
+                                  `mia-evals score` with truth_kind = "instances" (reads the GT from the store)
+      savedir/probe.png           test block, middle z: EM | true boundaries | predicted boundaries
+    Tokens get whole tiles of context around each 896^3 block, as in training.
+    """
+    import math
+    import torch
+    import zarr
+    from artifact import write_artifact
+    from PIL import Image
+    from lib.probe import AFFINITY_OFFSETS_XYZ, affinities, average_precision, fit_probe, to_tokens, to_voxels
+    par = allparams()[n]
+    model, step = load_checkpoint(par)
+    record(par, "probe")
+    encoder, device = model.encoder, next(model.parameters()).device
+    p = encoder.patch_embed.patch_size
+    vol = lmd.get(HEMIBRAIN_EB)
+    raw, lab = zarr.open_array(f"{vol.path}/raw/s0", mode="r"), zarr.open_array(f"{vol.path}/{HEMIBRAIN_EB_LABELS}/s0", mode="r")
+    offsets = [o[::-1] for o in AFFINITY_OFFSETS_XYZ]  # the store is x y z; the model sees z y x
+
+    def block(box):  # (token features N D, labels Z Y X, EM Z Y X) for an x y z box of the store
+        lo, size = [b[0] for b in box][::-1], [b[1] - b[0] for b in box][::-1]  # z y x
+        region = [math.ceil(s / t) * t for s, t in zip(size, par.global_size)]  # whole tiles around the box
+        m = [(r - s) // 2 for r, s in zip(region, size)]
+        assert all(mi % q == 0 for mi, q in zip(m, p)) and all(s % q == 0 for s, q in zip(size, p)), (box, region)
+        (z0, y0, x0), (zs, ys, xs) = [l - mi for l, mi in zip(lo, m)], region
+        assert min(z0, y0, x0) >= 0 and max(z0 + zs, y0 + ys, x0 + xs) <= min(raw.shape), f"{box}: context leaves the crop"
+        img = torch.from_numpy(np.asarray(raw[x0:x0 + xs, y0:y0 + ys, z0:z0 + zs])).permute(2, 1, 0).to(device).float() / 255
+        feats = tile_features(encoder, img, par.global_size)
+        t0 = [mi // q for mi, q in zip(m, p)]
+        feats = feats[t0[0]:t0[0] + size[0] // p[0], t0[1]:t0[1] + size[1] // p[1], t0[2]:t0[2] + size[2] // p[2]]
+        (bx0, bx1), (by0, by1), (bz0, bz1) = box
+        labels = torch.from_numpy(np.asarray(lab[bx0:bx1, by0:by1, bz0:bz1]).astype(np.int64)).permute(2, 1, 0).to(device)
+        em = img[m[0]:m[0] + size[0], m[1]:m[1] + size[1], m[2]:m[2] + size[2]]
+        return feats.reshape(-1, feats.shape[-1]), labels.contiguous(), em
+
+    assert len(set(p)) == 1, f"patch {p} must be cubic"
+    feats, labels, _ = block(HEMIBRAIN_EB_PROBE_BOXES["train"])
+    aff, valid = affinities(labels, offsets)
+    del labels
+    head = fit_probe(feats, to_tokens(aff, p[0]), to_tokens(valid, p[0]))
+    del feats, aff, valid
+    run_name = "-".join(Path(par.savedir).parts[1:])  # mia-evals row name: letters, digits, _ and - only
+    stats = {"tbl": "probe", "step": step, "run": run_name}
+    for split in ["fit", "test"]:
+        box = HEMIBRAIN_EB_PROBE_BOXES[split]
+        feats, labels, em = block(box)
+        with torch.no_grad():
+            prob = torch.cat([torch.sigmoid(head(f.float())).half() for f in feats.split(65536)])
+        grid = tuple(s // p[0] for s in labels.shape)
+        pred = to_voxels(prob, grid, p[0])  # C Z Y X
+        del feats, prob
+        if split == "test":  # cheap scores, on a fixed random subset of the valid edges
+            aff, valid = affinities(labels, offsets)
+            g = torch.Generator(device=device).manual_seed(0)
+            for c, o in enumerate(AFFINITY_OFFSETS_XYZ):
+                idx = valid[c].nonzero()
+                idx = idx[torch.randint(len(idx), (min(len(idx), 10_000_000),), device=device, generator=g)]
+                q, t = pred[c][tuple(idx.T)].float(), aff[c][tuple(idx.T)].float()
+                stats[f"bce_{o}"] = float(torch.nn.functional.binary_cross_entropy(q.clamp(1e-6, 1 - 1e-6), t))
+                stats[f"boundary_ap_{o}"] = average_precision(1 - q, 1 - t)  # boundary = different objects
+                stats[f"boundary_frac_{o}"] = float(1 - t.mean())
+            stats["boundary_ap_short"] = sum(stats[f"boundary_ap_{o}"] for o in AFFINITY_OFFSETS_XYZ[:3]) / 3
+            # EM | true boundaries | predicted boundaries (1 - min of the 3 short-range affinities), middle z slice
+            zm = labels.shape[0] // 2
+            row = [em[zm], 1 - aff[:3, zm].float().amin(0), 1 - pred[:3, zm].float().amin(0)]
+            gap = torch.ones(row[0].shape[0], 8, device=device)
+            Image.fromarray((torch.cat([row[0], gap, row[1], gap, row[2]], 1) * 255).byte().cpu().numpy()).save(Path(par.savedir) / "probe.png")
+            del aff, valid
+        (x0, x1), (y0, y1), (z0, z1) = box
+        write_artifact(Path(par.savedir) / "probe" / split / f"hemibrain_eb_{split}.zarr", pred.permute(0, 3, 2, 1).cpu().numpy(),
+                       kind="affinity", origin=(x0, y0, z0), convention="sigmoid(logit), linear probe on frozen tokens",
+                       run=run_name, step=step, axes="xyz", source_path=vol.path, source_label_key=HEMIBRAIN_EB_LABELS,
+                       native_box=box, annotated_box=HEMIBRAIN_EB_PROBE_ANNOTATED[split], covers_full_box=False)
+        del pred, labels
+    (Path(par.savedir) / "probe.json").write_text(json.dumps(stats) + "\n")
+    print(f"{par.savedir}: probe at step {step}: boundary AP (short-range mean) {stats['boundary_ap_short']:.3f}; wrote probe/", flush=True)
+
 def bsub(par: Params, job: str, minutes: int, n_gpus: int, cmd: str):
     """Submit `uv run <cmd>` for par's run dir to LSF as job <sweep>-<dN>-<job>, logging to savedir/job_<job>_%J.log.
 
@@ -598,13 +702,18 @@ def runlsf(n:int):
     par:Params = allparams()[n]
     assert_committed()
     trash(par.savedir)
-    minutes = int(par.max_hours * 60) + 30 if par.max_hours else 15  # 30 min slack for startup + final checkpoint
+    minutes = int(par.max_hours * 60) + 60 if par.max_hours else 15  # slack: startup, final checkpoint, pca + probe
     bsub(par, "run", minutes, par.n_gpus, f"torchrun --standalone --nproc_per_node={par.n_gpus} {{code}}/experiment.py run {n}")
 
 def pcalsf(n:int):
     """Redo pca(n) on LSF, e.g. after changing pca_maps in this experiment's change (run() already does it once)."""
     assert_committed()
     bsub(allparams()[n], "pca", 30, 1, f"python {{code}}/experiment.py pca {n}")
+
+def probelsf(n:int):
+    """Redo probe(n) on LSF, e.g. after changing the probe in this experiment's change (run() already does it once)."""
+    assert_committed()
+    bsub(allparams()[n], "probe", 60, 1, f"python {{code}}/experiment.py probe {n}")
 
 def pcamany():
     for i in range(len(allparams())):

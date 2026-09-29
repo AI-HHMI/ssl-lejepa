@@ -14,6 +14,19 @@ HEMIBRAIN_EB_BOXES = {  # [lo, hi) level-0 voxels, x y z
     "val": [[0, 5000], [0, 5000], [3000, 4000]],
     "test": [[4000, 5000], [4000, 5000], [4000, 5000]],
 }
+# Linear affinity probe (experiment.probe): 896^3 blocks of EB, [lo, hi) level-0 voxels, x y z. fit and test are
+# mia-evals' gary_comparison_neuron_instance blocks (docs/scoring_third_party_affinities.md: fit tunes the size filter,
+# test is reported); the probe itself trains on a third block in our val slab, so neither mia-evals block is its
+# training data. None of the three is in our encoder's training region (EB z < 3000).
+HEMIBRAIN_EB_LABELS = "labels/proofread-cell-hemibrain-v1.2"
+HEMIBRAIN_EB_PROBE_BOXES = {
+    "train": [[3052, 3948], [3052, 3948], [3052, 3948]],
+    "fit": [[4052, 4948], [4052, 4948], [3052, 3948]],
+    "test": [[4052, 4948], [4052, 4948], [4052, 4948]],
+}
+# mia-evals' annotated boxes around fit and test (artifact provenance: annotated_box)
+HEMIBRAIN_EB_PROBE_ANNOTATED = {"fit": [[4000, 5000], [4000, 5000], [3000, 4000]], "test": [[4000, 5000], [4000, 5000], [4000, 5000]]}
+
 # Hemibrain crops in global hemibrain voxels (x y z), 8 nm, from their catalog names and shapes:
 #   crop-001 EB   x 24000-29000  y 23000-28000  z 17000-22000   (5000^3)
 #   crop-002 11k  x 18000-29000  y 17000-28000  z 11000-22000   (11000^3, CONTAINS crop-001)
