@@ -75,7 +75,7 @@ class Params:
     compile_blocks: bool = False  # compile each transformer block separately so DDP can overlap all-reduce with backward
     defer_image_ops: bool = True  # workers ship uint8 crops; cast + normalize on the GPU (miao.finish_images)
     batch_views: bool = False  # one encoder call per group of same-shape views (2 per step with displace)
-    eager_patch_embed: bool = False  # keep PatchEmbed3d out of torch.compile (see compile_model)
+    eager_patch_embed: bool = True  # keep PatchEmbed3d out of torch.compile (see compile_model); False only to study the bug
     weight_decay: float = 0.0  # AdamW decay on weight matrices (biases/norms excluded); 0 = the original plain Adam
     adam_beta2: float = 0.999  # Adam second-moment decay; 0.999 = torch default (all runs so far), mia-muvit uses 0.95
     grad_compress: bool = False  # DDP bf16_compress_hook: all-reduce gradients in bf16 (half the bytes)
