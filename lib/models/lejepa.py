@@ -335,20 +335,12 @@ class Lejepa(nn.Module):
         self._n_encoder_params = sum(p.numel() for p in self.encoder.parameters())
         self._n_projector_params = sum(p.numel() for p in self.projector.parameters()) if self.projector is not None else 0
 
-    def encode(self, x: Tensor) -> Tensor:
-        """Encode input volume directly to embedding representations (B, width)."""
-        return self.encoder(x)
-
-    def project(self, emb: Tensor) -> Tensor:
-        """Project embedding to metric space (B, proj_dim)."""
-        if self.projector is not None:
-            return self.projector(emb)
-        return emb
-
     def encode_and_project(self, x: Tensor) -> Tensor:
         """Encode input volume and project to metric space."""
-        emb = self.encode(x)
-        return self.project(emb)
+        emb = self.encoder(x)
+        if self.projector:
+            return self.projector(emb)
+        return emb
 
     def encode_views(self, views: list[Tensor]) -> Tensor:
         """Encode and project each view (each Batch C Z Y X) -> View Batch D.
@@ -398,8 +390,7 @@ class Lejepa(nn.Module):
 
         # If views are disabled or inference mode requested, return embeddings directly
         if not return_loss or self.cfg.views == "none" or self.view_maker is None:
-            emb = self.encode(vol)
-            return self.project(emb)
+            return self.encode_and_project(vol)
 
         # Generate views if not pre-provided
         if views is not None:

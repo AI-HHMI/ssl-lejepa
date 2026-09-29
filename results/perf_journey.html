@@ -67,7 +67,7 @@
 <body>
 <main>
   <h1>The throughput journey</h1>
-  <p class="sub">ssl-lejepa · LeJEPA (invariance + SIGReg) with a 3D ViT (12 layers, width 512, 8³ patches, ~44M params) on microscopy volumes · sweeps under <code>outdir/e00/</code>, Sep 17–27 2026</p>
+  <p class="sub">ssl-lejepa · LeJEPA (invariance + SIGReg) with a 3D ViT (12 layers, width 512, 8³ patches, ~44M params) on microscopy volumes · sweeps under <code>outdir/e00/</code>, Sep 17–29 2026</p>
 
   <div class="tiles">
     <div class="card tile"><div class="num">5.0×</div><div class="lbl">single-GPU speedup on B300</div><div class="note">267 → 1,333 ktok/s</div></div>
@@ -135,6 +135,9 @@
       <li style="--c: var(--series-1)"><div class="h">Patch embedding as a Linear layer</div>
         A Conv3d with stride equal to its kernel is a matmul in disguise, but cuDNN ran it as slow implicit-GEMM kernels, worst on B300. We cut the volume into 8³ patches with a reshape and apply one <code>nn.Linear</code>. The math is the same, and old Conv3d checkpoints still load.
         <div class="res">B300 width 512: 1,501 → 2,033 ktok/s (<b>1.35×</b>, 29% MFU). H200 width 512: 1,036 → 1,156 (1.12×, 38%). A100 width 768: 242 → 262 (1.08×, 55%).</div></li>
+      <li style="--c: var(--series-1)"><div class="h">Pay for correctness: flash attention and an eager patch embed</div>
+        Two kernels were quietly wrong. cuDNN's fused attention backward returned NaN gradients on some trained weights: every "divergence" in our long runs (<code>nanhunt_flash</code>). Flash attention avoids it. Inductor's fused patchify kernel for the Linear patch embed corrupted memory under CUDA graphs at some batch sizes, crashing some runs and silently producing NaNs in others (<code>b300-compile</code>). Running the patch embed outside the compiled graph fixes it at no cost (1,425 vs 1,414 ktok/s).
+        <div class="res">B300 width 512: 2,033 → 1,425 ktok/s (<b>−30%</b>, 20% MFU), nearly all of it flash attention. H200 loses 12–21%. This is what training runs at now. Re-enabling cuDNN on B300 only, if its kernels prove safe there, would win most of it back.</div></li>
     </ol>
   </div>
 
@@ -202,6 +205,7 @@ const steps = [
   {"k": "H200|setup", "g": 1, "v": 1501, "hw": "B300", "run": "b300-revisit/d0", "d": "Everything from the H200 phase, on one B300. Conv3d patch embed ~15–17% of GPU time. 21.5% MFU."},
   {"k": "DDP", "g": 8, "v": 1437, "hw": "B300", "run": "b300-revisit/d1", "d": "8×B300. 11.49M tok/s total. 20.6% MFU.", "x": "96%", "ref": 1501},
   {"k": "+ Linear|embed", "g": 1, "v": 2033, "hw": "B300", "run": "patchembed-linear/d0", "d": "Patch embedding as reshape + one Linear (cuDNN attention). 29.1% MFU.", "x": "+35%"},
+  {"k": "safe|stack", "g": 1, "v": 1425, "hw": "B300", "run": "cudagraph-fix/d3", "d": "What training runs now: flash attention (cuDNN's backward returned NaN grads, nanhunt_flash) and the patch embed outside the compiled graph (its Triton kernel miscompiled under cudagraphs, b300-compile). Nearly all of the cost is flash. 20.4% MFU.", "x": "-30%"},
 ];
 // One label per phase; a new phase starts wherever the GPU type changes.
 const phases = ["B300 · flyliconn, basic views", "H200 · hemibrain EB 128³, displace views", "B300 · H200 setup"];

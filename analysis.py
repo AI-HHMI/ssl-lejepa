@@ -555,6 +555,9 @@ def perf_journey():
             ("H200|setup", "b300-revisit/d0", B3, None, "Everything from the H200 phase, on one B300. Conv3d patch embed ~15–17% of GPU time."),
             ("DDP", "b300-revisit/d1", B3, "b300-revisit/d0", "8×B300."),
             ("+ Linear|embed", "patchembed-linear/d0", B3, "b300-revisit/d0", "Patch embedding as reshape + one Linear (cuDNN attention)."),
+            ("safe|stack", "cudagraph-fix/d3", B3, "patchembed-linear/d0", "What training runs now: flash attention (cuDNN's "
+             "backward returned NaN grads, nanhunt_flash) and the patch embed outside the compiled graph (its Triton kernel "
+             "miscompiled under cudagraphs, b300-compile). Nearly all of the cost is flash."),
         ]),
     ]
     scaling = [  # (label, run, GPU type, 1-GPU run whose 8x is ideal)
