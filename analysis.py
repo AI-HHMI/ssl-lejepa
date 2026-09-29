@@ -181,6 +181,8 @@ def bench(sweep: str, *compare: str):
         status = ("ok" if "Successfully completed" in text else f"exit {exit_code[1]}" if exit_code else "running?") + \
                  (": illegal memory access" if b1 else ": OOM" if b2 else "")
         losses = [r["loss"] for r in m]
+        if losses and not all(l == l for l in losses):
+            status += ": NaN loss"  # finished fast on garbage (miscompile), not a working run
         t = tp[-1] if tp else {}
         n_gpus = t.get("world_size") or params[d].get("n_gpus", 1)
         config = config_label(params[d], varying)
@@ -198,7 +200,7 @@ def bench(sweep: str, *compare: str):
                      title=f"Loss per run: {', '.join(sweeps)} (a broken run is missing or diverges from its reference)"), f"{out}_loss")
     # Crashed runs as zero-length bars, so their status still shows (text outside the bar end).
     speed = res.assign(label=res["run"] + " " + res["config"], x=res["ktok/s/gpu"].fillna(0),
-                       text=res["mfu %"].map(lambda v: f"{v:.0f}% MFU" if v == v else "").where(res.status.str.startswith("ok"), res.status))
+                       text=res["mfu %"].map(lambda v: f"{v:.0f}% MFU" if v == v else "").where(res.status == "ok", res.status))
     fig = px.bar(speed, x="x", y="label", orientation="h", text="text", color="status",
                  title=f"Benchmark throughput per GPU: {', '.join(sweeps)}")
     fig.update_traces(textposition="outside", cliponaxis=False).update_yaxes(title="", autorange="reversed")
