@@ -629,7 +629,7 @@ def runmany_sequential():
 def test():
     x = lmd.all()
     for xi in x:
-        if xi.name.startswith("em-"):
+        if "em-drosophila-flyem-hemibrain/crop-001_EllipsoidBody_x24000_y23000_z17000" in xi.name:
             pprint(xi)
 
 def size():

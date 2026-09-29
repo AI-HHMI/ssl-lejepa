@@ -12,10 +12,14 @@ import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
+import lmd_catalog as lmd
 import pandas
 import plotly.express as px
 import plotly.graph_objects as go
+from lmd_catalog.catalog import DEFAULT_DATA_ROOT
+from lmd_catalog.viewers import make_neuroglancer_url, parse_neuroglancer_url, to_fileglancer_content_url
 
 from lib.util import call_entrypoint, pick_entrypoint
 
@@ -65,6 +69,51 @@ def save_table(df: pandas.DataFrame, name: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, index=False)
     print(f"{name}:\n{df.to_string(index=False)}\n")
+
+def ng_link(name: str, boxes: dict[str, list[list[int]]] | None = None) -> str:
+    """Neuroglancer (Fileglancer) link for an lmd_catalog volume, e.g. em-drosophila-flyem-cns-mito-gt-v6/crop-001_box000:
+    its raw image plus every OME-zarr label layer in <volume>.zarr/labels/. Finds labels even when
+    VolumeEntry.tracked_by is empty (public GT ingested straight into the zarr, so has_ground_truth says False).
+    Reads the label list through the local data root (LMD_DATA_ROOT, mounted); the link uses the cluster path.
+    Log in to fileglancer.int.janelia.org in that browser first, or every layer gets a 401 and shows black.
+    boxes: {label: [[x0, x1], [y0, y1], [z0, z1]]} in level-0 voxels, drawn as a bounding-box annotation layer;
+    the view centres on the first."""
+    v = lmd.get(name)
+    assert Path(v.path).is_dir(), f"{v.path} not found: mount the data root (LMD_DATA_ROOT)"
+    meta = Path(v.path) / "labels" / "zarr.json"
+    labels = json.loads(meta.read_text())["attributes"]["ome"]["labels"] if meta.is_file() else []
+    path = f"{DEFAULT_DATA_ROOT.rstrip('/')}/{name}.zarr"  # Fileglancer URLs are built from the cluster path
+    layers = [{"type": "segmentation", "name": l, "source": to_fileglancer_content_url(path, key=f"labels/{l}", zarr_version=v.zarr_version)}
+              for l in labels]
+    assert v.voxelsize and v.axes, f"{name} has no voxelsize/axes in the catalog"
+    vox = {a: [v.voxelsize[i] * 1e-9, "m"] for i, a in enumerate(v.axes)}  # one voxel, in neuroglancer's units
+    if boxes:
+        layers.append({"type": "annotation", "name": "boxes",
+                       "source": {"url": "local://annotations", "transform": {"outputDimensions": vox}},
+                       "annotations": [{"type": "axis_aligned_bounding_box", "id": str(i), "description": label,
+                                        "pointA": [b[0] for b in box], "pointB": [b[1] for b in box]}
+                                       for i, (label, box) in enumerate(boxes.items())]})
+    url = make_neuroglancer_url(path, raw_key=v.image_key, raw_name=name.split("/")[-1], raw_zarr_version=v.zarr_version,
+                                additional_layers=layers)
+    if boxes:  # centre the view on the first box
+        state = parse_neuroglancer_url(url)
+        first = next(iter(boxes.values()))
+        state |= {"dimensions": vox, "position": [(lo + hi) / 2 for lo, hi in first]}
+        url = url.split("#!", 1)[0] + "#!" + quote(json.dumps(state, separators=(",", ":")))
+    print(f"{name}: raw + {len(labels)} label layers {labels}" + (f" + boxes {list(boxes)}" if boxes else "") + f"\n{url}")
+    return url
+
+def ng_mia_evals_hemibrain() -> str:
+    """Hemibrain EB crop-001 with mia-evals' neuron-instance GT boxes (labels/proofread-cell-hemibrain-v1.2) and our
+    own EB train/val/test split, to see what each eval scores and whether it overlaps our training data.
+    Boxes copied from ~/proj/mia-evals configs/*/data/*.yaml (2026-09-29) and lib/data.py HEMIBRAIN_EB_BOXES."""
+    return ng_link("em-drosophila-flyem-hemibrain/crop-001_EllipsoidBody_x24000_y23000_z17000", {
+        "mia-evals gary_comparison test": [[4000, 5000], [4000, 5000], [4000, 5000]],  # = our test box
+        "mia-evals gary_comparison fit": [[4000, 5000], [4000, 5000], [3000, 4000]],  # inside our val slab
+        "mia-evals lmd_ssl_v1 fit": [[1988, 3012], [1988, 3012], [1988, 3012]],  # mostly in our train region
+        "ssl-lejepa EB train": [[0, 5000], [0, 5000], [0, 3000]],
+        "ssl-lejepa EB val": [[0, 5000], [0, 5000], [3000, 4000]],
+    })
 
 def show(fig, name: str):
     """Display a plotly figure and keep a copy at results/<name>.html, e.g. name = e00/nanhunt_plot."""

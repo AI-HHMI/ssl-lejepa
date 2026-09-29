@@ -45,6 +45,21 @@ def test_bench_reports_crashes_with_short_config(tmp_path, monkeypatch):
     assert (tmp_path / "results/e00/b/bench.csv").is_file() and shown == ["e00/b/bench_loss", "e00/b/bench_speed"]
 
 
+def test_ng_link_lists_zarr_label_layers(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    vol = tmp_path / "ds/crop-001.zarr"
+    (vol / "labels").mkdir(parents=True)
+    (vol / "labels/zarr.json").write_text(json.dumps({"attributes": {"ome": {"labels": ["seg-a", "mito-b"]}}}))
+    monkeypatch.setattr(analysis.lmd, "get", lambda name: SimpleNamespace(path=str(vol), image_key="raw", zarr_version="zarr3",
+                                                                          voxelsize=[8.0, 8.0, 8.0], axes=["x", "y", "z"]))
+    url = analysis.ng_link("ds/crop-001")
+    assert "seg-a" in url and "mito-b" in url and "groups_miaai_miaai" in url  # cluster path, not the local mount
+    state = analysis.parse_neuroglancer_url(analysis.ng_link("ds/crop-001", {"test": [[40, 50], [0, 10], [4, 6]]}))
+    box = state["layers"][-1]["annotations"][0]
+    assert box["pointA"] == [40, 0, 4] and box["pointB"] == [50, 10, 6] and state["position"] == [45, 5, 5]
+    assert state["dimensions"]["x"] == [8e-9, "m"]
+
+
 def test_show_writes_results(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     fig = px.line(x=[0, 1], y=[1, 0])

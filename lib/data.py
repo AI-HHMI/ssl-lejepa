@@ -25,7 +25,9 @@ HEMIBRAIN_003 = "em-drosophila-flyem-hemibrain/crop-003_10k_x8000_y17000_z11000"
 
 # Training volumes per TrainData choice: catalog name -> [lo, hi) level-0 box in that crop, x y z.
 TRAIN_BOXES: dict[TrainData, dict[str, list[list[int]]]] = {
-    "hemibrain_eb": {HEMIBRAIN_EB: HEMIBRAIN_EB_BOXES["train"]},  # 75 Gvox
+    "hemibrain_eb": {
+        HEMIBRAIN_EB: HEMIBRAIN_EB_BOXES["train"]
+    },  # 75 Gvox
     "hemibrain_wide": {  # ~2.1 Tvox, EB train included via crop-002
         HEMIBRAIN_002: [[0, 11000], [0, 11000], [0, 9000]],
         HEMIBRAIN_003: [[0, 10000], [0, 10000], [0, 10000]],
