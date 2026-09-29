@@ -55,10 +55,11 @@ def run_dirs(sweep: str) -> list[Path]:
 
 def saved_params(d: Path) -> dict:
     """A run's own params: runs.json (written first thing, so crashed runs have it too), else performance.json
-    (runs from before runs.json had params), else {}."""
+    (runs from before runs.json had params), else {}. The newest row: a dir's rows agree on params except where an
+    older job predates a field (e.g. a probe row from before init_from)."""
     for name in ["runs.json", "performance.json"]:
         f = d / name
-        found = next((r["params"] for r in read_jsonl(f) if "params" in r), None) if f.is_file() else None
+        found = next((r["params"] for r in reversed(read_jsonl(f)) if "params" in r), None) if f.is_file() else None
         if found:
             return found
     return {}
@@ -194,6 +195,16 @@ def loss_curves(sweep: str):
                  hover_data=["width", "batch_size", "queue"], markers=True, log_y=True,
                  category_orders={"batch_size": sorted(res.batch_size.unique())}), f"{sweep}/loss_curves")
 
+def run_compute(d: Path) -> tuple[int | None, float | None]:
+    """(training steps, total EFLOP) of a run dir: the last logged step in metrics.json + 1, times FLOPs per step from
+    the benchmark window (TFLOP/s x s/step, all GPUs; fixed with displace views). None where a file is missing."""
+    m = read_jsonl(d / "metrics.json") if (d / "metrics.json").is_file() else []
+    tp = [r for r in read_jsonl(d / "performance.json") if r.get("tbl") == "throughput"] if (d / "performance.json").is_file() else []
+    steps = m[-1]["idx_step"] + 1 if m else None
+    t = tp[-1] if tp else {}
+    tflop_per_step = t["tflops_per_second"] * t["seconds_per_step"] if t.get("tflops_per_second") else None
+    return steps, tflop_per_step * steps / 1e6 if tflop_per_step and steps else None
+
 def varying_params(params: list[dict]) -> set:
     """Param names whose values differ between runs (runs without saved params are left out)."""
     known = [p for p in params if p]
@@ -214,8 +225,9 @@ def config_label(p: dict, varying: set) -> str:
     return " ".join(parts)
 
 def bench(sweep: str, *compare: str):
-    """A benchmark sweep, next to any reference sweeps it's compared with: a table (config, LSF outcome, loss sanity,
-    speed), loss vs step, and speed per config. A fast run with a NaN loss is broken, not fast (patchembed-linear/d1):
+    """A benchmark sweep, next to any reference sweeps it's compared with: a table (config, LSF outcome, training steps
+    and total compute, loss sanity, speed), loss vs step, and speed per config. EFLOP = the benchmark window's
+    TFLOP/s x s/step (FLOPs per step, all GPUs; fixed with displace views) x steps trained (metrics.json). A fast run with a NaN loss is broken, not fast (patchembed-linear/d1):
     read status and loss first. Outputs: results/<sweep>/bench.csv, bench_loss.html, bench_speed.html."""
     sweeps = (sweep, *compare)
     runs = [(sweep, d) for sweep in sweeps for d in run_dirs(sweep)]
@@ -239,7 +251,8 @@ def bench(sweep: str, *compare: str):
         t = tp[-1] if tp else {}
         n_gpus = t.get("world_size") or params[d].get("n_gpus", 1)
         config = config_label(params[d], varying)
-        rows.append({"run": name, "config": config, "status": status,
+        steps, eflop = run_compute(d)
+        rows.append({"run": name, "config": config, "status": status, "steps": steps, "EFLOP": eflop,
                      "finite": all(l == l for l in losses) if losses else None,
                      "loss0": losses[0] if losses else None, "loss_end": sum(losses[-3:]) / len(losses[-3:]) if losses else None,
                      "ktok/s/gpu": t["tokens_per_second"] / n_gpus / 1e3 if t else None,
@@ -280,6 +293,43 @@ def probe_table(sweep: str) -> pandas.DataFrame:
     res = pandas.DataFrame(rows).round(3)
     save_table(res, f"{sweep}/probe")
     return res
+
+def probe_vs_compute(sweep: str, *compare: str):
+    """Probe boundary AP vs total training compute, one point per probed run of sweep and any compare sweeps, for
+    short-range (+1 voxel: membranes) and long-range (+10: same neuron?) affinities. A probe-only run (init_from a run
+    dir) is placed at its source run's compute; init_from random is the dashed baseline in each panel."""
+    CHANNELS = {"short (+1)": ["(1, 0, 0)", "(0, 1, 0)", "(0, 0, 1)"], "long (+10)": ["(10, 0, 0)", "(0, 10, 0)", "(0, 0, 10)"]}
+    points, random = [], {}
+    for sw in (sweep, *compare):
+        for d in run_dirs(sw):
+            if not (d / "probe.json").is_file():
+                continue
+            st = read_jsonl(d / "probe.json")[-1]
+            ap = {r: sum(st[f"boundary_ap_{c}"] for c in chans) / 3 for r, chans in CHANNELS.items()}
+            init = saved_params(d).get("init_from", "")
+            if init == "random":
+                random = ap
+                continue
+            src = Path(init) if init else d  # a probe-only run's compute is its source run's
+            p = saved_params(src)
+            steps, eflop = run_compute(src)
+            label = f'{p["patch_size"][0]}/{p["global_size"][0]}/{p["local_size"][0]} w{p["width"]}' + (f' x{p["n_gpus"]}' if p.get("n_gpus", 1) > 1 else "")
+            points += [{"range": r, "AP": v, "EFLOP": eflop, "steps": steps, "run": f"{sw.split('/')[-1]}/{d.name}", "config": label,
+                        "source": "/".join(src.parts[-2:]), "sweep": sw.split("/")[-1] if not init else "/".join(src.parts[-2:-1])} for r, v in ap.items()]
+    assert points, f"no probe.json in {(sweep, *compare)}; run ./pull.sh?"
+    res = pandas.DataFrame(points)
+    res["label"] = res.config.where(res.sweep != sweep.split("/")[-1], "")  # name only the reference models; hover the rest
+    fig = px.scatter(res, x="EFLOP", y="AP", color="sweep", facet_col="range", text="label", log_x=True,
+                     hover_data=["config", "run", "source", "steps"], category_orders={"range": list(CHANNELS)},
+                     title=f"Linear-probe boundary AP vs training compute: {', '.join((sweep, *compare))}")
+    fig.update_traces(textposition="top center", textfont_size=10).update_yaxes(matches=None, showticklabels=True)
+    fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+    lo, hi = res.EFLOP.min() * 0.8, res.EFLOP.max() * 1.25
+    for col, r in enumerate(CHANNELS, start=1):
+        if r in random:  # dashed line across the panel
+            fig.add_scatter(x=[lo, hi], y=[random[r]] * 2, mode="lines", line=dict(dash="dash", color="gray"),
+                            name="random encoder", showlegend=col == 1, row=1, col=col)
+    show(fig, f"{sweep}/probe_vs_compute")
 
 def probe_curves(sweep: str):
     """The probe's fit curves per run, every 100 steps: training BCE, and BCE and boundary AP on held-out test-block
@@ -561,6 +611,7 @@ def e00_viewsizes_v2():
     loss_curves("e00/viewsizes-v2")
     probe_table("e00/viewsizes-v2")
     probe_curves("e00/viewsizes-v2")
+    probe_vs_compute("e00/viewsizes-v2", "e00/probe-test")
 
 if __name__ == "__main__":
     if len(sys.argv) == 1:

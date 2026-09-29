@@ -33,12 +33,14 @@ def test_bench_reports_crashes_with_short_config(tmp_path, monkeypatch):
         (d / "runs.json").write_text(json.dumps({"fn": "run", "params": {**base, "batch_size": bs, "savedir": str(d)}}) + "\n")
     legacy.mkdir(parents=True)  # crashed before runs.json had params
     (ok / "metrics.json").write_text("".join(json.dumps({"idx_step": s, "loss": l}) + "\n" for s, l in [(0, 2.0), (10, 1.5)]))
-    (ok / "performance.json").write_text(json.dumps({"tbl": "throughput", "tokens_per_second": 2e6, "world_size": 2, "mfu": 0.2}) + "\n")
+    (ok / "performance.json").write_text(json.dumps({"tbl": "throughput", "tokens_per_second": 2e6, "world_size": 2, "mfu": 0.2,
+                                                     "tflops_per_second": 500.0, "seconds_per_step": 0.4}) + "\n")
     (ok / "job_run_1.log").write_text("...\nSuccessfully completed.\n")
     for d in [crashed, legacy]:
         (d / "job_run_2.log").write_text("CUDA error: an illegal memory access was encountered\nExited with exit code 1.\n")
     res = analysis.bench("e00/b")
-    assert list(res.columns) == ["run", "config", "status", "finite", "loss0", "loss_end", "ktok/s/gpu", "mfu %", "mem GB"]
+    assert list(res.columns) == ["run", "config", "status", "steps", "EFLOP", "finite", "loss0", "loss_end", "ktok/s/gpu", "mfu %", "mem GB"]
+    assert res.steps[0] == 11 and abs(res.EFLOP[0] - 500 * 0.4 * 11 / 1e6) < 1e-3  # last logged idx_step 10 -> 11 steps
     assert list(res.config) == ["B300 w512 b84 cudagraphs+eager-pe", "B300 w512 b64 cudagraphs+eager-pe", "? (no saved params)"]
     assert list(res.status) == ["ok", "exit 1: illegal memory access", "exit 1: illegal memory access"]
     assert res["ktok/s/gpu"][0] == 1000 and res.finite[0] and res.loss_end[0] == 1.75
@@ -77,6 +79,29 @@ def test_probe_table_and_curves(tmp_path, monkeypatch):
     assert res.config[1].endswith("steps=100") and "AP (1, 0, 0)" in res
     analysis.probe_curves("e00/p")
     assert shown == ["e00/p/probe_fit"] and (tmp_path / "results/e00/p/probe.csv").is_file()
+
+
+def test_probe_vs_compute(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    figs = []
+    monkeypatch.setattr(analysis, "show", lambda fig, name: figs.append((fig, name)))
+    ap = lambda v: {f"boundary_ap_{c}": v for c in ["(1, 0, 0)", "(0, 1, 0)", "(0, 0, 1)", "(10, 0, 0)", "(0, 10, 0)", "(0, 0, 10)"]}
+    arch = {"patch_size": [128] * 3, "global_size": [96] * 3, "local_size": [64] * 3, "width": 512}
+    trained, probed, rand = (tmp_path / f"outdir/e00/{s}/d0" for s in ["train", "probe", "rand"])
+    for d, params, v in [(trained, arch, 0.6), (probed, {**arch, "init_from": str(trained.relative_to(tmp_path))}, 0.7),
+                         (rand, {**arch, "init_from": "random"}, 0.4)]:
+        d.mkdir(parents=True)
+        (d / "runs.json").write_text(json.dumps({"fn": "run", "params": {"savedir": "old"}}) + "\n"
+                                     + json.dumps({"fn": "probe", "params": params}) + "\n")  # the newest row counts
+        (d / "probe.json").write_text(json.dumps(ap(v)) + "\n")
+    (trained / "metrics.json").write_text(json.dumps({"idx_step": 99, "loss": 1.0}) + "\n")
+    (trained / "performance.json").write_text(json.dumps({"tbl": "throughput", "tflops_per_second": 1e3, "seconds_per_step": 0.5}) + "\n")
+    analysis.probe_vs_compute("e00/train", "e00/probe", "e00/rand")
+    (fig, name), = figs
+    pts = [t for t in fig.data if t.mode == "markers+text"]
+    assert {round(x, 6) for t in pts for x in t.x} == {0.05}  # 100 steps x 500 TFLOP = 0.05 EFLOP, for both
+    assert sorted({round(y, 6) for t in pts for y in t.y}) == [0.6, 0.7]  # random is a baseline, not a point
+    assert [round(t.y[0], 6) for t in fig.data if t.mode == "lines"] == [0.4, 0.4] and name == "e00/train/probe_vs_compute"
 
 
 def test_show_writes_results(tmp_path, monkeypatch):
