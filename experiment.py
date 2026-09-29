@@ -100,33 +100,46 @@ def on_queue(p: Params, queue: str) -> Params:
 
 def allparams():
     params = []
-    # Is torch.compile broken on B300 for the Linear patch embed at batch 64? patchembed-linear/d1 (B300 w1024 b64)
-    # had NaN loss from step 0, and b300-train8h (B300 b64, 8 GPUs) gave NaN at step 0 then an illegal memory
-    # access, while b84 (patchembed-linear/d0) was fine, and so was an eager replay of the b64 step. 1-GPU
-    # benchmarks (71 steps), settings as patchembed-linear/d0, with flash attention (cuDNN off since nanhunt_flash).
-    # Pass: finite loss every step, step-0 loss close to d3's (eager).
-    #   d0 B300 w512  b84 cudagraphs (repeat of patchembed-linear/d0)   d1 B300 w512  b64 cudagraphs
-    #   d2 B300 w512  b64 compile(dynamic), no cudagraphs               d3 B300 w512  b64 eager
-    #   d4 B300 w1024 b64 cudagraphs (repeat of patchembed-linear/d1)   d5 H200 w512  b64 cudagraphs (B300-only?)
-    runs = [("gpu_b300", 512, 84, "cudagraphs"), ("gpu_b300", 512, 64, "cudagraphs"), ("gpu_b300", 512, 64, "dynamic"),
-            ("gpu_b300", 512, 64, "eager"), ("gpu_b300", 1024, 64, "cudagraphs"), ("gpu_h200", 512, 64, "cudagraphs")]
-    for i, (queue, w, bs, mode) in enumerate(runs):
-        p = Params()
-        p.savedir = f"outdir/e00/b300-compile/d{i}/"
-        p.queue = queue
-        p.width = w
-        p.batch_size = bs
-        p.data = "hemibrain_eb"
-        p.views = "displace"
-        p.patch_size = (128, 128, 128)
-        p.global_size = (96, 96, 96)
-        p.local_size = (64, 64, 64)
-        p.compile = mode != "eager"
-        p.cudagraphs = mode == "cudagraphs"
-        p.batch_views = True
-        p.n_workers = 8
-        p.n_gpus = 1
-        params.append(p)
+    # View-size study, again: the 17 (input, global, local) configs of e00/viewsizes, one B300 each, 8 h, now with the
+    # fixes: flash attention (e00/viewsizes lost every large-input and small-local config to cuDNN NaNs at 5-18k steps
+    # while the rest ran 44-72k), the eager patch embed under cudagraphs, AdamW 0.95/0.05 (nanhunt_flash's recipe).
+    # Every run ends with pca and probe (boundary AP on mia-evals' blocks): the downstream metric viewsizes lacked.
+    # Two repeats (d0-d16, d17-d33: same config, different data draws) measure run-to-run noise, never measured yet,
+    # without which differences between configs can't be read.
+    base = (128, 96, 64)
+    configs = [base]  # same order as e00/viewsizes
+    configs += [(p, 96, 64) for p in [104, 160, 192, 256]]  # input patch: room for globals to move
+    configs += [(128, g, 64) for g in [64, 80, 112, 128]]  # global view size
+    configs += [(128, 96, l) for l in [32, 48, 80, 96]]  # local view size
+    configs += [(96, 64, 32), (160, 128, 80), (192, 144, 96), (256, 192, 128)]  # all scaled together
+    tokens = lambda g, l: 2 * (g // 8) ** 3 + 4 * (l // 8) ** 3  # per sample: 2 globals + 4 locals, 8^3 patches
+    # Model FLOPs per sample, relative units: 6 x ~38M encoder params per token + 12 x depth x width x N attention.
+    flops = lambda g, l: sum(k * (n * (6 * 38.1e6 + 12 * 12 * 512 * n)) for k, n in [(2, (g // 8) ** 3), (4, (l // 8) ** 3)])
+    for rep in range(2):
+        for c, (inp, g, l) in enumerate(configs):
+            p = Params()
+            p.savedir = f"outdir/e00/viewsizes-v2/d{rep * len(configs) + c}/"
+            p.data = "hemibrain_wide"
+            p.views = "displace"
+            p.patch_size = (inp, inp, inp)
+            p.global_size = (g, g, g)
+            p.local_size = (l, l, l)
+            # Tokens per step about constant (GPU memory): the baseline's 84 x 5504. Multiple of 4, capped at 2x.
+            p.batch_size = min(168, max(8, 4 * round(84 * tokens(*base[1:]) / tokens(g, l) / 4)))
+            # Cosine horizon = expected steps in 8 h: the baseline's ~0.32 s/step on one B300 (cudagraph-fix/d3: 1425
+            # ktok/s at b84, flash + eager-pe cudagraphs) scaled by FLOPs per step. Data-loading-bound configs (large
+            # inputs, big batches: ~260 samples/s per GPU measured) run slower; max_hours stops them regardless.
+            step_s = 0.32 * (p.batch_size * flops(g, l)) / (84 * flops(*base[1:]))
+            p.steps_per_epoch = int(8 * 3600 / step_s)
+            p.max_hours = 8.0
+            p.weight_decay = 0.05
+            p.adam_beta2 = 0.95
+            p.cudagraphs = True
+            p.batch_views = True
+            p.n_workers = 11  # 12 cores per GPU
+            p.n_gpus = 1
+            p.queue = "gpu_b300"
+            params.append(p)
     return params
 
 def record(par: Params, fn: str):

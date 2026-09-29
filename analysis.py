@@ -555,6 +555,13 @@ def e00_probe_test():
     probe_table("e00/probe-test")
     probe_curves("e00/probe-test")
 
+def e00_viewsizes_v2():
+    """View-size study with the fixed stack: training loss, probe scores per config (d0-d16 and repeats d17-d33)."""
+    bench("e00/viewsizes-v2")
+    loss_curves("e00/viewsizes-v2")
+    probe_table("e00/viewsizes-v2")
+    probe_curves("e00/viewsizes-v2")
+
 if __name__ == "__main__":
     if len(sys.argv) == 1:
         pick_entrypoint()
