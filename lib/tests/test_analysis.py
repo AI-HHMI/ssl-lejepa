@@ -104,6 +104,21 @@ def test_probe_vs_compute(tmp_path, monkeypatch):
     assert [round(t.y[0], 6) for t in fig.data if t.mode == "lines"] == [0.4, 0.4] and name == "e00/train/probe_vs_compute"
 
 
+def test_mia_evals_table(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    for i, pq in enumerate([0.12, 0.05]):
+        d = tmp_path / f"outdir/e00/s/d{i}"
+        (d / "mia_evals/gary_comparison_neuron_instance/records").mkdir(parents=True)
+        (d / "runs.json").write_text(json.dumps({"fn": "run", "params": {"queue": "gpu_h200", "width": 512 * (i + 1), "batch_size": 64}}) + "\n")
+        rec = {"route": "mws", "postprocess": {"describe": "mws(min_size=5000)"},
+               "scores": {"voxel_instance": {"pq": pq, "voi_split": 1.0, "voi_merge": 2.0, "adapted_rand_error": 0.7,
+                                             "instances_predicted": 700.0, "instances_truth": 2806.0}}}
+        (d / "mia_evals/gary_comparison_neuron_instance/records/run.mws.json").write_text(json.dumps(rec))
+    res = analysis.mia_evals_table("e00/s")
+    assert list(res.pq) == [0.12, 0.05] and list(res.instances) == ["700/2806"] * 2
+    assert res.config[1].startswith("H200 w1024") and (tmp_path / "results/e00/s/mia_evals.csv").is_file()
+
+
 def test_show_writes_results(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     fig = px.line(x=[0, 1], y=[1, 0])

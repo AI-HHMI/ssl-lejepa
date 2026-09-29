@@ -99,3 +99,46 @@ def test_load_checkpoint_init_from(tmp_path, monkeypatch):
     torch.save({"step": 42, "params": {"savedir": str(other), "width": 16}, "model": trained}, other / "checkpoints/step_0000042.pt")
     c, step = experiment.load_checkpoint(experiment.Params(savedir=str(tmp_path / "new/d0"), init_from=str(other), n_layers=1, width=16))
     assert step == 42 and all(torch.equal(x, trained[k]) for k, x in c.state_dict().items())
+
+
+def test_scoring_config_loads_with_instances_truth():
+    from config import load_scoring_config  # mia-evals' own loader
+    from pathlib import Path
+    c = load_scoring_config(Path(experiment.__file__).parent / experiment.SCORE_CONFIG)
+    assert c.task.kwargs["truth_kind"] == "instances"  # GT read from the store, no .gt.zarr copies
+    assert [v.name for v in c.volumes] == ["hemibrain_eb_test"] and [v.name for v in c.fit_volumes or ()] == ["hemibrain_eb_fit"]
+    assert c.volumes[0].bounding_box == ((4000, 5000),) * 3 and c.volumes[0].label_key == experiment.HEMIBRAIN_EB_LABELS
+
+
+def test_score_runs_mia_evals_on_the_probe_artifacts(tmp_path, monkeypatch):
+    par = experiment.Params(savedir=str(tmp_path / "run"))
+    for split in ["fit", "test"]:
+        (tmp_path / "run/probe" / split).mkdir(parents=True)
+    monkeypatch.setattr(experiment, "allparams", lambda: [par])
+    monkeypatch.setattr(experiment, "code_provenance", lambda: {"commit_id": "abc123"})
+    calls = []
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", lambda cmd, check: calls.append(cmd))
+    experiment.score(0)
+    (cmd,) = calls
+    assert cmd[0].endswith("mia-evals") and cmd[1] == "score" and cmd[2].endswith(experiment.SCORE_CONFIG)
+    args = dict(zip(cmd[3::2], cmd[4::2]))
+    assert args["--test"] == str(tmp_path / "run/probe/test") and args["--val"] == str(tmp_path / "run/probe/fit")
+    assert args["--leaderboard"] == str(tmp_path / "run/mia_evals") and "--no-scored" in cmd
+    assert (tmp_path / "run/git_commit.txt").read_text() == "abc123\n"  # copied into the record by --run-dir
+    assert json.loads((tmp_path / "run/resolved_config.json").read_text())["savedir"] == par.savedir
+
+
+def test_scorelsf_submits_a_cpu_job(tmp_path, monkeypatch):
+    par = experiment.Params(savedir=str(tmp_path / "run"))
+    (tmp_path / "run/probe/test").mkdir(parents=True)
+    monkeypatch.setattr(experiment, "allparams", lambda: [par])
+    monkeypatch.setattr(experiment, "assert_committed", lambda: None)
+    monkeypatch.setattr(experiment, "snapshot", lambda paths, dest: tmp_path / "code")
+    submitted = []
+    import subprocess
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: submitted.append(cmd))
+    experiment.scorelsf(0)
+    (cmd,) = submitted
+    assert f"-q {experiment.SCORE_QUEUE}" in cmd and f"-n {experiment.SCORE_SLOTS}" in cmd and "-gpu" not in cmd
+    assert "experiment.py score 0" in cmd and "job_score_%J.log" in cmd

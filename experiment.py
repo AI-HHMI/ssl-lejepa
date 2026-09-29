@@ -49,8 +49,12 @@ QUEUE_ARCH = {
  
 # Code copied into .tmpcode/<sweep>/ at submission (runlsf); jobs import only from these. Add files here if
 # the experiment starts depending on others. Dependencies (pyproject.toml / uv.lock) are not frozen.
-SNAPSHOT_PATHS = ["experiment.py", "lib"]
+SNAPSHOT_PATHS = ["experiment.py", "lib", "mia_evals"]
 CPUS_PER_GPU = 12  # LSF slots per GPU: 8 GPUs -> all 96 cores; training processes need cores beyond the data workers
+# mia-evals scoring (score): CPU only. mia-evals: ~1 h and ~200 GB peak for the mutex watershed at 896^3, "give it a
+# whole node". The shortest CPU queue; check its run limit and memory per slot with `bqueues -l short`.
+SCORE_QUEUE, SCORE_SLOTS, SCORE_MINUTES = "short", 16, 60
+SCORE_CONFIG = "mia_evals/gary_comparison_neuron_instance/mws.toml"  # ours: truth_kind = "instances"
 
 @dataclass(slots=True)
 class Params:
@@ -611,6 +615,30 @@ def pca_maps(encoder, par: Params, savedir: Path, step: int):
     print(f"{savedir}: step {step}, effective rank {erank:.1f}, top-3 variance {sum(var[:3]):.2f}, "
           f"between-tile variance {between_tile:.2f}, norm outliers (>2x median) {stats['norm_outliers']}/{norms.numel()}; wrote pca.png")
 
+def score(n:int):
+    """Score probe(n)'s affinities as mia-evals' neuron-instance task (SCORE_CONFIG: mutex watershed + size filter,
+    fitted on the fit block, reported on the test block; panoptic quality ranks, VOI and ARE reported).
+
+    Writes the record into the run's own dir, savedir/mia_evals/<task>/records/*.json (pull.sh brings it down;
+    analysis.mia_evals_table reads it), not mia-evals' repo. resolved_config.json (params) and git_commit.txt (the
+    commit that ran) go in the savedir first: mia-evals copies them into the record from --run-dir.
+    Depends on the pinned mia-evals (uv.lock) and SCORE_CONFIG, so like probe it runs from this commit (scorelsf).
+    """
+    import subprocess
+    par = allparams()[n]
+    savedir = Path(par.savedir)
+    assert (savedir / "probe/test").is_dir() and (savedir / "probe/fit").is_dir(), f"no probe artifacts in {savedir}: probe first"
+    record(par, "score")
+    (savedir / "resolved_config.json").write_text(json.dumps(asdict(par)) + "\n")
+    (savedir / "git_commit.txt").write_text(code_provenance()["commit_id"] + "\n")
+    config = Path(__file__).resolve().parent / SCORE_CONFIG  # the snapshot's copy when run by scorelsf
+    cmd = [str(Path(sys.executable).with_name("mia-evals")), "score", str(config),
+           "--test", str(savedir / "probe/test"), "--val", str(savedir / "probe/fit"),
+           "--leaderboard", str(savedir / "mia_evals"), "--run-dir", str(savedir),
+           "--no-scored"]  # don't keep the 5.8 GB post-processed labelling per run
+    print(" ".join(cmd), flush=True)
+    subprocess.run(cmd, check=True)
+
 def tile_features(encoder, img, tile):
     """Encoder tokens (after its final LayerNorm) of img (Z Y X in [0, 1], on the encoder's device, a multiple of
     tile), from non-overlapping tiles at the training global-view size, stitched: Gz Gy Gx D, bf16."""
@@ -720,8 +748,9 @@ def probe(n:int):
     (Path(par.savedir) / "probe.json").write_text(json.dumps(stats) + "\n")
     print(f"{par.savedir}: probe at step {step}: boundary AP (short-range mean) {stats['boundary_ap_short']:.3f}; wrote probe/", flush=True)
 
-def bsub(par: Params, job: str, minutes: int, n_gpus: int, cmd: str):
+def bsub(par: Params, job: str, minutes: int, n_gpus: int, cmd: str, queue: str | None = None, slots: int | None = None):
     """Submit `uv run <cmd>` for par's run dir to LSF as job <sweep>-<dN>-<job>, logging to savedir/job_<job>_%J.log.
+    Default: par.queue with CPUS_PER_GPU slots per GPU. A CPU job (n_gpus = 0) names its queue and slots.
 
     {code} in cmd is this commit's code snapshot (.tmpcode/<sweep>/), which the job runs instead of the shared
     checkout: that may have moved on (another sweep pushed) by the time the job starts. Python puts the script's
@@ -731,13 +760,13 @@ def bsub(par: Params, job: str, minutes: int, n_gpus: int, cmd: str):
     import subprocess
     name = "-".join(Path(par.savedir).parts[1:]) + f"-{job}"  # e.g. e00-nanhunt-d9-run, so bjobs shows which is which
     code = snapshot(SNAPSHOT_PATHS, Path(".tmpcode") / "-".join(Path(par.savedir).parts[1:-1]))
+    gpu = f'-gpu "num={n_gpus}:mode=exclusive_process"' if n_gpus else ""
     full = f""" bsub -J {name} \
         -W {minutes // 60}:{minutes % 60:02d} \
         -P miaai \
-        -n {n_gpus * CPUS_PER_GPU} \
-        -R "span[hosts=1]" \
-        -gpu "num={n_gpus}:mode=exclusive_process" \
-        -q {par.queue} \
+        -n {slots or n_gpus * CPUS_PER_GPU} \
+        -R "span[hosts=1]" {gpu} \
+        -q {queue or par.queue} \
         -o {par.savedir}/job_{job}_%J.log \
         uv run {cmd.format(code=code)}
         """
@@ -769,6 +798,17 @@ def probelsf(n:int):
 def probemany():
     for i in range(len(allparams())):
         probelsf(i)
+
+def scorelsf(n:int):
+    """score(n) as a CPU job on SCORE_QUEUE: mia-evals' mutex watershed over probe(n)'s affinity artifacts."""
+    par = allparams()[n]
+    assert (Path(par.savedir) / "probe/test").is_dir(), f"no probe artifacts in {par.savedir}: probe first (probelsf)"
+    assert_committed()
+    bsub(par, "score", SCORE_MINUTES, 0, f"python {{code}}/experiment.py score {n}", queue=SCORE_QUEUE, slots=SCORE_SLOTS)
+
+def scoremany():
+    for i in range(len(allparams())):
+        scorelsf(i)
 
 def pcamany():
     for i in range(len(allparams())):

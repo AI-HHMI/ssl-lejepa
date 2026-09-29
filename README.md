@@ -26,7 +26,7 @@ Every piece of code is either **remote** or **local**, and depends either on **m
 
 | class | runs | depends on | examples | rule |
 |---|---|---|---|---|
-| **experiment** | remote (LSF) | `lib/` (treat all of it as mutable, `util.py` included) | `experiment.py`: `run`, `pca`, `probe`, `replay_bad_batch`; submitted by `runlsf`/`pcalsf`/`probelsf`/`replaylsf` | Only for **this commit's own `allparams()`**, run from its committed snapshot. Training, inference (`pca`) and replays of an old sweep need time travel: `jj new <its commit>`. |
+| **experiment** | remote (LSF) | `lib/` (treat all of it as mutable, `util.py` included), `mia_evals/` configs | `experiment.py`: `run`, `pca`, `probe`, `score`, `replay_bad_batch`; submitted by `runlsf`/`pcalsf`/`probelsf`/`scorelsf`/`replaylsf` | Only for **this commit's own `allparams()`**, run from its committed snapshot. Training, inference (`pca`) and replays of an old sweep need time travel: `jj new <its commit>`. |
 | **analysis** | local | only `outdir/` (saved artifacts); never builds a `Lejepa`: imports neither `experiment.py` nor `lib/` model code, only `lib.util`'s entrypoint CLI | `analysis.py`: `loss_curves`, `nanhunt_plot`, `flash_perf`, `perf_journey`, `check_runs` | Runs at HEAD on **any** past sweep. It depends on `lib/` only transitively, through `outdir/`, which is an append-only log. |
 | **glue** | either | neither | `jrun.sh`, `pull.sh`, `gpufree.sh` | |
 
@@ -75,6 +75,9 @@ The pattern in `experiment.py`:
   - `probe.json`, `probe.png`, `probe/{fit,test}/hemibrain_eb_{split}.zarr`: the linear affinity probe (`probe`, `lib/probe.py`). It runs at the end of training after `pca`.
     - It fits one Linear per frozen token to mia-evals' 6 neuron affinities on an EB val-slab block, then predicts mia-evals' `gary_comparison` fit and test blocks (`lib/data.py` `HEMIBRAIN_EB_PROBE_BOXES`).
     - `probe.json` holds test-block boundary AP and BCE. The `.zarr` files are mia-evals affinity artifacts for `mia-evals score` with `truth_kind = "instances"`, which reads the ground truth from the store. They stay on the cluster.
+  - `mia_evals/<task>/records/*.json`, `resolved_config.json`, `git_commit.txt`: mia-evals' neuron-segmentation scores of the probe's affinities (`score`, submitted by `scorelsf`/`scoremany` as CPU jobs on the `short` queue).
+    - Scoring runs mutex watershed plus a size filter fitted on the fit block, reported on the test block (PQ, VOI, ARE), with `mia_evals/gary_comparison_neuron_instance/mws.toml`: a copy of mia-evals' config with `truth_kind = "instances"`.
+    - Read with `analysis.mia_evals_table`.
   - `trace_summary.json`: from `lib.util.trace_summary`. GPU busy fraction (union of kernel intervals) and per-phase host ms over the profiled steps.
 
 - `analysis.load_table(sweep, filename)` joins every run dir's rows with that run's saved `Params` (current defaults for fields added since) into a pandas DataFrame.

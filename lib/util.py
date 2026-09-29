@@ -33,7 +33,8 @@ def snapshot(paths, dest) -> Path:
     Always (re)writes dest/provenance.json with the commit being copied: see code_provenance().
     """
     dest = Path(dest)
-    files = sorted(f for p in map(Path, paths) for f in ([p] if p.is_file() else p.rglob("*.py")) if "__pycache__" not in f.parts)
+    files = sorted(f for p in map(Path, paths) for f in ([p] if p.is_file() else p.rglob("*"))
+                   if f.is_file() and "__pycache__" not in f.parts and f.name != ".DS_Store")  # code and its configs
     assert files, f"nothing to snapshot in {paths}"
     digest = sha256(b"".join(str(f).encode() + b"\0" + f.read_bytes() for f in files)).hexdigest()
     stamp = dest / ".sha256"

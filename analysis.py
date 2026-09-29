@@ -331,6 +331,29 @@ def probe_vs_compute(sweep: str, *compare: str):
                             name="random encoder", showlegend=col == 1, row=1, col=col)
     show(fig, f"{sweep}/probe_vs_compute")
 
+def mia_evals_table(sweep: str) -> pandas.DataFrame:
+    """One row per mia-evals record of a sweep (experiment.score: savedir/mia_evals/<task>/records/*.json): the neuron
+    segmentation scores of the probe's affinities on the test block. pq (panoptic quality) ranks; VOI split/merge
+    (lower is better) and adapted Rand error (ARE) are reported; the size filter was fitted on the fit block. Next to
+    the probe's long-range boundary AP. Reference: gary's supervised dinov3 model, pq ~0.11 at 100k steps (cc_threshold)."""
+    rows, params = [], {}
+    for d in run_dirs(sweep):
+        for f in sorted(d.glob("mia_evals/*/records/*.json")):
+            r = json.loads(f.read_text())
+            v = r["scores"]["voxel_instance"]
+            st = read_jsonl(d / "probe.json")[-1] if (d / "probe.json").is_file() else {}
+            params[d] = saved_params(d)
+            rows.append({"run": d.name, "route": r["route"], "pq": v["pq"], "voi_split": v["voi_split"], "voi_merge": v["voi_merge"],
+                         "ARE": v["adapted_rand_error"], "instances": f'{int(v["instances_predicted"])}/{int(v["instances_truth"])}',
+                         "postprocess": r["postprocess"]["describe"],
+                         "probe AP long": sum(st.get(f"boundary_ap_{c}", float("nan")) for c in ["(10, 0, 0)", "(0, 10, 0)", "(0, 0, 10)"]) / 3})
+    assert rows, f"no mia-evals records in outdir/{sweep}/d*/mia_evals/; score first (experiment.scorelsf), then ./pull.sh"
+    varying = varying_params(list(params.values()))
+    res = pandas.DataFrame(rows)
+    res.insert(1, "config", [config_label(params[Path("outdir", sweep, r)], varying) for r in res.run])
+    save_table(res.round(3), f"{sweep}/mia_evals")
+    return res
+
 def probe_curves(sweep: str):
     """The probe's fit curves per run, every 100 steps: training BCE, and BCE and boundary AP on held-out test-block
     tokens. Flat by the end means the fit converged; AP is the binary boundary-vs-same-object metric."""
