@@ -84,16 +84,15 @@ def code_provenance() -> dict:
 
 
 def log_command(argv: list[str]):
-    """Append one JSON line per entrypoint call to outdir/_log/commands-<host>.jsonl: time, host, argv, LSF
-    job and code_provenance(). Called by experiment scripts' __main__ (remote code), not by call_entrypoint, so
-    local analysis never writes outdir/. One file per cluster host, since appends from several hosts to one NFS
-    file can interleave. Rank 0 only under torchrun."""
-    if os.environ.get("RANK", "0") != "0":
+    """Append one JSON line per CLI call of an experiment script outside LSF jobs, i.e. the commands you issue
+    (runmany, runlsf n, pcalsf n, ... on the login node via jrun.sh), to outdir/_log/commands.jsonl: time, host,
+    argv and code_provenance(). Jobs don't log here: each records what it ran in its savedir's runs.json
+    (experiment.record), and appends from many cluster hosts to one NFS file could interleave or overwrite."""
+    if "LSB_JOBID" in os.environ:
         return
-    host = socket.gethostname().split(".")[0]
-    row = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "host": host, "argv": argv,
-           "lsf_job": os.environ.get("LSB_JOBID"), **code_provenance()}
-    path = Path("outdir/_log") / f"commands-{host}.jsonl"
+    row = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "host": socket.gethostname().split(".")[0], "argv": argv,
+           **code_provenance()}
+    path = Path("outdir/_log/commands.jsonl")
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a") as f:
         f.write(json.dumps(row) + "\n")

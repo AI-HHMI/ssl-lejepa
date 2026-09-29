@@ -175,3 +175,15 @@ def test_patch_embed_matches_conv3d():
     tokens, grid = embed(x)
     assert grid == (2, 2, 3)
     torch.testing.assert_close(tokens, conv(x).flatten(2).transpose(1, 2))
+
+
+def test_log_command_skips_jobs(tmp_path, monkeypatch):
+    import lib.util
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(lib.util, "code_provenance", lambda: {"commit_id": "c0"})
+    monkeypatch.delenv("LSB_JOBID", raising=False)
+    lib.util.log_command(["experiment.py", "runmany"])
+    monkeypatch.setenv("LSB_JOBID", "123")
+    lib.util.log_command(["experiment.py", "run", "0"])  # jobs record in runs.json instead
+    rows = [json.loads(l) for l in (tmp_path / "outdir/_log/commands.jsonl").read_text().splitlines()]
+    assert [r["argv"] for r in rows] == [["experiment.py", "runmany"]] and rows[0]["commit_id"] == "c0"

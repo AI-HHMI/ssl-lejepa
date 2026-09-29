@@ -128,7 +128,8 @@ def allparams():
 def record(par: Params, fn: str):
     """Append one row to par.savedir/runs.json: which experiment function ran (fn), its params, code_provenance(),
     argv and LSF job. Written first thing, so even a run that crashes before any results describes itself.
-    Repro for the dir's artifacts: that commit + argv. Also logged per host in outdir/_log/ (log_command)."""
+    Repro for the dir's artifacts: that commit + argv. The command that submitted the job is in
+    outdir/_log/commands.jsonl (log_command)."""
     row = {"fn": fn, "params": asdict(par), **code_provenance(), "argv": sys.argv, "lsf_job": os.environ.get("LSB_JOBID")}
     with open(Path(par.savedir) / "runs.json", "a") as f:
         f.write(json.dumps(row) + "\n")
@@ -649,5 +650,5 @@ if __name__ == "__main__":
     if len(sys.argv) == 1:
         pick_entrypoint()
     else:
-        log_command(sys.argv)  # experiment code: every CLI call -> outdir/_log/commands-<host>.jsonl
+        log_command(sys.argv)  # commands issued outside jobs -> outdir/_log/commands.jsonl; jobs use runs.json
         call_entrypoint(sys.argv[1], *sys.argv[2:])

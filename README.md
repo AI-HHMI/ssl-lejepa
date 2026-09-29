@@ -39,7 +39,10 @@ Every piece of code is either **remote** or **local**, and depends either on **m
 - **Remote code gets the concurrency guards; local code gets none.**
   - Only committed code is submitted: `bsub` jobs come from `runlsf` (train), `pcalsf` (redo PCA maps) and `replaylsf` (replay a bad batch). Each first calls `assert_committed()`.
   - Each job runs a snapshot of the code plus its commit (`.tmpcode/<sweep>/`, `provenance.json`), and records that commit, argv and LSF job ID in `runs.json`. Repro for any run: *commit X, `experiment.py run n`*.
-  - Every CLI call of an experiment script (`experiment.py <fn> ...`, via `log_command` in its `__main__`) is logged to `outdir/_log/commands-<host>.jsonl`, one file per host. This covers the login-node `runmany`/`pcalsf`/`replaylsf` calls and each job's `run`/`pca`/`replay_bad_batch`. Analysis doesn't log.
+  - **Two logs, each fact once:**
+    - `outdir/_log/commands.jsonl` gets the commands you issue: every CLI call of `experiment.py` outside an LSF job, via `log_command` in its `__main__`. These are the login-node `runmany` / `runlsf n` / `pcalsf` / `replaylsf` calls.
+    - Each job records what it ran in its savedir's `runs.json` instead. This keeps it one file from one host (`login1`, through `jrun.sh`). Appends from many cluster hosts to one NFS file could interleave or overwrite each other.
+    - Older per-host `commands-<host>.jsonl` files are history. Analysis doesn't log.
   - Resubmitting moves the old savedir to `outdir/.trash/<path>/<time>/` (`lib.util.trash`) instead of deleting it. Empty `.trash` by hand.
 - **`pca` and `replay_bad_batch` assert they're working on this commit's own runs.** `pca(n)` checks the checkpoint's saved params equal `allparams()[n]`. `replay_bad_batch` checks the dump sits in one of this commit's savedirs.
 - **Two artifact places**:
@@ -66,7 +69,7 @@ The pattern in `experiment.py`:
 - Outputs go to the savedir as append-only JSON-lines:
   - `metrics.json`: loss every 10 steps.
   - `performance.json`: from the benchmark window. `samples_per_second`, `tokens_per_second`, `tokens_per_sample`, `input_mvox_per_second`, `world_size`.
-  - `runs.json`: one row per experiment function that ran on this dir (`record`: `fn` = `run` / `pca` / `replay_bad_batch`). Each row has commit, subject, dirty flag and diff hash (`code_provenance`), argv and LSF job ID. This overlaps with `outdir/_log/commands-<host>.jsonl` on purpose: the run dir is self-contained, and the global log covers calls with no run dir (`runmany`, `pcalsf`).
+  - `runs.json`: one row per experiment function that ran on this dir (`record`: `fn` = `run` / `pca` / `replay_bad_batch`). Each row has commit, subject, dirty flag and diff hash (`code_provenance`), argv and LSF job ID. The command that submitted the job is in `outdir/_log/commands.jsonl`.
     Rows from before 2026-09-28 have only `commit_id` + `diff_hash`. Their uncommitted diffs are in `outdir/_log/diffs-legacy.json`, keyed by `diff_hash`: the frozen old `_diffs/diffs.json` from the cluster.
   - `profile.json` / `profile.out`: from `torch.profiler`.
   - `trace_summary.json`: from `lib.util.trace_summary`. GPU busy fraction (union of kernel intervals) and per-phase host ms over the profiled steps.
