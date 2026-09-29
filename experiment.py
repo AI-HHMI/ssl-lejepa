@@ -231,7 +231,8 @@ def dataloader(n:int):
         save_view_pngs(par, dl)
     return batches
 
-def run(n:int):
+def train(n:int):
+    """Train allparams()[n] (every DDP rank); ends with no process group left. run() adds the evals."""
     start_time = time.time()
     # LSF jobs must run a runlsf snapshot: the shared checkout's allparams()[n] may be another sweep by now.
     b1 = "LSB_JOBID" in os.environ
@@ -400,11 +401,21 @@ def run(n:int):
                 f.write(json.dumps(row) + "\n")
         raise
     save_checkpoint(idx_step + 1)
-    if rank0 and par.max_hours:  # training runs (not benchmarks): evals of the last finite checkpoint
-        pca(n)
-        probe(n)
     if world_size > 1:
         dist.destroy_process_group()
+
+def run(n:int):
+    """The LSF job: train allparams()[n], then rank 0 evaluates its last finite checkpoint (pca, probe).
+
+    Evals run after train() has destroyed the process group, so the other ranks exit instead of waiting at a
+    collective for minutes; they only run for training runs (max_hours > 0), not throughput benchmarks.
+    """
+    train(n)
+    b1 = int(os.environ.get("RANK", 0)) == 0
+    b2 = bool(allparams()[n].max_hours)
+    if b1 and b2:
+        pca(n)
+        probe(n)
 
 
 def replay_bad_batch(path: str):

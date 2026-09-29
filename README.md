@@ -57,7 +57,7 @@ A script is a flat module of top-level functions. `lib.util.call_entrypoint` / `
 
 The pattern in `experiment.py`:
 - `Params` dataclass holds one run's config. `allparams()` returns the sweep as a list of `Params`, each with its own `savedir` (`outdir/e00/<exp>/d{i}/`). Each sweep is recorded in a commit message prefixed `exp:` that names the outdir. Results are recorded in commits prefixed `result:`.
-- `run(n)` trains `allparams()[n]`. `runlsf(n)` moves any old savedir to `outdir/.trash/` and `bsub`s it to the `gpu_b300` queue (project `miaai`) as `torchrun --standalone --nproc_per_node={n_gpus} experiment.py run n`, requesting `n_gpus` GPUs and `n_gpus * (n_workers + 1)` CPU slots. `runmany()` submits the whole sweep.
+- `run(n)` is the job: `train(n)` trains `allparams()[n]` on every DDP rank and tears down the process group; then, for training runs (`max_hours > 0`), rank 0 runs the evals `pca(n)` and `probe(n)` on the last checkpoint. `runlsf(n)` moves any old savedir to `outdir/.trash/` and `bsub`s it to the `gpu_b300` queue (project `miaai`) as `torchrun --standalone --nproc_per_node={n_gpus} experiment.py run n`, requesting `n_gpus` GPUs and `n_gpus * (n_workers + 1)` CPU slots. `runmany()` submits the whole sweep.
 - Optimization knobs in `Params`:
   - `amp`: bf16 autocast for forward + loss; SIGReg stays fp32.
   - `compile`: `torch.compile(dynamic=True)` on the encoder.

@@ -155,3 +155,14 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
     assert runs[0]["params"]["savedir"] == params.savedir  # every run dir describes itself, even if it crashes
     assert replay["eager"][0] == pytest.approx(losses[3], rel=1e-5)
     assert replay["as trained"][0] == pytest.approx(losses[3], rel=1e-5)  # compile=False: both paths are eager
+
+
+@pytest.mark.parametrize("max_hours,evals", [(0.0, []), (1.0, ["pca", "probe"])])
+def test_run_trains_then_evals_training_runs_only(monkeypatch, max_hours, evals):
+    calls = []
+    monkeypatch.setattr(experiment, "allparams", lambda: [experiment.Params(max_hours=max_hours)])
+    for fn in ["train", "pca", "probe"]:
+        monkeypatch.setattr(experiment, fn, lambda n, fn=fn: calls.append(fn))
+    monkeypatch.delenv("RANK", raising=False)
+    experiment.run(0)
+    assert calls == ["train", *evals]  # evals after train() has torn down the process group, benchmarks skip them
