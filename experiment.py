@@ -120,11 +120,13 @@ def allparams():
         params.append(p)
     return params
 
-def record(savedir, fn: str):
-    """Append one row to savedir/runs.json: which experiment function ran (fn), code_provenance(), argv, LSF job.
+def record(par: Params, fn: str):
+    """Append one row to par.savedir/runs.json: which experiment function ran (fn), its params, code_provenance(),
+    argv and LSF job. Written first thing, so even a run that crashes before any results describes itself.
     Repro for the dir's artifacts: that commit + argv. Also logged per host in outdir/_log/ (log_command)."""
-    with open(Path(savedir) / "runs.json", "a") as f:
-        f.write(json.dumps({"fn": fn, **code_provenance(), "argv": sys.argv, "lsf_job": os.environ.get("LSB_JOBID")}) + "\n")
+    row = {"fn": fn, "params": asdict(par), **code_provenance(), "argv": sys.argv, "lsf_job": os.environ.get("LSB_JOBID")}
+    with open(Path(par.savedir) / "runs.json", "a") as f:
+        f.write(json.dumps(row) + "\n")
 
 def collate_images(samples):
     import torch
@@ -224,6 +226,8 @@ def run(n:int):
     b2 = ".tmpcode" not in Path(__file__).resolve().parts
     assert not (b1 and b2), f"LSF job running {__file__} from the shared checkout; submit via runlsf (code snapshot)"
     par : Params = allparams()[n]
+    if int(os.environ.get("RANK", 0)) == 0:  # first thing, so even a run that crashes early describes itself
+        record(par, "run")
     import torch
     import torch.distributed as dist
     torch.set_float32_matmul_precision(par.f32mode)
@@ -248,9 +252,6 @@ def run(n:int):
     batches = dataloader(n)
 
     savedir = Path(par.savedir)
-
-    if rank0:  # repro: this commit + this command (runlsf only submits committed code)
-        record(savedir, "run")
 
     model = Lejepa(lejepa_config(par))
     if rank0: pprint(model)
@@ -414,9 +415,9 @@ def replay_bad_batch(path: str):
     # Like training, replay depends on lib/: only for dumps of this commit's own experiment (replaylsf submits it).
     ours = {Path(p.savedir).resolve() for p in allparams()}
     assert Path(path).resolve().parent in ours, f"{path} isn't from this commit's allparams(): replay it from its experiment's commit"
-    record(Path(path).parent, "replay_bad_batch")
     dump = torch.load(path, map_location="cpu", weights_only=False)
     par = Params(**dump["params"])
+    record(par, "replay_bad_batch")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.set_float32_matmul_precision(par.f32mode)
     x = dump["x_uint8"].to(device).float() / 255  # Batch C Z Y X, exactly the training input
@@ -472,7 +473,7 @@ def pca(n:int):
     model = Lejepa(lejepa_config(par))
     model.load_state_dict(ckpt["model"])  # strict: architecture drift fails loudly
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    record(par.savedir, "pca")  # argv says whether it ran inside `run n` or on its own (pcalsf)
+    record(par, "pca")  # argv says whether it ran inside `run n` or on its own (pcalsf)
     pca_maps(model.encoder.to(device), par, Path(par.savedir), ckpt["step"])
 
 def pca_maps(encoder, par: Params, savedir: Path, step: int):
