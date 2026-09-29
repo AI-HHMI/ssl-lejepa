@@ -23,6 +23,8 @@ from lmd_catalog.viewers import make_neuroglancer_url, parse_neuroglancer_url, t
 
 from lib.util import call_entrypoint, pick_entrypoint
 
+BOUNDARY_CHANNELS = {"short (+1)": ["(1, 0, 0)", "(0, 1, 0)", "(0, 0, 1)"], "long (+10)": ["(10, 0, 0)", "(0, 10, 0)", "(0, 0, 10)"]}
+
 
 def read_jsonl(path) -> list[dict]:
     return [json.loads(l) for l in Path(path).read_text().splitlines() if l.strip()]
@@ -294,18 +296,21 @@ def probe_table(sweep: str) -> pandas.DataFrame:
     save_table(res, f"{sweep}/probe")
     return res
 
+def boundary_ap(st: dict) -> dict[str, float]:
+    """Mean boundary AP per range (BOUNDARY_CHANNELS) from one probe.json row."""
+    return {r: sum(st[f"boundary_ap_{c}"] for c in chans) / 3 for r, chans in BOUNDARY_CHANNELS.items()}
+
 def probe_vs_compute(sweep: str, *compare: str):
     """Probe boundary AP vs total training compute, one point per probed run of sweep and any compare sweeps, for
     short-range (+1 voxel: membranes) and long-range (+10: same neuron?) affinities. A probe-only run (init_from a run
     dir) is placed at its source run's compute; init_from random is the dashed baseline in each panel."""
-    CHANNELS = {"short (+1)": ["(1, 0, 0)", "(0, 1, 0)", "(0, 0, 1)"], "long (+10)": ["(10, 0, 0)", "(0, 10, 0)", "(0, 0, 10)"]}
     points, random = [], {}
     for sw in (sweep, *compare):
         for d in run_dirs(sw):
             if not (d / "probe.json").is_file():
                 continue
             st = read_jsonl(d / "probe.json")[-1]
-            ap = {r: sum(st[f"boundary_ap_{c}"] for c in chans) / 3 for r, chans in CHANNELS.items()}
+            ap = boundary_ap(st)
             init = saved_params(d).get("init_from", "")
             if init == "random":
                 random = ap
@@ -320,16 +325,45 @@ def probe_vs_compute(sweep: str, *compare: str):
     res = pandas.DataFrame(points)
     res["label"] = res.config.where(res.sweep != sweep.split("/")[-1], "")  # name only the reference models; hover the rest
     fig = px.scatter(res, x="EFLOP", y="AP", color="sweep", facet_col="range", text="label", log_x=True,
-                     hover_data=["config", "run", "source", "steps"], category_orders={"range": list(CHANNELS)},
+                     hover_data=["config", "run", "source", "steps"], category_orders={"range": list(BOUNDARY_CHANNELS)},
                      title=f"Linear-probe boundary AP vs training compute: {', '.join((sweep, *compare))}")
     fig.update_traces(textposition="top center", textfont_size=10).update_yaxes(matches=None, showticklabels=True)
     fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
     lo, hi = res.EFLOP.min() * 0.8, res.EFLOP.max() * 1.25
-    for col, r in enumerate(CHANNELS, start=1):
+    for col, r in enumerate(BOUNDARY_CHANNELS, start=1):
         if r in random:  # dashed line across the panel
             fig.add_scatter(x=[lo, hi], y=[random[r]] * 2, mode="lines", line=dict(dash="dash", color="gray"),
                             name="random encoder", showlegend=col == 1, row=1, col=col)
     show(fig, f"{sweep}/probe_vs_compute")
+
+def probe_short_vs_long(sweep: str, *compare: str):
+    """Scatter of linear-probe boundary AP, short-range (+1 voxel: membranes) vs long-range (+10: same neuron?), one
+    point per probed run of sweep and any compare sweeps: do configs that separate membranes also separate neurons?
+    init_from random is the dashed crosshair baseline."""
+    points, random = [], {}
+    for sw in (sweep, *compare):
+        for d in run_dirs(sw):
+            if not (d / "probe.json").is_file():
+                continue
+            ap = boundary_ap(read_jsonl(d / "probe.json")[-1])
+            init = saved_params(d).get("init_from", "")
+            src = Path(init) if init and init != "random" else d  # a probe-only run's config is its source run's
+            p = saved_params(src)
+            label = f'{p["patch_size"][0]}/{p["global_size"][0]}/{p["local_size"][0]} w{p["width"]}' if p else "?"
+            row = {**ap, "run": f"{sw.split('/')[-1]}/{d.name}", "config": label, "sweep": sw.split("/")[-1]}
+            if init == "random":
+                random = row
+            else:
+                points.append(row)
+    assert points, f"no probe.json in {(sweep, *compare)}; run ./pull.sh?"
+    res = pandas.DataFrame(points)
+    fig = px.scatter(res, x="short (+1)", y="long (+10)", color="sweep", text="config", hover_data=["run"],
+                     title=f"Linear-probe boundary AP, short vs long range: {', '.join((sweep, *compare))}")
+    fig.update_traces(textposition="top center", textfont_size=10)
+    if random:
+        fig.add_scatter(x=[random["short (+1)"]], y=[random["long (+10)"]], mode="markers",
+                        marker=dict(symbol="x", size=12, color="black"), name="random encoder")
+    show(fig, f"{sweep}/probe_short_vs_long")
 
 def mia_evals_table(sweep: str) -> pandas.DataFrame:
     """One row per mia-evals record of a sweep (experiment.score: savedir/mia_evals/<task>/records/*.json): the neuron
@@ -635,11 +669,12 @@ def e00_probe_test():
 
 def e00_viewsizes_v2():
     """View-size study with the fixed stack: training loss, probe scores per config (d0-d16 and repeats d17-d33)."""
-    bench("e00/viewsizes-v2")
-    loss_curves("e00/viewsizes-v2")
-    probe_table("e00/viewsizes-v2")
+    # bench("e00/viewsizes-v2")
+    # loss_curves("e00/viewsizes-v2")
+    # probe_table("e00/viewsizes-v2")
     probe_curves("e00/viewsizes-v2")
-    probe_vs_compute("e00/viewsizes-v2", "e00/probe-test")
+    # probe_vs_compute("e00/viewsizes-v2", "e00/probe-test")
+    # probe_short_vs_long("e00/viewsizes-v2", "e00/probe-test")
 
 if __name__ == "__main__":
     if len(sys.argv) == 1:
