@@ -604,6 +604,7 @@ def probe(n:int):
     Frozen encoder; one Linear per token from its features to mia-evals' 6 affinity channels at every voxel of its
     patch (lib.probe), fitted on HEMIBRAIN_EB_PROBE_BOXES["train"] against proofread-cell-hemibrain-v1.2. Then:
       savedir/probe.json          test-block BCE and boundary AP per channel (cheap, immediate)
+      savedir/probe_fit.json      the probe's fit curve (training BCE every 100 steps)
       savedir/probe/{fit,test}/hemibrain_eb_{split}.zarr   mia-evals affinity artifacts, (6, X, Y, Z) float16, for
                                   `mia-evals score` with truth_kind = "instances" (reads the GT from the store)
       savedir/probe.png           test block, middle z: EM | true boundaries | predicted boundaries
@@ -644,8 +645,9 @@ def probe(n:int):
     feats, labels, _ = block(HEMIBRAIN_EB_PROBE_BOXES["train"])
     aff, valid = affinities(labels, offsets)
     del labels
-    head = fit_probe(feats, to_tokens(aff, p[0]), to_tokens(valid, p[0]))
+    head, curve = fit_probe(feats, to_tokens(aff, p[0]), to_tokens(valid, p[0]))
     del feats, aff, valid
+    (Path(par.savedir) / "probe_fit.json").write_text("".join(json.dumps({"tbl": "probe_fit", "step": s, "loss": l}) + "\n" for s, l in curve))
     run_name = "-".join(Path(par.savedir).parts[1:])  # mia-evals row name: letters, digits, _ and - only
     stats = {"tbl": "probe", "step": step, "run": run_name}
     for split in ["fit", "test"]:

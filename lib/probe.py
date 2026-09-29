@@ -34,21 +34,26 @@ def to_voxels(tok: Tensor, grid: tuple[int, ...], p: int) -> Tensor:
     C = tok.shape[1] // p ** 3
     return tok.reshape(gz, gy, gx, C, p, p, p).permute(3, 0, 4, 1, 5, 2, 6).reshape(C, gz * p, gy * p, gx * p)
 
-def fit_probe(feats: Tensor, targets: Tensor, valid: Tensor) -> nn.Linear:
+def fit_probe(feats: Tensor, targets: Tensor, valid: Tensor) -> tuple[nn.Linear, list[tuple[int, float]]]:
     """Linear(D, K) from frozen token features (N D) to binary token targets (N K), BCE over the valid entries.
-    Random token batches, Adam at a fixed lr; seeded, so a refit gives the same probe."""
+    Random token batches, Adam at a fixed lr; seeded, so a refit gives the same probe. Also returns the batch loss
+    every 100 steps (the fit curve: flat by the end means STEPS was enough)."""
     STEPS, BATCH, LR = 3000, 4096, 1e-3
     head = nn.Linear(feats.shape[1], targets.shape[1]).to(feats.device)
     opt = torch.optim.Adam(head.parameters(), lr=LR)
     g = torch.Generator(device=feats.device).manual_seed(0)
-    for _ in range(STEPS):
+    curve = []
+    for step in range(STEPS):
         i = torch.randint(len(feats), (BATCH,), device=feats.device, generator=g)
         w = valid[i].float()
         loss = F.binary_cross_entropy_with_logits(head(feats[i].float()), targets[i].float(), weight=w, reduction="sum")
-        (loss / w.sum().clamp_min(1)).backward()
+        loss = loss / w.sum().clamp_min(1)
+        loss.backward()
         opt.step()
         opt.zero_grad(set_to_none=True)
-    return head
+        if step % 100 == 0 or step == STEPS - 1:
+            curve.append((step, loss.item()))
+    return head, curve
 
 def average_precision(scores: Tensor, labels: Tensor) -> float:
     """Average precision of 1-D scores for 1-D binary labels (area under the precision-recall curve, step-wise)."""

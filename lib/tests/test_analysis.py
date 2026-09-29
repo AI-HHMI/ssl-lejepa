@@ -60,6 +60,24 @@ def test_ng_link_lists_zarr_label_layers(tmp_path, monkeypatch):
     assert state["dimensions"]["x"] == [8e-9, "m"]
 
 
+def test_probe_table_and_curves(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    shown = []
+    monkeypatch.setattr(analysis, "show", lambda fig, name: shown.append(name))
+    for i, (steps, ap) in enumerate([(5000, 0.8), (100, 0.3)]):
+        d = tmp_path / f"outdir/e00/p/d{i}"
+        d.mkdir(parents=True)
+        (d / "runs.json").write_text(json.dumps({"fn": "run", "params": {"queue": "gpu_h200", "width": 512, "batch_size": 64, "steps_per_epoch": steps}}) + "\n")
+        st = {"tbl": "probe", "step": steps, "boundary_ap_short": ap, "boundary_ap_(1, 0, 0)": ap, "bce_(1, 0, 0)": 0.1, "bce_(0, 1, 0)": 0.3}
+        (d / "probe.json").write_text(json.dumps(st) + "\n")
+        (d / "probe_fit.json").write_text("".join(json.dumps({"tbl": "probe_fit", "step": s, "loss": 1 / (s + 1)}) + "\n" for s in [0, 100]))
+    res = analysis.probe_table("e00/p")
+    assert list(res["boundary AP short"]) == [0.8, 0.3] and list(res["BCE short"]) == [0.2, 0.2]
+    assert res.config[1].endswith("steps=100") and "AP (1, 0, 0)" in res
+    analysis.probe_curves("e00/p")
+    assert shown == ["e00/p/probe_fit"] and (tmp_path / "results/e00/p/probe.csv").is_file()
+
+
 def test_show_writes_results(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     fig = px.line(x=[0, 1], y=[1, 0])

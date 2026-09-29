@@ -36,10 +36,11 @@ def test_fit_probe_learns_a_linear_target():
     targets = feats @ w > 0
     valid = torch.ones_like(targets)
     valid[:, 0] = False  # an ignored column must not matter
-    head = fit_probe(feats, targets, valid)
+    head, curve = fit_probe(feats, targets, valid)
     with torch.no_grad():
         acc = ((head(feats) > 0) == targets)[:, 1:].float().mean()
     assert acc > 0.95
+    assert curve[0][0] == 0 and curve[-1][0] == 2999 and curve[-1][1] < curve[0][1]  # the fit curve goes down
 
 
 def test_average_precision():
@@ -78,3 +79,5 @@ def test_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch):
     arr = np.asarray(zarr.open_array(str(tmp_path / "run/probe/test/hemibrain_eb_test.zarr"), mode="r")[:])
     assert arr.shape == (6, 32, 32, 32) and 0 <= arr.min() and arr.max() <= 1
     assert (tmp_path / "run/probe.png").is_file() and (tmp_path / "run/probe/fit/hemibrain_eb_fit.zarr").is_dir()
+    fit = [json.loads(l) for l in (tmp_path / "run/probe_fit.json").read_text().splitlines()]
+    assert fit[0]["step"] == 0 and fit[-1]["step"] == 2999 and all(f["tbl"] == "probe_fit" for f in fit)

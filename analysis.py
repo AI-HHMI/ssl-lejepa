@@ -194,6 +194,11 @@ def loss_curves(sweep: str):
                  hover_data=["width", "batch_size", "queue"], markers=True, log_y=True,
                  category_orders={"batch_size": sorted(res.batch_size.unique())}), f"{sweep}/loss_curves")
 
+def varying_params(params: list[dict]) -> set:
+    """Param names whose values differ between runs (runs without saved params are left out)."""
+    known = [p for p in params if p]
+    return {k for k in dict.fromkeys(k for p in known for k in p) if len({json.dumps(p.get(k)) for p in known}) > 1}
+
 def config_label(p: dict, varying: set) -> str:
     """Short run label from saved params, e.g. 'B300 w512 b64 cudagraphs+eager-pe'; view sizes and GPU count only
     if they vary. '?' for runs that crashed before params were saved (runs.json had none until 2026-09-28)."""
@@ -215,8 +220,7 @@ def bench(sweep: str, *compare: str):
     sweeps = (sweep, *compare)
     runs = [(sweep, d) for sweep in sweeps for d in run_dirs(sweep)]
     params = {d: saved_params(d) for _, d in runs}
-    known = [p for p in params.values() if p]
-    varying = {k for k in dict.fromkeys(k for p in known for k in p) if len({json.dumps(p.get(k)) for p in known}) > 1}
+    varying = varying_params(list(params.values()))
     rows, curves = [], []
     for s, d in runs:
         name = f"{s.split('/')[-1]}/{d.name}" if compare else d.name
@@ -256,6 +260,31 @@ def bench(sweep: str, *compare: str):
     fig.update_xaxes(title="ktok/s per GPU", range=[0, 1.15 * max(speed.x.max(), 1)])  # room for the labels
     show(fig, f"{out}_speed")
     return res
+
+def probe_table(sweep: str) -> pandas.DataFrame:
+    """One row per run with a probe.json: config, the checkpoint step it probed, test-block boundary AP (mean of the
+    3 short-range channels, then each short and long channel) and mean short-range BCE. Higher AP is better;
+    compare against a near-random encoder's run (e.g. probe-test/d1)."""
+    dirs = [d for d in run_dirs(sweep) if (d / "probe.json").is_file()]
+    assert dirs, f"no probe.json in outdir/{sweep}/d*/; run ./pull.sh?"
+    params = {d: saved_params(d) for d in dirs}
+    varying = varying_params(list(params.values()))
+    rows = []
+    for d in dirs:
+        st = read_jsonl(d / "probe.json")[-1]
+        aps = {k.removeprefix("boundary_ap_"): v for k, v in st.items() if k.startswith("boundary_ap_(")}
+        bce = [v for k, v in st.items() if k.startswith("bce_(")][:3]
+        rows.append({"run": d.name, "config": config_label(params[d], varying) + f' steps={params[d].get("steps_per_epoch")}',
+                     "probe step": st["step"], "boundary AP short": st["boundary_ap_short"],
+                     **{f"AP {k}": v for k, v in aps.items()}, "BCE short": sum(bce) / len(bce)})
+    res = pandas.DataFrame(rows).round(3)
+    save_table(res, f"{sweep}/probe")
+    return res
+
+def probe_curves(sweep: str):
+    """The probe's fit curve per run (training BCE every 100 steps): flat by the end means it converged."""
+    res = load_table(sweep, "probe_fit.json")
+    show(px.line(res, x="step", y="loss", color="run", log_y=True, title=f"Linear probe fit: {sweep}"), f"{sweep}/probe_fit")
 
 # def plot2(sweep: str):
 #     """ktok/s per GPU: one bar per result row, bars grouped by n_gpus with gaps between groups, colored by width + defer_image_ops."""
@@ -512,6 +541,13 @@ def e00_b300_train8h_dynamic():
     """First long 8xB300 runs, width 512 vs 1024, dynamic compile."""
     bench("e00/b300-train8h-dynamic")
     loss_curves("e00/b300-train8h-dynamic")
+
+def e00_probe_test():
+    """First real linear affinity probe: 30 min of training (d0) vs a near-random encoder (d1). The images are in
+    outdir/e00/probe-test/d*/probe.png (EM | true boundaries | predicted boundaries)."""
+    loss_curves("e00/probe-test")
+    probe_table("e00/probe-test")
+    probe_curves("e00/probe-test")
 
 if __name__ == "__main__":
     if len(sys.argv) == 1:
