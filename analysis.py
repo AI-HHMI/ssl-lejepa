@@ -195,15 +195,20 @@ def loss_curves(sweep: str):
                  hover_data=["width", "batch_size", "queue"], markers=True, log_y=True,
                  category_orders={"batch_size": sorted(res.batch_size.unique())}), f"{sweep}/loss_curves")
 
+def tflop_per_step(d: Path) -> float | None:
+    """TFLOP for one training step of this run dir (all GPUs), from its measured benchmark-window throughput row
+    (performance.json). None before the run has logged one (still warming up, or crashed/OOM'd first)."""
+    tp = [r for r in read_jsonl(d / "performance.json") if r.get("tbl") == "throughput"]
+    t = tp[-1] if tp else {}
+    return t["tflops_per_second"] * t["seconds_per_step"] if t.get("tflops_per_second") else None
+
 def run_compute(d: Path) -> tuple[int | None, float | None]:
     """(training steps, total EFLOP) of a run dir: the last logged step in metrics.json + 1, times FLOPs per step from
     the benchmark window (TFLOP/s x s/step, all GPUs; fixed with displace views). None where a file is missing."""
     m = read_jsonl(d / "metrics.json")
-    tp = [r for r in read_jsonl(d / "performance.json") if r.get("tbl") == "throughput"]
     steps = m[-1]["idx_step"] + 1 if m else None
-    t = tp[-1] if tp else {}
-    tflop_per_step = t["tflops_per_second"] * t["seconds_per_step"] if t.get("tflops_per_second") else None
-    return steps, tflop_per_step * steps / 1e6 if tflop_per_step and steps else None
+    tps = tflop_per_step(d)
+    return steps, tps * steps / 1e6 if tps and steps else None
 
 def job_text(d: Path, *prefixes: str) -> str:
     """Latest job log's text for a run dir: the first prefix with a job_<prefix>_*.log (e.g. "run", "probe"),
@@ -786,6 +791,94 @@ def e00_scaling_law_calib():
     bench_table("e00/scaling-law-calib")
     scaling_law_calib_lr_scan()
     scaling_law_calib_loss_vs_flops()
+
+def scaling_law_budget(d: Path) -> str:
+    """This run's nominal compute budget label (c1..c4), from its position in e00/scaling-law's grid: 4 budgets x 5
+    sizes, ordered d{budget_index*5 + size_index} (paramsall()'s BUDGETS x SIZES loop order). Sweep-specific, not
+    a saved param."""
+    return f"c{int(d.name[1:]) // 5 + 1}"
+
+def scaling_law_loss_curves():
+    """Loss vs step for e00/scaling-law (the main IsoFLOP grid), one line per run colored by n_layers, faceted by
+    nominal compute budget (scaling_law_budget). Sanity check while runs are in progress: any divergence, and are
+    all 5 sizes in a budget progressing normally (similar step counts so far)?"""
+    res = load_table("e00/scaling-law", "metrics.json")
+    res["budget"] = res.savedir.map(lambda s: scaling_law_budget(Path(s)))
+    fig = px.line(res.sort_values(["n_layers", "idx_step"]), x="idx_step", y="loss", color="n_layers",
+                 line_group="run", facet_col="budget", log_y=True,
+                 category_orders={"budget": [f"c{i}" for i in range(1, 5)]},
+                 title="e00/scaling-law: loss vs step per compute budget, colored by n_layers")
+    fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+    fig.update_layout(legend_title="n_layers")
+    show(fig, "e00/scaling-law/loss_curves")
+
+def scaling_law_loss_vs_flops():
+    """Loss vs cumulative training compute (EFLOP) for e00/scaling-law, one line per run colored by n_layers: the
+    classic loss-vs-compute training-curve plot, whose lower envelope at any compute value is the compute-optimal
+    size there. Unlike a final-loss comparison, this stays valid while runs are in progress -- read it by slicing
+    vertically at a compute value, not by comparing where curves currently end (a bigger model's curve just ends
+    earlier in EFLOP terms per wall-clock hour, not because it's worse)."""
+    res = load_table("e00/scaling-law", "metrics.json")
+    tps = {d.name: tflop_per_step(d) for d in run_dirs("e00/scaling-law")}
+    res["tflop_per_step"] = res.run.map(tps)
+    res = res.dropna(subset=["tflop_per_step"])
+    res["EFLOP"] = res.tflop_per_step * (res.idx_step + 1) / 1e6
+    fig = px.line(res.sort_values(["n_layers", "EFLOP"]), x="EFLOP", y="loss", color="n_layers", line_group="run",
+                 log_x=True, log_y=True, hover_data=["run", "n_layers", "width", "batch_size", "lr"],
+                 title="e00/scaling-law: loss vs cumulative training compute, colored by n_layers")
+    fig.update_layout(legend_title="n_layers")
+    show(fig, "e00/scaling-law/loss_vs_flops")
+
+def scaling_law_lr_vs_flops():
+    """lr vs training compute so far (EFLOP), one point per run in e00/scaling-law colored by n_layers: does the
+    main grid's per-size lr (calibrated in e00/scaling-law-calib, not a simple 1/width rule any more) track depth
+    sensibly, or does the calibration override make it non-monotonic across sizes? Each size's lr is fixed across
+    its 4 budgets, so expect 4 points per color stacked at different EFLOP (more compute reached at looser budgets)."""
+    rows = []
+    for d in run_dirs("e00/scaling-law"):
+        _, eflop = run_compute(d)
+        if eflop is None:
+            continue  # OOM'd before logging a throughput row (xl)
+        p = saved_params(d)
+        rows.append({"run": d.name, "n_layers": p.get("n_layers"), "width": p.get("width"), "lr": p.get("lr"),
+                     "budget": scaling_law_budget(d), "EFLOP": eflop})
+    res = pandas.DataFrame(rows)
+    fig = px.line(res.sort_values("n_layers"), x="EFLOP", y="lr", facet_row="n_layers", log_x=True, log_y=True,
+                     hover_data=["run", "width", "budget"],
+                     # category_orders={"color": [str(n) for n in sorted(res.n_layers.unique())]},
+                     title="e00/scaling-law: lr vs training compute so far, colored by n_layers")
+    fig.update_layout(legend_title="n_layers")
+    show(fig, "e00/scaling-law/lr_vs_flops")
+
+def scaling_law_isoflop():
+    """Current loss vs model width, one line per nominal compute budget (scaling_law_budget): the classic IsoFLOP
+    curve, whose U-shaped minimum is the compute-optimal size at that budget. Only a fair comparison once every
+    size in a budget has reached similar progress -- check bench_table's steps/status columns first. While runs
+    are in progress, prefer scaling_law_loss_vs_flops, which stays valid to read at partial completion."""
+    rows = []
+    for d in run_dirs("e00/scaling-law"):
+        m = read_jsonl(d / "metrics.json")
+        if not m:
+            continue  # not logged a step yet (still starting up, or crashed/OOM'd first)
+        p = saved_params(d)
+        rows.append({"run": d.name, "width": p.get("width"), "budget": scaling_law_budget(d),
+                     "loss": m[-1]["loss"], "steps": m[-1]["idx_step"] + 1})
+    res = pandas.DataFrame(rows)
+    fig = px.line(res.sort_values(["budget", "width"]), x="width", y="loss", color="budget", markers=True,
+                 log_x=True, log_y=True, hover_data=["run", "steps"],
+                 category_orders={"budget": [f"c{i}" for i in range(1, 5)]},
+                 title="e00/scaling-law: current loss vs model width per compute budget (IsoFLOP)")
+    show(fig, "e00/scaling-law/isoflop")
+
+def e00_scaling_law():
+    """Main IsoFLOP grid (4 budgets x 5 sizes): status/progress table, loss curves per budget, loss vs compute
+    (valid mid-run), lr vs compute per size, and the current IsoFLOP U-curve per budget (only trustworthy once
+    sizes are similarly progressed -- check the table's steps/status first)."""
+    bench_table("e00/scaling-law")
+    scaling_law_loss_curves()
+    scaling_law_loss_vs_flops()
+    scaling_law_lr_vs_flops()
+    scaling_law_isoflop()
 
 def e00_viewsizes_v2():
     """View-size study with the fixed stack: training loss, probe scores per config (d0-d16 and repeats d17-d33)."""
