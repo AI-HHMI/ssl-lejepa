@@ -66,6 +66,7 @@ class Params:
     max_hours: float = 0.0  # >0: stop after this many hours (steps_per_epoch is then an upper bound); sets LSF walltime
     n_layers: int = 12
     width: int = 512  # encoder width; heads = width // 64
+    lr: float = 1e-4  # peak lr (run(): warmup then cosine decay over steps_per_epoch)
     views: Views = "basic"  # 'basic' (random scales) or 'displace' (fixed sizes below, locals inside globals)
     global_size: Tup3Int = (88, 88, 88)  # displace only
     local_size: Tup3Int = (56, 56, 56)  # displace only
@@ -102,40 +103,45 @@ def on_queue(p: Params, queue: str) -> Params:
     p.width, p.batch_size = QUEUE_ARCH[queue]
     return p
 
-def allparams():
+def params():
     params = []
-    # View-size study, again: the 17 (input, global, local) configs of e00/viewsizes, one B300 each, 8 h, now with the
-    # fixes: flash attention (e00/viewsizes lost every large-input and small-local config to cuDNN NaNs at 5-18k steps
-    # while the rest ran 44-72k), the eager patch embed under cudagraphs, AdamW 0.95/0.05 (nanhunt_flash's recipe).
-    # Every run ends with pca and probe (boundary AP on mia-evals' blocks): the downstream metric viewsizes lacked.
-    # Two repeats (d0-d16, d17-d33: same config, different data draws) measure run-to-run noise, never measured yet,
-    # without which differences between configs can't be read.
-    base = (128, 96, 64)
-    configs = [base]  # same order as e00/viewsizes
-    configs += [(p, 96, 64) for p in [104, 160, 192, 256]]  # input patch: room for globals to move
-    configs += [(128, g, 64) for g in [64, 80, 112, 128]]  # global view size
-    configs += [(128, 96, l) for l in [32, 48, 80, 96]]  # local view size
-    configs += [(96, 64, 32), (160, 128, 80), (192, 144, 96), (256, 192, 128)]  # all scaled together
-    tokens = lambda g, l: 2 * (g // 8) ** 3 + 4 * (l // 8) ** 3  # per sample: 2 globals + 4 locals, 8^3 patches
-    # Model FLOPs per sample, relative units: 6 x ~38M encoder params per token + 12 x depth x width x N attention.
-    flops = lambda g, l: sum(k * (n * (6 * 38.1e6 + 12 * 12 * 512 * n)) for k, n in [(2, (g // 8) ** 3), (4, (l // 8) ** 3)])
-    for rep in range(2):
-        for c, (inp, g, l) in enumerate(configs):
+    # Scaling-law probe: does model size vs. training tokens follow Chinchilla's N* ~ C^0.5, or does it skew like
+    # Gary's MAE study on mia-muvit (an IsoFLOP grid there fit N* ~ C^0.67)? Fixed background from the past
+    # viewsizes-v2 sweep (its base view sizes, safe stack): only n_layers/width (and lr) vary, so the model-size/data
+    # tradeoff isn't confounded with the view-size study.
+    #
+    # A single shared lr across sizes is exactly the confound Chinchilla found in Kaplan et al.'s over-large-favoring
+    # estimate (small models look artificially worse without their own tuned lr) -- so lr is scaled ~1/width from
+    # this repo's one validated lr (m, w512), the leading-order correction muP formalizes (not full muP: init is
+    # untouched, and depth isn't covered by this rule at all). e00/scaling-law-calib checks that before the real grid
+    # runs: 5 sizes x 3 lr (0.5x/1x/2x) at max_hours=0.25 (15 min) each -- watch for divergence, or a non-monotonic
+    # loss-vs-lr at any size, before trusting main's lr choice. Its real measured throughput should also replace
+    # ANCHOR_STEP_S_M_B84 below before submitting main, the same way mia-muvit's e07 probe tier's numbers replaced
+    # its initial FLOPs-ratio extrapolation (which turned out to under-predict small sizes' relative cost).
+    SIZES = {"xs": (4, 256), "s": (6, 384), "m": (12, 512), "l": (16, 768), "xl": (24, 1024)}  # (n_layers, width); m = current default
+    BATCH = 64  # fixed across sizes (== gpu_b300's validated default at m); l/xl may OOM at 2x/4x m's depth -- untested, watch status
+    BASE_LR = 1e-4  # this repo's only lr so far, always at width=512
+    lr = lambda width: BASE_LR * (512 / width)
+    n_params, n_proj = {}, {}
+    for name, (n_layers, width) in SIZES.items():
+        model = Lejepa(LejepaConfig(n_layers=n_layers, width=width, views="displace",
+                                    global_size=(96, 96, 96), local_size=(64, 64, 64), batch_views=True, lamb=0.1))
+        n_params[name], n_proj[name] = model._n_encoder_params, model._n_projector_params
+    print("e00/scaling-law N_params (encoder):", {k: f"{v:,}" for k, v in n_params.items()})
+    for i, (name, (n_layers, width)) in enumerate(SIZES.items()):
+        for j, mult in enumerate([0.5, 1.0, 2.0]):
             p = Params()
-            p.savedir = f"outdir/e00/viewsizes-v2/d{rep * len(configs) + c}/"
+            p.savedir = f"outdir/e00/scaling-law-calib/d{i * 3 + j}/"
             p.data = "hemibrain_wide"
             p.views = "displace"
-            p.patch_size = (inp, inp, inp)
-            p.global_size = (g, g, g)
-            p.local_size = (l, l, l)
-            # Tokens per step about constant (GPU memory): the baseline's 84 x 5504. Multiple of 4, capped at 2x.
-            p.batch_size = min(168, max(8, 4 * round(84 * tokens(*base[1:]) / tokens(g, l) / 4)))
-            # Cosine horizon = expected steps in 8 h: the baseline's ~0.32 s/step on one B300 (cudagraph-fix/d3: 1425
-            # ktok/s at b84, flash + eager-pe cudagraphs) scaled by FLOPs per step. Data-loading-bound configs (large
-            # inputs, big batches: ~260 samples/s per GPU measured) run slower; max_hours stops them regardless.
-            step_s = 0.32 * (p.batch_size * flops(g, l)) / (84 * flops(*base[1:]))
-            p.steps_per_epoch = int(8 * 3600 / step_s)
-            p.max_hours = 8.0
+            p.patch_size = (128, 128, 128)
+            p.global_size = (96, 96, 96)
+            p.local_size = (64, 64, 64)
+            p.n_layers, p.width = n_layers, width
+            p.lr = lr(width) * mult
+            p.batch_size = BATCH
+            p.steps_per_epoch = 100_000  # not the real horizon: max_hours below is what stops this run
+            p.max_hours = 0.25
             p.weight_decay = 0.05
             p.adam_beta2 = 0.95
             p.cudagraphs = True
@@ -144,6 +150,45 @@ def allparams():
             p.n_gpus = 1
             p.queue = "gpu_b300"
             params.append(p)
+
+    # Main IsoFLOP grid: its own experiment/commit, once e00/scaling-law-calib's results replace ANCHOR_STEP_S_M_B84
+    # and any size's lr below. 4 compute budgets (anchored on m's ~0.32 s/step at b84, cudagraph-fix/d3, adjusted for
+    # batch and model size) x the 5 sizes above = 20 runs. steps_per_epoch is the real cosine-schedule horizon (this
+    # sweep's best a-priori estimate; see the calib note above); max_hours is a 2x safety cap, not the primary stop.
+    # Analysis reads back each run's REAL EFLOP (analysis.bench_table/run_compute) after the fact, so an inaccurate
+    # estimate under/over-shoots the nominal budget rather than corrupting the fit -- c1..c4 are only for grid design.
+    # Model FLOPs per sample (exact: lib.models.lejepa.Lejepa.forward's own out.n_flops accounting), at the base view
+    # sizes' fixed token counts (2 globals of 12^3, 4 locals of 8^3 tokens; patch=8, LejepaConfig's default).
+    # flops = lambda name: sum(k * (n * (6 * n_params[name] + 12 * SIZES[name][0] * SIZES[name][1] * n) + 6 * n_proj[name])
+    #                          for k, n in [(2, 12 ** 3), (4, 8 ** 3)])
+    # ANCHOR_STEP_S_M_B84 = 0.32  # cudagraph-fix/d3: 1425 ktok/s at b84, flash + eager-pe cudagraphs (m: n_layers=12, width=512)
+    # step_s = lambda name, batch: ANCHOR_STEP_S_M_B84 * (batch * flops(name)) / (84 * flops("m"))
+    # flops_per_hour_m = 3600 / step_s("m", BATCH) * flops("m") * BATCH
+    # BUDGET_HOURS_AT_M = {"c1": 1, "c2": 2, "c3": 4, "c4": 8}  # m's wall-clock at each budget; other sizes get more/fewer steps
+    # BUDGETS = {b: h * flops_per_hour_m for b, h in BUDGET_HOURS_AT_M.items()}
+    # for bi, budget_flops in enumerate(BUDGETS.values()):
+    #     for si, (name, (n_layers, width)) in enumerate(SIZES.items()):
+    #         p = Params()
+    #         p.savedir = f"outdir/e00/scaling-law/d{bi * len(SIZES) + si}/"
+    #         p.data = "hemibrain_wide"
+    #         p.views = "displace"
+    #         p.patch_size = (128, 128, 128)
+    #         p.global_size = (96, 96, 96)
+    #         p.local_size = (64, 64, 64)
+    #         p.n_layers, p.width = n_layers, width
+    #         p.lr = lr(width)  # revisit per-size if e00/scaling-law-calib shows a size is unstable/off at this lr
+    #         p.batch_size = BATCH
+    #         steps = budget_flops / (flops(name) * BATCH)
+    #         p.steps_per_epoch = round(steps)
+    #         p.max_hours = 2 * steps * step_s(name, BATCH) / 3600
+    #         p.weight_decay = 0.05
+    #         p.adam_beta2 = 0.95
+    #         p.cudagraphs = True
+    #         p.batch_views = True
+    #         p.n_workers = 11  # 12 cores per GPU
+    #         p.n_gpus = 1
+    #         p.queue = "gpu_b300"
+    #         params.append(p)
     return params
 
 def record(par: Params, fn: str):
@@ -219,7 +264,7 @@ def save_view_pngs(par: Params, dataset, n_samples: int = 3):
 
 def dataloader(n:int):
     import torch
-    par: Params = allparams()[n]
+    par: Params = params()[n]
     # volumes = [x.to_miao() for x in lmd.all() if x.name == "exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001"]
     # Training volumes (lib/data.py), images only. Boxes are x y z; output is z y x.
     # With several volumes miao samples each equally (size_weighting_exponent=0); the wide crops are ~equal size.
@@ -259,7 +304,7 @@ def train(n:int):
     b1 = "LSB_JOBID" in os.environ
     b2 = ".tmpcode" not in Path(__file__).resolve().parts
     assert not (b1 and b2), f"LSF job running {__file__} from the shared checkout; submit via runlsf (code snapshot)"
-    par : Params = allparams()[n]
+    par : Params = params()[n]
     assert not par.init_from, f"{par.savedir}: init_from={par.init_from!r} is a probe-only run (training ignores it); use probe"
     if int(os.environ.get("RANK", 0)) == 0:  # first thing, so even a run that crashes early describes itself
         record(par, "run")
@@ -302,14 +347,14 @@ def train(n:int):
         if par.grad_compress:
             from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
             model.register_comm_hook(None, default_hooks.bf16_compress_hook)
-    LR, LR_WARMUP, LR_FLOOR = 1e-4, 1000, 0.01  # peak lr; linear warmup steps; cosine ends at LR_FLOOR * LR
+    LR_WARMUP, LR_FLOOR = 1000, 0.01  # linear warmup steps; cosine ends at LR_FLOOR * par.lr
     GRAD_CLIP = 1.0  # max global grad norm
     CHECKPOINT_EVERY, CHECKPOINT_KEEP = 2000, 1  # steps (~15 min at 8 GPUs); newest checkpoints kept
     # AdamW with weight_decay=0 is exactly Adam. Decay only weight matrices, not biases or norm gains.
     decay = [p for p in model.parameters() if p.ndim >= 2]
     no_decay = [p for p in model.parameters() if p.ndim < 2]
     opt = torch.optim.AdamW([{"params": decay, "weight_decay": par.weight_decay},
-                             {"params": no_decay, "weight_decay": 0.0}], lr=LR, betas=(0.9, par.adam_beta2))
+                             {"params": no_decay, "weight_decay": 0.0}], lr=par.lr, betas=(0.9, par.adam_beta2))
     # Warmup then cosine decay over steps_per_epoch, by step count so every rank uses the same lr.
     # For max_hours runs set steps_per_epoch to the expected step count so the schedule completes.
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / LR_WARMUP) * (
@@ -434,7 +479,7 @@ def run(n:int):
     """
     train(n)
     b1 = int(os.environ.get("RANK", 0)) == 0
-    b2 = bool(allparams()[n].max_hours)
+    b2 = bool(params()[n].max_hours)
     if b1 and b2:
         pca(n)
         probe(n)
@@ -459,7 +504,7 @@ def replay_bad_batch(path: str):
     from contextlib import nullcontext
     from torch.nn.attention import SDPBackend, sdpa_kernel
     # Like training, replay depends on lib/: only for dumps of this commit's own experiment (replaylsf submits it).
-    ours = {Path(p.savedir).resolve() for p in allparams()}
+    ours = {Path(p.savedir).resolve() for p in params()}
     assert Path(path).resolve().parent in ours, f"{path} isn't from this commit's allparams(): replay it from its experiment's commit"
     dump = torch.load(path, map_location="cpu", weights_only=False)
     par = Params(**dump["params"])
@@ -531,7 +576,7 @@ def load_checkpoint(par: Params):
 
 def pca(n:int):
     """PCA maps (pca_maps) of allparams()[n]'s latest checkpoint. Runs at the end of training; pcalsf(n) redoes it."""
-    par = allparams()[n]
+    par = params()[n]
     model, step = load_checkpoint(par)
     record(par, "pca")  # argv says whether it ran inside `run n` or on its own (pcalsf)
     pca_maps(model.encoder, par, Path(par.savedir), step)
@@ -625,7 +670,7 @@ def score(n:int):
     Depends on the pinned mia-evals (uv.lock) and SCORE_CONFIG, so like probe it runs from this commit (scorelsf).
     """
     import subprocess
-    par = allparams()[n]
+    par = params()[n]
     savedir = Path(par.savedir)
     assert (savedir / "probe/test").is_dir() and (savedir / "probe/fit").is_dir(), f"no probe artifacts in {savedir}: probe first"
     record(par, "score")
@@ -673,7 +718,7 @@ def probe(n:int):
     from artifact import write_artifact
     from PIL import Image
     from lib.probe import AFFINITY_OFFSETS_XYZ, affinities, average_precision, fit_probe, to_tokens, to_voxels
-    par = allparams()[n]
+    par = params()[n]
     model, step = load_checkpoint(par)
     record(par, "probe")
     encoder, device = model.encoder, next(model.parameters()).device
@@ -775,7 +820,7 @@ def bsub(par: Params, job: str, minutes: int, n_gpus: int, cmd: str, queue: str 
 
 def runlsf(n:int):
     """Train allparams()[n] on LSF, in a fresh savedir (old contents -> outdir/.trash/)."""
-    par:Params = allparams()[n]
+    par:Params = params()[n]
     assert not par.init_from, f"{par.savedir}: init_from={par.init_from!r} is a probe-only run (training ignores it); submit with probemany"
     assert par.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={par.n_workers} leaves no core for the training process"
     assert_committed()
@@ -786,48 +831,48 @@ def runlsf(n:int):
 def pcalsf(n:int):
     """Redo pca(n) on LSF, e.g. after changing pca_maps in this experiment's change (run() already does it once)."""
     assert_committed()
-    bsub(allparams()[n], "pca", 30, 1, f"python {{code}}/experiment.py pca {n}")
+    bsub(params()[n], "pca", 30, 1, f"python {{code}}/experiment.py pca {n}")
 
 def probelsf(n:int):
     """probe(n) as its own LSF job: redo a training run's probe, or a probe-only run (par.init_from set)."""
-    par = allparams()[n]
+    par = params()[n]
     assert_committed()
     Path(par.savedir).mkdir(parents=True, exist_ok=True)  # a probe-only run has no training job to create it
     bsub(par, "probe", 60, 1, f"python {{code}}/experiment.py probe {n}")
 
-def probemany():
-    for i in range(len(allparams())):
+def probeall():
+    for i in range(len(params())):
         probelsf(i)
 
 def scorelsf(n:int):
     """score(n) as a CPU job on SCORE_QUEUE: mia-evals' mutex watershed over probe(n)'s affinity artifacts."""
-    par = allparams()[n]
+    par = params()[n]
     assert (Path(par.savedir) / "probe/test").is_dir(), f"no probe artifacts in {par.savedir}: probe first (probelsf)"
     assert_committed()
     bsub(par, "score", SCORE_MINUTES, 0, f"python {{code}}/experiment.py score {n}", queue=SCORE_QUEUE, slots=SCORE_SLOTS)
 
-def scoremany():
-    for i in range(len(allparams())):
+def scoreall():
+    for i in range(len(params())):
         scorelsf(i)
 
-def pcamany():
-    for i in range(len(allparams())):
+def pcaall():
+    for i in range(len(params())):
         pcalsf(i)
 
 def replaylsf(n:int):
     """replay_bad_batch on LSF for allparams()[n]'s first bad_batch dump. CUDA_LAUNCH_BLOCKING names a crashing kernel."""
-    par = allparams()[n]
+    par = params()[n]
     dumps = sorted(Path(par.savedir).glob("bad_batch_*.pt"))
     assert dumps, f"no bad_batch_*.pt in {par.savedir}"
     assert_committed()
     bsub(par, "replay", 30, 1, f"env CUDA_LAUNCH_BLOCKING=1 python {{code}}/experiment.py replay_bad_batch {dumps[0]}")
 
-def runmany():
-    for i in range(len(allparams())):
+def runall():
+    for i in range(len(params())):
         runlsf(i)
 
-def runmany_sequential():
-    for i in range(len(allparams())):
+def runall_sequential():
+    for i in range(len(params())):
         run(i)
 
 def test():
