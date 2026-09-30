@@ -232,7 +232,7 @@ def fmt_duration(seconds: float | None) -> str | None:
 
 def probe_walltime_s(d: Path) -> float | None:
     """Wall-clock time spent probing, not pretraining: a dedicated probe job's LSF run time when probe ran as its
-    own job (job_probe_*.log, e.g. probe-test/probemany), else, when probe ran inline at the end of the training
+    own job (job_probe_*.log, e.g. probe-test/probeall), else, when probe ran inline at the end of the training
     job (e.g. viewsizes-v2, no separate job log to read), the time from metrics.json's last write (training done)
     to probe.json's (probe done) -- both pulled with rsync -a, so mtimes are the cluster's. None if neither applies."""
     probe_logs = sorted(d.glob("job_probe_*.log"))
@@ -354,7 +354,7 @@ def boundary_ap(st: dict) -> dict[str, float]:
 
 def probe_source(d: Path) -> tuple[Path, dict, str]:
     """(source run dir, its saved params, init_from) for a probe.json row: d itself, unless init_from points at
-    another run's checkpoint (a probe-only job, e.g. probemany) or "random" (no source run, the baseline)."""
+    another run's checkpoint (a probe-only job, e.g. probeall) or "random" (no source run, the baseline)."""
     init = saved_params(d).get("init_from", "")
     src = Path(init) if init and init != "random" else d
     return src, saved_params(src), init
@@ -482,7 +482,7 @@ def probe_curves(sweep: str):
 #     """ktok/s per GPU: one bar per result row, bars grouped by n_gpus with gaps between groups, colored by width + defer_image_ops."""
 #     res = load_table(sweep, "performance.json")
 #     res["ktok_s_per_gpu"] = res.tokens_per_second / res.n_gpus / 1e3
-#     assert len(res), "no performance.json rows for allparams(); run ./pull.sh?"
+#     assert len(res), "no performance.json rows for paramsall(); run ./pull.sh?"
 #     # Bar label: short run name, plus a suffix for repeated rows in one run.
 #     repeat = res.groupby("savedir").cumcount()
 #     res["run"] = short_runs(res.savedir) + repeat.map(lambda k: f".{k}" if k else "")

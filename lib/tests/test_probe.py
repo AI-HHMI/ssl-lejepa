@@ -60,7 +60,7 @@ def test_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch):
     boxes = {"train": [[24, 56], [24, 56], [24, 56]], "fit": [[20, 52], [24, 56], [24, 56]], "test": [[24, 56], [20, 52], [24, 56]]}
     par = experiment.Params(savedir=str(tmp_path / "run"), global_size=(24, 24, 24))  # 32^3 boxes -> 48^3 of context
     (tmp_path / "run").mkdir()
-    monkeypatch.setattr(experiment, "allparams", lambda: [par])
+    monkeypatch.setattr(experiment, "paramsall", lambda: [par])
     monkeypatch.setattr(experiment, "HEMIBRAIN_EB_PROBE_BOXES", boxes)
     monkeypatch.setattr(experiment, "HEMIBRAIN_EB_PROBE_ANNOTATED", {k: v for k, v in boxes.items() if k != "train"})
     monkeypatch.setattr(experiment, "HEMIBRAIN_EB_LABELS", "labels/cells")
@@ -114,7 +114,7 @@ def test_score_runs_mia_evals_on_the_probe_artifacts(tmp_path, monkeypatch):
     par = experiment.Params(savedir=str(tmp_path / "run"))
     for split in ["fit", "test"]:
         (tmp_path / "run/probe" / split).mkdir(parents=True)
-    monkeypatch.setattr(experiment, "allparams", lambda: [par])
+    monkeypatch.setattr(experiment, "paramsall", lambda: [par])
     monkeypatch.setattr(experiment, "code_provenance", lambda: {"commit_id": "abc123"})
     calls = []
     import subprocess
@@ -132,7 +132,7 @@ def test_score_runs_mia_evals_on_the_probe_artifacts(tmp_path, monkeypatch):
 def test_scorelsf_submits_a_cpu_job(tmp_path, monkeypatch):
     par = experiment.Params(savedir=str(tmp_path / "run"))
     (tmp_path / "run/probe/test").mkdir(parents=True)
-    monkeypatch.setattr(experiment, "allparams", lambda: [par])
+    monkeypatch.setattr(experiment, "paramsall", lambda: [par])
     monkeypatch.setattr(experiment, "assert_committed", lambda: None)
     monkeypatch.setattr(experiment, "snapshot", lambda paths, dest: tmp_path / "code")
     submitted = []

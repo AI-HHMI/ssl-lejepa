@@ -47,7 +47,7 @@ class NanGrad(torch.autograd.Function):
 
 def patch_experiment(monkeypatch, tmp_path, params):
     """Point experiment at params, a synthetic dataset and a tiny model, with no cluster, git or GPU."""
-    monkeypatch.setattr(experiment, "allparams", lambda: [params])
+    monkeypatch.setattr(experiment, "paramsall", lambda: [params])
     monkeypatch.setattr(experiment.lmd, "get", lambda name: SimpleNamespace(to_miao=lambda **kw: None))
     monkeypatch.setattr(experiment, "MiaoConfig", SimpleNamespace)
     monkeypatch.setattr(experiment, "VolumeDataset", SyntheticDataset)
@@ -160,7 +160,7 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
 @pytest.mark.parametrize("max_hours,evals", [(0.0, []), (1.0, ["pca", "probe"])])
 def test_run_trains_then_evals_training_runs_only(monkeypatch, max_hours, evals):
     calls = []
-    monkeypatch.setattr(experiment, "allparams", lambda: [experiment.Params(max_hours=max_hours)])
+    monkeypatch.setattr(experiment, "paramsall", lambda: [experiment.Params(max_hours=max_hours)])
     for fn in ["train", "pca", "probe"]:
         monkeypatch.setattr(experiment, fn, lambda n, fn=fn: calls.append(fn))
     monkeypatch.delenv("RANK", raising=False)
@@ -169,9 +169,9 @@ def test_run_trains_then_evals_training_runs_only(monkeypatch, max_hours, evals)
 
 
 def test_runlsf_refuses_probe_only_runs(tmp_path, monkeypatch):
-    # init_from runs are evaluated with probemany; training would silently ignore init_from and start from scratch.
+    # init_from runs are evaluated with probeall; training would silently ignore init_from and start from scratch.
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(experiment, "allparams", lambda: [experiment.Params(savedir="outdir/e00/x/d0", init_from="random")])
-    with pytest.raises(AssertionError, match="probemany"):
+    monkeypatch.setattr(experiment, "paramsall", lambda: [experiment.Params(savedir="outdir/e00/x/d0", init_from="random")])
+    with pytest.raises(AssertionError, match="probeall"):
         experiment.runlsf(0)
     assert not (tmp_path / "outdir").exists()  # refused before trash() or bsub

@@ -18,7 +18,7 @@ def test_load_table_uses_saved_params(tmp_path, monkeypatch):
     (tmp_path / "outdir/e00/sweep/notes").mkdir()  # not a run dir
     res = analysis.load_table("e00/sweep", "metrics.json")
     assert list(res.run) == ["d2", "d2", "d10", "d10"]  # numeric run order
-    assert list(res.width) == [512, 512, 768, 768]  # saved params, not allparams()
+    assert list(res.width) == [512, 512, 768, 768]  # saved params, not paramsall()
     assert "n_layers" not in res  # only what runs saved; no current Params defaults (analysis doesn't import lib/)
 
 

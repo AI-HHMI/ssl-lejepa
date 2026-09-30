@@ -1,5 +1,5 @@
 """Experiment code (remote): LeJEPA 3D ViT training runs, benchmarks, inference (pca) and replays, and their LSF
-sweep (allparams, savedirs under outdir/e00/). Depends on lib/, so it runs only from its experiment's commit.
+sweep (paramsall, savedirs under outdir/e00/). Depends on lib/, so it runs only from its experiment's commit.
 Analysis of the results lives in analysis.py."""
 
 from __future__ import annotations
@@ -103,7 +103,7 @@ def on_queue(p: Params, queue: str) -> Params:
     p.width, p.batch_size = QUEUE_ARCH[queue]
     return p
 
-def params():
+def paramsall():
     params = []
     # Scaling-law probe: does model size vs. training tokens follow Chinchilla's N* ~ C^0.5, or does it skew like
     # Gary's MAE study on mia-muvit (an IsoFLOP grid there fit N* ~ C^0.67)? Fixed background from the past
@@ -122,34 +122,40 @@ def params():
     BATCH = 64  # fixed across sizes (== gpu_b300's validated default at m); l/xl may OOM at 2x/4x m's depth -- untested, watch status
     BASE_LR = 1e-4  # this repo's only lr so far, always at width=512
     lr = lambda width: BASE_LR * (512 / width)
+    # Best lr per size found by e00/scaling-law-calib's 0.5x/1x/2x scan (lowest final loss at 15 min, one B300 each):
+    # xs and l/s disagree in direction with the 1/width rule above (xs wants less, s and l want more); m was flat
+    # (0.5x and 2x tied within noise) so its rule lr is kept. xl OOM'd at every lr (batch 64 doesn't fit); untested,
+    # so it still falls back to the rule until a batch/parallelism fix lets it calibrate.
+    CALIB_BEST_LR_MULT = {"xs": 0.5, "s": 2.0, "m": 1.0, "l": 2.0}
     n_params, n_proj = {}, {}
     for name, (n_layers, width) in SIZES.items():
         model = Lejepa(LejepaConfig(n_layers=n_layers, width=width, views="displace",
                                     global_size=(96, 96, 96), local_size=(64, 64, 64), batch_views=True, lamb=0.1))
         n_params[name], n_proj[name] = model._n_encoder_params, model._n_projector_params
     print("e00/scaling-law N_params (encoder):", {k: f"{v:,}" for k, v in n_params.items()})
-    for i, (name, (n_layers, width)) in enumerate(SIZES.items()):
-        for j, mult in enumerate([0.5, 1.0, 2.0]):
-            p = Params()
-            p.savedir = f"outdir/e00/scaling-law-calib/d{i * 3 + j}/"
-            p.data = "hemibrain_wide"
-            p.views = "displace"
-            p.patch_size = (128, 128, 128)
-            p.global_size = (96, 96, 96)
-            p.local_size = (64, 64, 64)
-            p.n_layers, p.width = n_layers, width
-            p.lr = lr(width) * mult
-            p.batch_size = BATCH
-            p.steps_per_epoch = 100_000  # not the real horizon: max_hours below is what stops this run
-            p.max_hours = 0.25
-            p.weight_decay = 0.05
-            p.adam_beta2 = 0.95
-            p.cudagraphs = True
-            p.batch_views = True
-            p.n_workers = 11  # 12 cores per GPU
-            p.n_gpus = 1
-            p.queue = "gpu_b300"
-            params.append(p)
+
+    # for i, (name, (n_layers, width)) in enumerate(SIZES.items()):
+    #     for j, mult in enumerate([0.5, 1.0, 2.0]):
+    #         p = Params()
+    #         p.savedir = f"outdir/e00/scaling-law-calib/d{i * 3 + j}/"
+    #         p.data = "hemibrain_wide"
+    #         p.views = "displace"
+    #         p.patch_size = (128, 128, 128)
+    #         p.global_size = (96, 96, 96)
+    #         p.local_size = (64, 64, 64)
+    #         p.n_layers, p.width = n_layers, width
+    #         p.lr = lr(width) * mult
+    #         p.batch_size = BATCH
+    #         p.steps_per_epoch = 100_000  # not the real horizon: max_hours below is what stops this run
+    #         p.max_hours = 0.25
+    #         p.weight_decay = 0.05
+    #         p.adam_beta2 = 0.95
+    #         p.cudagraphs = True
+    #         p.batch_views = True
+    #         p.n_workers = 11  # 12 cores per GPU
+    #         p.n_gpus = 1
+    #         p.queue = "gpu_b300"
+    #         params.append(p)
 
     # Main IsoFLOP grid: its own experiment/commit, once e00/scaling-law-calib's results replace ANCHOR_STEP_S_M_B84
     # and any size's lr below. 4 compute budgets (anchored on m's ~0.32 s/step at b84, cudagraph-fix/d3, adjusted for
@@ -159,36 +165,36 @@ def params():
     # estimate under/over-shoots the nominal budget rather than corrupting the fit -- c1..c4 are only for grid design.
     # Model FLOPs per sample (exact: lib.models.lejepa.Lejepa.forward's own out.n_flops accounting), at the base view
     # sizes' fixed token counts (2 globals of 12^3, 4 locals of 8^3 tokens; patch=8, LejepaConfig's default).
-    # flops = lambda name: sum(k * (n * (6 * n_params[name] + 12 * SIZES[name][0] * SIZES[name][1] * n) + 6 * n_proj[name])
-    #                          for k, n in [(2, 12 ** 3), (4, 8 ** 3)])
-    # ANCHOR_STEP_S_M_B84 = 0.32  # cudagraph-fix/d3: 1425 ktok/s at b84, flash + eager-pe cudagraphs (m: n_layers=12, width=512)
-    # step_s = lambda name, batch: ANCHOR_STEP_S_M_B84 * (batch * flops(name)) / (84 * flops("m"))
-    # flops_per_hour_m = 3600 / step_s("m", BATCH) * flops("m") * BATCH
-    # BUDGET_HOURS_AT_M = {"c1": 1, "c2": 2, "c3": 4, "c4": 8}  # m's wall-clock at each budget; other sizes get more/fewer steps
-    # BUDGETS = {b: h * flops_per_hour_m for b, h in BUDGET_HOURS_AT_M.items()}
-    # for bi, budget_flops in enumerate(BUDGETS.values()):
-    #     for si, (name, (n_layers, width)) in enumerate(SIZES.items()):
-    #         p = Params()
-    #         p.savedir = f"outdir/e00/scaling-law/d{bi * len(SIZES) + si}/"
-    #         p.data = "hemibrain_wide"
-    #         p.views = "displace"
-    #         p.patch_size = (128, 128, 128)
-    #         p.global_size = (96, 96, 96)
-    #         p.local_size = (64, 64, 64)
-    #         p.n_layers, p.width = n_layers, width
-    #         p.lr = lr(width)  # revisit per-size if e00/scaling-law-calib shows a size is unstable/off at this lr
-    #         p.batch_size = BATCH
-    #         steps = budget_flops / (flops(name) * BATCH)
-    #         p.steps_per_epoch = round(steps)
-    #         p.max_hours = 2 * steps * step_s(name, BATCH) / 3600
-    #         p.weight_decay = 0.05
-    #         p.adam_beta2 = 0.95
-    #         p.cudagraphs = True
-    #         p.batch_views = True
-    #         p.n_workers = 11  # 12 cores per GPU
-    #         p.n_gpus = 1
-    #         p.queue = "gpu_b300"
-    #         params.append(p)
+    flops = lambda name: sum(k * (n * (6 * n_params[name] + 12 * SIZES[name][0] * SIZES[name][1] * n) + 6 * n_proj[name])
+                             for k, n in [(2, 12 ** 3), (4, 8 ** 3)])
+    ANCHOR_STEP_S_M_B84 = 0.32  # cudagraph-fix/d3: 1425 ktok/s at b84, flash + eager-pe cudagraphs (m: n_layers=12, width=512)
+    step_s = lambda name, batch: ANCHOR_STEP_S_M_B84 * (batch * flops(name)) / (84 * flops("m"))
+    flops_per_hour_m = 3600 / step_s("m", BATCH) * flops("m") * BATCH
+    BUDGET_HOURS_AT_M = {"c1": 1, "c2": 2, "c3": 4, "c4": 8}  # m's wall-clock at each budget; other sizes get more/fewer steps
+    BUDGETS = {b: h * flops_per_hour_m for b, h in BUDGET_HOURS_AT_M.items()}
+    for bi, budget_flops in enumerate(BUDGETS.values()):
+        for si, (name, (n_layers, width)) in enumerate(SIZES.items()):
+            p = Params()
+            p.savedir = f"outdir/e00/scaling-law/d{bi * len(SIZES) + si}/"
+            p.data = "hemibrain_wide"
+            p.views = "displace"
+            p.patch_size = (128, 128, 128)
+            p.global_size = (96, 96, 96)
+            p.local_size = (64, 64, 64)
+            p.n_layers, p.width = n_layers, width
+            p.lr = lr(width) * CALIB_BEST_LR_MULT.get(name, 1.0)  # xl: no calib data (OOM at every lr), rule lr unscaled
+            p.batch_size = BATCH
+            steps = budget_flops / (flops(name) * BATCH)
+            p.steps_per_epoch = round(steps)
+            p.max_hours = 2 * steps * step_s(name, BATCH) / 3600
+            p.weight_decay = 0.05
+            p.adam_beta2 = 0.95
+            p.cudagraphs = True
+            p.batch_views = True
+            p.n_workers = 11  # 12 cores per GPU
+            p.n_gpus = 1
+            p.queue = "gpu_b300"
+            params.append(p)
     return params
 
 def record(par: Params, fn: str):
@@ -264,7 +270,7 @@ def save_view_pngs(par: Params, dataset, n_samples: int = 3):
 
 def dataloader(n:int):
     import torch
-    par: Params = params()[n]
+    par: Params = paramsall()[n]
     # volumes = [x.to_miao() for x in lmd.all() if x.name == "exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001"]
     # Training volumes (lib/data.py), images only. Boxes are x y z; output is z y x.
     # With several volumes miao samples each equally (size_weighting_exponent=0); the wide crops are ~equal size.
@@ -298,13 +304,13 @@ def dataloader(n:int):
     return batches
 
 def train(n:int):
-    """Train allparams()[n] (every DDP rank); ends with no process group left. run() adds the evals."""
+    """Train paramsall()[n] (every DDP rank); ends with no process group left. run() adds the evals."""
     start_time = time.time()
-    # LSF jobs must run a runlsf snapshot: the shared checkout's allparams()[n] may be another sweep by now.
+    # LSF jobs must run a runlsf snapshot: the shared checkout's paramsall()[n] may be another sweep by now.
     b1 = "LSB_JOBID" in os.environ
     b2 = ".tmpcode" not in Path(__file__).resolve().parts
     assert not (b1 and b2), f"LSF job running {__file__} from the shared checkout; submit via runlsf (code snapshot)"
-    par : Params = params()[n]
+    par : Params = paramsall()[n]
     assert not par.init_from, f"{par.savedir}: init_from={par.init_from!r} is a probe-only run (training ignores it); use probe"
     if int(os.environ.get("RANK", 0)) == 0:  # first thing, so even a run that crashes early describes itself
         record(par, "run")
@@ -472,14 +478,14 @@ def train(n:int):
         dist.destroy_process_group()
 
 def run(n:int):
-    """The LSF job: train allparams()[n], then rank 0 evaluates its last finite checkpoint (pca, probe).
+    """The LSF job: train paramsall()[n], then rank 0 evaluates its last finite checkpoint (pca, probe).
 
     Evals run after train() has destroyed the process group, so the other ranks exit instead of waiting at a
     collective for minutes; they only run for training runs (max_hours > 0), not throughput benchmarks.
     """
     train(n)
     b1 = int(os.environ.get("RANK", 0)) == 0
-    b2 = bool(params()[n].max_hours)
+    b2 = bool(paramsall()[n].max_hours)
     if b1 and b2:
         pca(n)
         probe(n)
@@ -504,8 +510,8 @@ def replay_bad_batch(path: str):
     from contextlib import nullcontext
     from torch.nn.attention import SDPBackend, sdpa_kernel
     # Like training, replay depends on lib/: only for dumps of this commit's own experiment (replaylsf submits it).
-    ours = {Path(p.savedir).resolve() for p in params()}
-    assert Path(path).resolve().parent in ours, f"{path} isn't from this commit's allparams(): replay it from its experiment's commit"
+    ours = {Path(p.savedir).resolve() for p in paramsall()}
+    assert Path(path).resolve().parent in ours, f"{path} isn't from this commit's paramsall(): replay it from its experiment's commit"
     dump = torch.load(path, map_location="cpu", weights_only=False)
     par = Params(**dump["params"])
     record(par, "replay_bad_batch")
@@ -575,8 +581,8 @@ def load_checkpoint(par: Params):
     return model.to(device).eval(), ckpt["step"]
 
 def pca(n:int):
-    """PCA maps (pca_maps) of allparams()[n]'s latest checkpoint. Runs at the end of training; pcalsf(n) redoes it."""
-    par = params()[n]
+    """PCA maps (pca_maps) of paramsall()[n]'s latest checkpoint. Runs at the end of training; pcalsf(n) redoes it."""
+    par = paramsall()[n]
     model, step = load_checkpoint(par)
     record(par, "pca")  # argv says whether it ran inside `run n` or on its own (pcalsf)
     pca_maps(model.encoder, par, Path(par.savedir), step)
@@ -670,7 +676,7 @@ def score(n:int):
     Depends on the pinned mia-evals (uv.lock) and SCORE_CONFIG, so like probe it runs from this commit (scorelsf).
     """
     import subprocess
-    par = params()[n]
+    par = paramsall()[n]
     savedir = Path(par.savedir)
     assert (savedir / "probe/test").is_dir() and (savedir / "probe/fit").is_dir(), f"no probe artifacts in {savedir}: probe first"
     record(par, "score")
@@ -699,7 +705,7 @@ def tile_features(encoder, img, tile):
     return feats
 
 def probe(n:int):
-    """Linear affinity probe of allparams()[n]'s latest checkpoint, scored as mia-evals' neuron-instance task.
+    """Linear affinity probe of paramsall()[n]'s latest checkpoint, scored as mia-evals' neuron-instance task.
 
     Frozen encoder; one Linear per token from its features to mia-evals' 6 affinity channels at every voxel of its
     patch (lib.probe), fitted on HEMIBRAIN_EB_PROBE_BOXES["train"] against proofread-cell-hemibrain-v1.2. Then:
@@ -718,7 +724,7 @@ def probe(n:int):
     from artifact import write_artifact
     from PIL import Image
     from lib.probe import AFFINITY_OFFSETS_XYZ, affinities, average_precision, fit_probe, to_tokens, to_voxels
-    par = params()[n]
+    par = paramsall()[n]
     model, step = load_checkpoint(par)
     record(par, "probe")
     encoder, device = model.encoder, next(model.parameters()).device
@@ -819,9 +825,9 @@ def bsub(par: Params, job: str, minutes: int, n_gpus: int, cmd: str, queue: str 
     print(f"Submitted {name} (code {code}) to LSF.")
 
 def runlsf(n:int):
-    """Train allparams()[n] on LSF, in a fresh savedir (old contents -> outdir/.trash/)."""
-    par:Params = params()[n]
-    assert not par.init_from, f"{par.savedir}: init_from={par.init_from!r} is a probe-only run (training ignores it); submit with probemany"
+    """Train paramsall()[n] on LSF, in a fresh savedir (old contents -> outdir/.trash/)."""
+    par:Params = paramsall()[n]
+    assert not par.init_from, f"{par.savedir}: init_from={par.init_from!r} is a probe-only run (training ignores it); submit with probeall"
     assert par.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={par.n_workers} leaves no core for the training process"
     assert_committed()
     trash(par.savedir)
@@ -831,48 +837,48 @@ def runlsf(n:int):
 def pcalsf(n:int):
     """Redo pca(n) on LSF, e.g. after changing pca_maps in this experiment's change (run() already does it once)."""
     assert_committed()
-    bsub(params()[n], "pca", 30, 1, f"python {{code}}/experiment.py pca {n}")
+    bsub(paramsall()[n], "pca", 30, 1, f"python {{code}}/experiment.py pca {n}")
 
 def probelsf(n:int):
     """probe(n) as its own LSF job: redo a training run's probe, or a probe-only run (par.init_from set)."""
-    par = params()[n]
+    par = paramsall()[n]
     assert_committed()
     Path(par.savedir).mkdir(parents=True, exist_ok=True)  # a probe-only run has no training job to create it
     bsub(par, "probe", 60, 1, f"python {{code}}/experiment.py probe {n}")
 
 def probeall():
-    for i in range(len(params())):
+    for i in range(len(paramsall())):
         probelsf(i)
 
 def scorelsf(n:int):
     """score(n) as a CPU job on SCORE_QUEUE: mia-evals' mutex watershed over probe(n)'s affinity artifacts."""
-    par = params()[n]
+    par = paramsall()[n]
     assert (Path(par.savedir) / "probe/test").is_dir(), f"no probe artifacts in {par.savedir}: probe first (probelsf)"
     assert_committed()
     bsub(par, "score", SCORE_MINUTES, 0, f"python {{code}}/experiment.py score {n}", queue=SCORE_QUEUE, slots=SCORE_SLOTS)
 
 def scoreall():
-    for i in range(len(params())):
+    for i in range(len(paramsall())):
         scorelsf(i)
 
 def pcaall():
-    for i in range(len(params())):
+    for i in range(len(paramsall())):
         pcalsf(i)
 
 def replaylsf(n:int):
-    """replay_bad_batch on LSF for allparams()[n]'s first bad_batch dump. CUDA_LAUNCH_BLOCKING names a crashing kernel."""
-    par = params()[n]
+    """replay_bad_batch on LSF for paramsall()[n]'s first bad_batch dump. CUDA_LAUNCH_BLOCKING names a crashing kernel."""
+    par = paramsall()[n]
     dumps = sorted(Path(par.savedir).glob("bad_batch_*.pt"))
     assert dumps, f"no bad_batch_*.pt in {par.savedir}"
     assert_committed()
     bsub(par, "replay", 30, 1, f"env CUDA_LAUNCH_BLOCKING=1 python {{code}}/experiment.py replay_bad_batch {dumps[0]}")
 
 def runall():
-    for i in range(len(params())):
+    for i in range(len(paramsall())):
         runlsf(i)
 
 def runall_sequential():
-    for i in range(len(params())):
+    for i in range(len(paramsall())):
         run(i)
 
 def test():
