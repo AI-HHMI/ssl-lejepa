@@ -11,6 +11,8 @@ import json
 import os
 import re
 import sys
+from collections import defaultdict
+from fnmatch import fnmatch
 from pathlib import Path
 from urllib.parse import quote
 
@@ -27,7 +29,10 @@ BOUNDARY_CHANNELS = {"short (+1)": ["(1, 0, 0)", "(0, 1, 0)", "(0, 0, 1)"], "lon
 
 
 def read_jsonl(path) -> list[dict]:
-    return [json.loads(l) for l in Path(path).read_text().splitlines() if l.strip()]
+    """JSON-lines rows of `path`, or [] if it doesn't exist (a run dir missing a file it predates, or hasn't
+    written yet)."""
+    p = Path(path)
+    return [json.loads(l) for l in p.read_text().splitlines() if l.strip()] if p.is_file() else []
 
 def profile_device_ms(path: str | Path) -> tuple[float, dict[str, float]]:
     """GPU ms per profiled step from a Benchmark profile.out: the total, and each row of its self-device-time table.
@@ -60,8 +65,7 @@ def saved_params(d: Path) -> dict:
     (runs from before runs.json had params), else {}. The newest row: a dir's rows agree on params except where an
     older job predates a field (e.g. a probe row from before init_from)."""
     for name in ["runs.json", "performance.json"]:
-        f = d / name
-        found = next((r["params"] for r in reversed(read_jsonl(f)) if "params" in r), None) if f.is_file() else None
+        found = next((r["params"] for r in reversed(read_jsonl(d / name)) if "params" in r), None)
         if found:
             return found
     return {}
@@ -134,17 +138,14 @@ def check_runs(root: str = "outdir/e00"):
     Missing: every run dir needs at least a job log and metrics.json (pending or still-running jobs show up too).
     Different: within a sweep, a run lacking file names (top level, excluding IGNORED) that other runs have.
     """
-    import re
-    from collections import defaultdict
     flagged = 0
-    run_dirs = sorted(p for p in Path(root).glob("**/d*/") if re.fullmatch(r"d\d+", p.name))
-    from fnmatch import fnmatch
+    dirs = sorted(p for p in Path(root).glob("**/d*/") if re.fullmatch(r"d\d+", p.name))
     IGNORED = ["job_*.log", ".DS_Store"]  # expected to differ between runs, or not ours
-    names = {d: {f.name for f in d.iterdir() if not any(fnmatch(f.name, g) for g in IGNORED)} for d in run_dirs}
+    names = {d: {f.name for f in d.iterdir() if not any(fnmatch(f.name, g) for g in IGNORED)} for d in dirs}
     sweep_names = defaultdict(set)
-    for d in run_dirs:
+    for d in dirs:
         sweep_names[d.parent] |= names[d]
-    for d in run_dirs:
+    for d in dirs:
         issues = []
         missing = sweep_names[d.parent] - names[d]
         if missing:
@@ -153,13 +154,11 @@ def check_runs(root: str = "outdir/e00"):
             issues.append("no job log")
         if not (d / "metrics.json").is_file():
             issues.append("no metrics.json")
-        perf = d / "performance.json"
-        for line in (perf.read_text().splitlines() if perf.is_file() else []):
-            saved = json.loads(line).get("params", {}).get("savedir")
+        for r in read_jsonl(d / "performance.json"):
+            saved = r.get("params", {}).get("savedir")
             if saved and Path(saved) != d:
                 issues.append(f"row for {saved}")
-        runs = d / "runs.json"
-        n = sum(r.get("fn", "run") == "run" for r in read_jsonl(runs)) if runs.is_file() else 0
+        n = sum(r.get("fn", "run") == "run" for r in read_jsonl(d / "runs.json"))
         if n > 1:
             issues.append(f"{n} training rows in runs.json")
         for log in d.glob("job_*.log"):
@@ -176,8 +175,7 @@ def load_table(sweep: str, filename: str) -> pandas.DataFrame:
     params (saved_params), savedir and run name. Params a run predates are missing (NaN in the table)."""
     rows = []
     for d in run_dirs(sweep):
-        if (d / filename).is_file():
-            rows += [{**saved_params(d), **r, "savedir": str(d), "run": d.name} for r in read_jsonl(d / filename)]
+        rows += [{**saved_params(d), **r, "savedir": str(d), "run": d.name} for r in read_jsonl(d / filename)]
     assert rows, f"no {filename} in outdir/{sweep}/d*/; run ./pull.sh?"
     return pandas.DataFrame(rows)
 
@@ -200,8 +198,8 @@ def loss_curves(sweep: str):
 def run_compute(d: Path) -> tuple[int | None, float | None]:
     """(training steps, total EFLOP) of a run dir: the last logged step in metrics.json + 1, times FLOPs per step from
     the benchmark window (TFLOP/s x s/step, all GPUs; fixed with displace views). None where a file is missing."""
-    m = read_jsonl(d / "metrics.json") if (d / "metrics.json").is_file() else []
-    tp = [r for r in read_jsonl(d / "performance.json") if r.get("tbl") == "throughput"] if (d / "performance.json").is_file() else []
+    m = read_jsonl(d / "metrics.json")
+    tp = [r for r in read_jsonl(d / "performance.json") if r.get("tbl") == "throughput"]
     steps = m[-1]["idx_step"] + 1 if m else None
     t = tp[-1] if tp else {}
     tflop_per_step = t["tflops_per_second"] * t["seconds_per_step"] if t.get("tflops_per_second") else None
@@ -248,6 +246,14 @@ def varying_params(params: list[dict]) -> set:
     known = [p for p in params if p]
     return {k for k in dict.fromkeys(k for p in known for k in p) if len({json.dumps(p.get(k)) for p in known}) > 1}
 
+def sweep_name(sweep: str) -> str:
+    """The sweep's short name, e.g. 'e00/viewsizes-v2' -> 'viewsizes-v2'."""
+    return sweep.split("/")[-1]
+
+def view_sizes(p: dict) -> str:
+    """'<patch>/<global>/<local>' view-size label from saved params, e.g. '16/128/96'."""
+    return f'{p["patch_size"][0]}/{p["global_size"][0]}/{p["local_size"][0]}'
+
 def config_label(p: dict, varying: set) -> str:
     """Short run label from saved params, e.g. 'B300 w512 b64 cudagraphs+eager-pe'; view sizes and GPU count only
     if they vary. '?' for runs that crashed before params were saved (runs.json had none until 2026-09-28)."""
@@ -257,7 +263,7 @@ def config_label(p: dict, varying: set) -> str:
     parts = [p["queue"].removeprefix("gpu_").upper(), f'w{p["width"]}', f'b{p["batch_size"]}',
              mode + ("+eager-pe" if p.get("eager_patch_embed") else "")]
     if varying & {"patch_size", "global_size", "local_size"}:
-        parts.append(f'{p["patch_size"][0]}/{p["global_size"][0]}/{p["local_size"][0]}')
+        parts.append(view_sizes(p))
     if "n_gpus" in varying or p.get("n_gpus", 1) > 1:
         parts.append(f'x{p.get("n_gpus", 1)}')
     return " ".join(parts)
@@ -275,9 +281,9 @@ def bench_rows(sweep: str, *compare: str) -> tuple[list[dict], list[dict]]:
     varying = varying_params(list(params.values()))
     rows, curves = [], []
     for s, d in runs:
-        name = f"{s.split('/')[-1]}/{d.name}" if compare else d.name
-        m = read_jsonl(d / "metrics.json") if (d / "metrics.json").is_file() else []
-        tp = [r for r in read_jsonl(d / "performance.json") if r.get("tbl") == "throughput"] if (d / "performance.json").is_file() else []
+        name = f"{sweep_name(s)}/{d.name}" if compare else d.name
+        m = read_jsonl(d / "metrics.json")
+        tp = [r for r in read_jsonl(d / "performance.json") if r.get("tbl") == "throughput"]
         text = job_text(d, "run")
         exit_code = re.search(r"Exited with exit code (\d+)", text)
         b1 = "illegal memory access" in text
@@ -334,20 +340,43 @@ def bench_speed(sweep: str, *compare: str):
     fig.update_xaxes(title="ktok/s per GPU", range=[0, 1.15 * max(speed.x.max(), 1)])  # room for the labels
     show(fig, f"{sweep}/bench_speed")
 
+def probed_dirs(sweep: str) -> list[Path]:
+    """run_dirs(sweep) that have a probe.json."""
+    return [d for d in run_dirs(sweep) if (d / "probe.json").is_file()]
+
+def probe_stats(d: Path) -> dict:
+    """The (last, only) row of a run's probe.json."""
+    return read_jsonl(d / "probe.json")[-1]
+
+def boundary_ap(st: dict) -> dict[str, float]:
+    """Mean boundary AP per range (BOUNDARY_CHANNELS) from one probe.json row."""
+    return {r: sum(st[f"boundary_ap_{c}"] for c in chans) / 3 for r, chans in BOUNDARY_CHANNELS.items()}
+
+def probe_source(d: Path) -> tuple[Path, dict, str]:
+    """(source run dir, its saved params, init_from) for a probe.json row: d itself, unless init_from points at
+    another run's checkpoint (a probe-only job, e.g. probemany) or "random" (no source run, the baseline)."""
+    init = saved_params(d).get("init_from", "")
+    src = Path(init) if init and init != "random" else d
+    return src, saved_params(src), init
+
+def size_label(p: dict) -> str:
+    """'<patch>/<global>/<local> w<width>' view-size + width label from saved params, or '?' if missing."""
+    return f'{view_sizes(p)} w{p["width"]}' if p else "?"
+
 def probe_table(sweep: str) -> pandas.DataFrame:
     """One row per run with a probe.json: config, the pretraining checkpoint step it probed, how many steps the
     linear probe itself trained for (probe_fit.json, fixed at fit_probe's STEPS unless a run crashed mid-fit) and
     its own walltime (probe_walltime_s: excludes pretraining), test-block boundary AP (mean of the 3 short-range
     channels, then each short and long channel) and mean short-range BCE. Higher AP is better; compare against a
     near-random encoder's run (e.g. probe-test/d1)."""
-    dirs = [d for d in run_dirs(sweep) if (d / "probe.json").is_file()]
+    dirs = probed_dirs(sweep)
     assert dirs, f"no probe.json in outdir/{sweep}/d*/; run ./pull.sh?"
     params = {d: saved_params(d) for d in dirs}
     varying = varying_params(list(params.values()))
     rows = []
     for d in dirs:
-        st = read_jsonl(d / "probe.json")[-1]
-        fit = read_jsonl(d / "probe_fit.json") if (d / "probe_fit.json").is_file() else []
+        st = probe_stats(d)
+        fit = read_jsonl(d / "probe_fit.json")
         aps = {k.removeprefix("boundary_ap_"): v for k, v in st.items() if k.startswith("boundary_ap_(")}
         bce = [v for k, v in st.items() if k.startswith("bce_(")][:3]
         walltime = probe_walltime_s(d)
@@ -359,34 +388,25 @@ def probe_table(sweep: str) -> pandas.DataFrame:
     save_table(res, f"{sweep}/probe")
     return res
 
-def boundary_ap(st: dict) -> dict[str, float]:
-    """Mean boundary AP per range (BOUNDARY_CHANNELS) from one probe.json row."""
-    return {r: sum(st[f"boundary_ap_{c}"] for c in chans) / 3 for r, chans in BOUNDARY_CHANNELS.items()}
-
 def probe_vs_compute(sweep: str, *compare: str):
     """Probe boundary AP vs total training compute, one point per probed run of sweep and any compare sweeps, for
     short-range (+1 voxel: membranes) and long-range (+10: same neuron?) affinities. A probe-only run (init_from a run
     dir) is placed at its source run's compute; init_from random is the dashed baseline in each panel."""
     points, random = [], {}
     for sw in (sweep, *compare):
-        for d in run_dirs(sw):
-            if not (d / "probe.json").is_file():
-                continue
-            st = read_jsonl(d / "probe.json")[-1]
-            ap = boundary_ap(st)
-            init = saved_params(d).get("init_from", "")
+        for d in probed_dirs(sw):
+            ap = boundary_ap(probe_stats(d))
+            src, p, init = probe_source(d)
             if init == "random":
                 random = ap
                 continue
-            src = Path(init) if init else d  # a probe-only run's compute is its source run's
-            p = saved_params(src)
             steps, eflop = run_compute(src)
-            label = f'{p["patch_size"][0]}/{p["global_size"][0]}/{p["local_size"][0]} w{p["width"]}' + (f' x{p["n_gpus"]}' if p.get("n_gpus", 1) > 1 else "")
-            points += [{"range": r, "AP": v, "EFLOP": eflop, "steps": steps, "run": f"{sw.split('/')[-1]}/{d.name}", "config": label,
-                        "source": "/".join(src.parts[-2:]), "sweep": sw.split("/")[-1] if not init else "/".join(src.parts[-2:-1])} for r, v in ap.items()]
+            label = size_label(p) + (f' x{p["n_gpus"]}' if p.get("n_gpus", 1) > 1 else "")
+            points += [{"range": r, "AP": v, "EFLOP": eflop, "steps": steps, "run": f"{sweep_name(sw)}/{d.name}", "config": label,
+                        "source": "/".join(src.parts[-2:]), "sweep": sweep_name(sw) if not init else "/".join(src.parts[-2:-1])} for r, v in ap.items()]
     assert points, f"no probe.json in {(sweep, *compare)}; run ./pull.sh?"
     res = pandas.DataFrame(points)
-    res["label"] = res.config.where(res.sweep != sweep.split("/")[-1], "")  # name only the reference models; hover the rest
+    res["label"] = res.config.where(res.sweep != sweep_name(sweep), "")  # name only the reference models; hover the rest
     fig = px.scatter(res, x="EFLOP", y="AP", color="sweep", facet_col="range", text="label", log_x=True,
                      hover_data=["config", "run", "source", "steps"], category_orders={"range": list(BOUNDARY_CHANNELS)},
                      title=f"Linear-probe boundary AP vs training compute: {', '.join((sweep, *compare))}")
@@ -405,15 +425,10 @@ def probe_short_vs_long(sweep: str, *compare: str):
     init_from random is the dashed crosshair baseline."""
     points, random = [], {}
     for sw in (sweep, *compare):
-        for d in run_dirs(sw):
-            if not (d / "probe.json").is_file():
-                continue
-            ap = boundary_ap(read_jsonl(d / "probe.json")[-1])
-            init = saved_params(d).get("init_from", "")
-            src = Path(init) if init and init != "random" else d  # a probe-only run's config is its source run's
-            p = saved_params(src)
-            label = f'{p["patch_size"][0]}/{p["global_size"][0]}/{p["local_size"][0]} w{p["width"]}' if p else "?"
-            row = {**ap, "run": f"{sw.split('/')[-1]}/{d.name}", "config": label, "sweep": sw.split("/")[-1]}
+        for d in probed_dirs(sw):
+            ap = boundary_ap(probe_stats(d))
+            _, p, init = probe_source(d)
+            row = {**ap, "run": f"{sweep_name(sw)}/{d.name}", "config": size_label(p), "sweep": sweep_name(sw)}
             if init == "random":
                 random = row
             else:
@@ -435,15 +450,16 @@ def mia_evals_table(sweep: str) -> pandas.DataFrame:
     the probe's long-range boundary AP. Reference: gary's supervised dinov3 model, pq ~0.11 at 100k steps (cc_threshold)."""
     rows, params = [], {}
     for d in run_dirs(sweep):
+        pj = read_jsonl(d / "probe.json")
+        st = pj[-1] if pj else {}
         for f in sorted(d.glob("mia_evals/*/records/*.json")):
             r = json.loads(f.read_text())
             v = r["scores"]["voxel_instance"]
-            st = read_jsonl(d / "probe.json")[-1] if (d / "probe.json").is_file() else {}
             params[d] = saved_params(d)
             rows.append({"run": d.name, "route": r["route"], "pq": v["pq"], "voi_split": v["voi_split"], "voi_merge": v["voi_merge"],
                          "ARE": v["adapted_rand_error"], "instances": f'{int(v["instances_predicted"])}/{int(v["instances_truth"])}',
                          "postprocess": r["postprocess"]["describe"],
-                         "probe AP long": sum(st.get(f"boundary_ap_{c}", float("nan")) for c in ["(10, 0, 0)", "(0, 10, 0)", "(0, 0, 10)"]) / 3})
+                         "probe AP long": sum(st.get(f"boundary_ap_{c}", float("nan")) for c in BOUNDARY_CHANNELS["long (+10)"]) / 3})
     assert rows, f"no mia-evals records in outdir/{sweep}/d*/mia_evals/; score first (experiment.scorelsf), then ./pull.sh"
     varying = varying_params(list(params.values()))
     res = pandas.DataFrame(rows)
@@ -545,7 +561,7 @@ def nanhunt_plot():
     rows = []
     for sweep in ["nanhunt", "nanhunt_beta95", "nanhunt_flash"]:
         for f in sorted(Path(f"outdir/e00/{sweep}").glob("d*/metrics.json")):
-            rows += [{**json.loads(l), "run": f.parent.name, "sweep": sweep} for l in f.read_text().splitlines() if l.strip()]
+            rows += [{**r, "run": f.parent.name, "sweep": sweep} for r in read_jsonl(f)]
     assert rows, "no e00/nanhunt* metrics.json; run ./pull.sh?"
     res = pandas.DataFrame(rows).query("tbl == 'metrics'")
     metrics = ["resid_norm", "grad_norm", "loss"]
@@ -594,14 +610,13 @@ def flash_perf():
     rows = []
     for sweep, attention in [("nanhunt", "cuDNN β2=.999"), ("nanhunt_beta95", "cuDNN"), ("nanhunt_flash", "flash")]:
         for d in sorted(Path(f"outdir/e00/{sweep}").glob("d*/")):
-            perf = [json.loads(l) for l in (d / "performance.json").read_text().splitlines() if l.strip()]
-            r = [x for x in perf if x["tbl"] == "throughput"][-1]
+            r = [x for x in read_jsonl(d / "performance.json") if x["tbl"] == "throughput"][-1]
             total, kernels = profile_device_ms(d / "profile.out")
             fwd = sum(v for k, v in kernels.items() if re.search(ATTN, k) and not re.search(BWD, k))
             bwd = sum(v for k, v in kernels.items() if re.search(ATTN, k) and re.search(BWD, k))
             p = r["params"]
             rows.append({"attention": attention, "sweep": sweep, "mfu %": 100 * r["mfu"],
-                         "config": f'{d.name} {p["patch_size"][0]}/{p["global_size"][0]}/{p["local_size"][0]} b{p["batch_size"]}',
+                         "config": f'{d.name} {view_sizes(p)} b{p["batch_size"]}',
                          "ktok/s per GPU": r["tokens_per_second"] / 1e3 / r["world_size"],
                          "attention fwd": fwd, "attention bwd": bwd, "other": total - fwd - bwd})
     assert rows, "no e00/nanhunt* results; run ./pull.sh?"
@@ -665,8 +680,7 @@ def perf_journey():
 
     def perf(run):  # (total tok/s, n_gpus, mfu or None) from the run's last throughput row
         f = Path("outdir/e00") / run / "performance.json"
-        rows = [json.loads(l) for l in f.read_text().splitlines() if l.strip()] if f.is_file() else []
-        tp = [r for r in rows if r["tbl"] == "throughput"]
+        tp = [r for r in read_jsonl(f) if r["tbl"] == "throughput"]
         assert tp, f"no throughput row in {f}; run ./pull.sh?"
         r = tp[-1]
         return r["tokens_per_second"], r.get("world_size") or r["params"].get("n_gpus", 1), r.get("mfu")  # pre-DDP: 1 GPU
