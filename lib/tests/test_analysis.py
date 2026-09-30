@@ -38,8 +38,10 @@ def test_bench_reports_crashes_with_short_config(tmp_path, monkeypatch):
     (ok / "job_run_1.log").write_text("...\nSuccessfully completed.\n")
     for d in [crashed, legacy]:
         (d / "job_run_2.log").write_text("CUDA error: an illegal memory access was encountered\nExited with exit code 1.\n")
-    res = analysis.bench("e00/b")
-    assert list(res.columns) == ["run", "config", "status", "steps", "EFLOP", "finite", "loss0", "loss_end", "ktok/s/gpu", "mfu %", "mem GB"]
+    res = analysis.bench_table("e00/b")
+    analysis.bench_loss("e00/b")
+    analysis.bench_speed("e00/b")
+    assert list(res.columns) == ["run", "config", "status", "steps", "EFLOP", "walltime", "finite", "loss0", "loss_end", "ktok/s/gpu", "mfu %", "mem GB"]
     assert res.steps[0] == 11 and abs(res.EFLOP[0] - 500 * 0.4 * 11 / 1e6) < 1e-3  # last logged idx_step 10 -> 11 steps
     assert list(res.config) == ["B300 w512 b84 cudagraphs+eager-pe", "B300 w512 b64 cudagraphs+eager-pe", "? (no saved params)"]
     assert list(res.status) == ["ok", "exit 1: illegal memory access", "exit 1: illegal memory access"]
