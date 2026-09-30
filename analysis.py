@@ -266,6 +266,8 @@ def config_label(p: dict, varying: set) -> str:
         parts.append(view_sizes(p))
     if "n_gpus" in varying or p.get("n_gpus", 1) > 1:
         parts.append(f'x{p.get("n_gpus", 1)}')
+    if "lr" in varying:
+        parts.append(f'lr{p["lr"]:.1e}')
     return " ".join(parts)
 
 def bench_rows(sweep: str, *compare: str) -> tuple[list[dict], list[dict]]:
@@ -749,6 +751,41 @@ def e00_probe_test():
     Images: outdir/e00/probe-test/d*/probe.png (EM | true boundaries | predicted boundaries)."""
     probe_table("e00/probe-test")
     probe_curves("e00/probe-test")
+
+def scaling_law_calib_lr_scan():
+    """Final loss vs lr, one line per model size (e00/scaling-law-calib: 5 sizes x 0.5/1/2x lr, 15 min each): is the
+    curve monotonic, and which direction, before trusting main's per-size lr (allparams()' lr ~ 1/width rule)?
+    A run missing from a line OOM'd before logging any step (see bench_table's status column)."""
+    res = load_table("e00/scaling-law-calib", "metrics.json")
+    last = res.sort_values("idx_step").groupby("savedir").last().reset_index()
+    show(px.line(last.sort_values(["width", "lr"]), x="lr", y="loss", color="width", markers=True, log_x=True,
+                 title="e00/scaling-law-calib: final loss vs lr per model size"), "e00/scaling-law-calib/lr_scan")
+
+def scaling_law_calib_loss_vs_flops():
+    """Final loss vs total training compute (EFLOP), one point per run colored by model size (e00/scaling-law-calib).
+    Not an IsoFLOP comparison (each run trains 15 min wall-clock, not a matched compute budget): shows where each
+    size naturally lands, not yet which size is compute-optimal at a fixed budget (that's the main grid)."""
+    rows = []
+    for d in run_dirs("e00/scaling-law-calib"):
+        m = read_jsonl(d / "metrics.json")
+        if not m:
+            continue  # OOM'd before logging any step (xl)
+        p = saved_params(d)
+        _, eflop = run_compute(d)
+        rows.append({"run": d.name, "width": p.get("width"), "lr": p.get("lr"), "loss": m[-1]["loss"], "EFLOP": eflop})
+    res = pandas.DataFrame(rows)
+    fig = px.scatter(res, x="EFLOP", y="loss", color=res.width.astype(str), log_x=True, log_y=True,
+                     hover_data=["run", "lr"], category_orders={"color": [str(w) for w in sorted(res.width.unique())]},
+                     title="e00/scaling-law-calib: final loss vs training compute per model size")
+    fig.update_layout(legend_title="width")
+    show(fig, "e00/scaling-law-calib/loss_vs_flops")
+
+def e00_scaling_law_calib():
+    """Per-size lr sensitivity before trusting main's lr (lr ~ 1/width): does loss end lower with higher or lower
+    lr, and is any size non-monotonic? xl OOMs at batch 64 on one B300 (see bench_table's status column)."""
+    bench_table("e00/scaling-law-calib")
+    scaling_law_calib_lr_scan()
+    scaling_law_calib_loss_vs_flops()
 
 def e00_viewsizes_v2():
     """View-size study with the fixed stack: training loss, probe scores per config (d0-d16 and repeats d17-d33)."""
