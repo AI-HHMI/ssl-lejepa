@@ -882,9 +882,9 @@ def runall_sequential():
         run(i)
 
 def mpix_per_week():
-    a = 1e6 # pix/s on 1 node
+    a = 525e6 * 8 # pix/s on 1 node = 8 gpu (ViT size m)
     b = 3600 * 24 * 7 # s/week
-    c = 10_000**3
+    # c = 10_000**3
     d = 103_884_030_089_749
 
     r1 = a*b # pix/week 1 node
