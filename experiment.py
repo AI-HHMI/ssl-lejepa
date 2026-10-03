@@ -881,9 +881,25 @@ def runall_sequential():
     for i in range(len(paramsall())):
         run(i)
 
+def mpix_per_week():
+    a = 1e6 # pix/s on 1 node
+    b = 3600 * 24 * 7 # s/week
+    c = 10_000**3
+    d = 103_884_030_089_749
+
+    r1 = a*b # pix/week 1 node
+    r2 = d   # pix/dataset
+    print(d/(a*b))
+
+
 def test():
+    tot = 0
+    from math import prod
     for vol in lmd.all():
         print(vol.name, vol.shape)
+        tot += prod(vol.shape[-3:])
+
+    print("tot = ", tot) # 103_884_030_089_749
 
     # import lib.data as libdata
     # x = libdata.TRAIN_BOXES["hemibrain_eb"][libdata.HEMIBRAIN_EB]

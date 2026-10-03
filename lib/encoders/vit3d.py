@@ -269,6 +269,26 @@ class ViT3DEncoder(nn.Module):
             x = block(x)
         return x
 
+    def forward_intermediate(self, x: Tensor, layer_idxs: Tuple[int, ...]) -> Tuple[Tensor, list[Tensor], Tup3Int]:
+        """Same residual stream as forward_residual (final block, pre-LayerNorm), plus each requested block's own
+        output (also pre-LayerNorm) -- for a decoder's skip connections (e.g. lib.decoders.unetr.Unetr), which need
+        the complete, correctly shaped (Gz Gy Gx) token grid, so token dropout never applies here regardless of
+        self.training.
+
+        x: Batch C Z Y X. layer_idxs: 0-based block indices, each < depth.
+        Returns (final Batch N D, [one Batch N D per layer_idxs, in that order], (Gz Gy Gx)).
+        """
+        assert all(0 <= i < self.depth for i in layer_idxs), f"layer_idxs {layer_idxs} out of range for depth {self.depth}"
+        tokens, grid_size = self.patch_embed(x)
+        pos_embed = get_3d_sincos_pos_embed(self.embed_dim, grid_size, device=x.device, dtype=tokens.dtype)
+        x = tokens + pos_embed
+        saved: dict[int, Tensor] = {}
+        for i, block in enumerate(self.blocks):
+            x = block(x)
+            if i in layer_idxs:
+                saved[i] = x
+        return x, [saved[i] for i in layer_idxs], grid_size
+
     def forward(self, x: Tensor) -> Tensor:
         """Forward pass with global average pooling (mean over tokens).
 

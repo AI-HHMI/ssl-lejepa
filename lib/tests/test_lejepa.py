@@ -40,6 +40,16 @@ def test_vit3d_encoder_forward():
     assert out.shape == (2, 64)
 
 
+def test_vit3d_encoder_forward_intermediate():
+    encoder = ViT3DEncoder(patch_size=(2, 2, 2), embed_dim=8, depth=4, num_heads=2).eval()
+    x = torch.randn(2, 1, 8, 8, 8)  # grid 4 4 4 = 64 tokens
+    final, intermediates, grid = encoder.forward_intermediate(x, (1, 3))
+    assert grid == (4, 4, 4)
+    assert final.shape == (2, 64, 8) and len(intermediates) == 2 and all(t.shape == (2, 64, 8) for t in intermediates)
+    assert torch.equal(final, intermediates[-1])  # the last requested layer is also the final block
+    assert torch.equal(final, encoder.forward_residual(x))  # same computation as the ordinary (no-skip-taps) path
+
+
 def test_sigreg():
     sigreg = SIGReg(num_slices=32, knots=9, t_max=3.0)
     # (n_views, batch, features)
