@@ -882,10 +882,21 @@ def runall_sequential():
         run(i)
 
 def test():
-    x = lmd.all()
-    for xi in x:
-        if "em-drosophila-flyem-hemibrain/crop-001_EllipsoidBody_x24000_y23000_z17000" in xi.name:
-            pprint(xi)
+    for vol in lmd.all():
+        print(vol.name, vol.shape)
+
+    # import lib.data as libdata
+    # x = libdata.TRAIN_BOXES["hemibrain_eb"][libdata.HEMIBRAIN_EB]
+    # print(x)
+    # x = libdata.TRAIN_BOXES["hemibrain_wide"][libdata.HEMIBRAIN_002]
+    # print(x)
+    # x = libdata.TRAIN_BOXES["hemibrain_wide"][libdata.HEMIBRAIN_003]
+    # print(x)
+    # print(lmd.get(HEMIBRAIN_EB))
+    # print(libdata.hemibrain_wide_config("train"))
+    # for xi in x:
+    #     if "em-drosophila-flyem-hemibrain/crop-001_EllipsoidBody_x24000_y23000_z17000" in xi.name:
+    #         pprint(xi)
 
 def size():
   import zarr

@@ -62,3 +62,18 @@ def hemibrain_eb_config(split: str) -> MiaoConfig:
         output_axes="lcxyz",
         samples_per_epoch=100000 if split == "train" else 32,
     )
+
+def hemibrain_wide_config(split: str) -> MiaoConfig:
+    """MiaoConfig over TRAIN_BOXES["hemibrain_wide"]'s volumes (crop-002 + crop-003, ~2.1 Tvox combined).
+
+    Only "train" is defined: no held-out region has been carved out of this corpus, so training loss here reflects
+    repeated passes over a fixed corpus at the smaller end of a compute budget, not a genuine held-out metric."""
+    assert split == "train", f"split must be 'train' (no val/test defined for hemibrain_wide yet), got {split!r}"
+    volumes = [lmd.get(name).to_miao(spatial_axes="xyz", bounding_box=box) for name, box in TRAIN_BOXES["hemibrain_wide"].items()]
+    return MiaoConfig(
+        volumes=volumes,
+        resolutions=[[8.0, 8.0, 8.0]],
+        patch_size=[256, 256, 256],
+        output_axes="lcxyz",
+        samples_per_epoch=100000,
+    )
