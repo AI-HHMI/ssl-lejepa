@@ -880,6 +880,12 @@ def e00_scaling_law():
     scaling_law_lr_vs_flops()
     scaling_law_isoflop()
 
+def e00_unetr_probe():
+    """UNETR decoder vs the linear probe on the scaling-law c4 checkpoints (probe-only runs, init_from scaling-law/d15-d19):
+    probe table and boundary AP vs training compute, next to scaling-law's own linear-probe points."""
+    probe_table("e00/unetr-probe")
+    probe_vs_compute("e00/unetr-probe", "e00/scaling-law")
+
 def e00_viewsizes_v2():
     """View-size study with the fixed stack: training loss, probe scores per config (d0-d16 and repeats d17-d33)."""
     # bench_table("e00/viewsizes-v2")

@@ -86,6 +86,44 @@ def test_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch):
     assert all(0 <= f["held_boundary_ap"] <= 1 and f["held_bce"] > 0 for f in fit)
 
 
+def test_unetr_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch):
+    # Same synthetic store, boxes and context padding as the linear probe's end-to-end test above (32^3 boxes ->
+    # 48^3 of context at global_size=24): only the decoder and the tiny encoder's patch_size/depth differ, since
+    # Unetr needs at least one block per upsample stage (num_stages = log2(patch_size); patch_size=2 -> 1 stage).
+    store = tmp_path / "crop.zarr"
+    x, y, z = np.meshgrid(*[np.arange(64)] * 3, indexing="ij")
+    zarr.open_array(str(store / "raw/s0"), mode="w", shape=(64, 64, 64), dtype="uint8")[:] = (x * 4).astype(np.uint8)
+    lab = 1 + (x >= 40)
+    zarr.open_array(str(store / "labels/cells/s0"), mode="w", shape=(64, 64, 64), dtype="uint64")[:] = lab
+    boxes = {"train": [[24, 56], [24, 56], [24, 56]], "fit": [[20, 52], [24, 56], [24, 56]], "test": [[24, 56], [20, 52], [24, 56]]}
+    par = experiment.Params(savedir=str(tmp_path / "run"), global_size=(24, 24, 24),
+                            decoder="unetr", unetr_hidden_dim=8, unetr_steps=20)
+    (tmp_path / "run").mkdir()
+    monkeypatch.setattr(experiment, "paramsall", lambda: [par])
+    monkeypatch.setattr(experiment, "HEMIBRAIN_EB_PROBE_BOXES", boxes)
+    monkeypatch.setattr(experiment, "HEMIBRAIN_EB_PROBE_ANNOTATED", {k: v for k, v in boxes.items() if k != "train"})
+    monkeypatch.setattr(experiment, "HEMIBRAIN_EB_LABELS", "labels/cells")
+    monkeypatch.setattr(experiment.lmd, "get", lambda name: SimpleNamespace(path=str(store)))
+    monkeypatch.setattr(experiment, "code_provenance", lambda: {"commit_id": "test"})
+    model = Lejepa(LejepaConfig(n_layers=2, width=16, num_heads=2, patch_size=(2, 2, 2), proj_hidden=16, proj_dim=8))
+    monkeypatch.setattr(experiment, "load_checkpoint", lambda p: (model.eval(), 7))
+    experiment.probe(0)
+
+    stats = json.loads((tmp_path / "run/probe.json").read_text())
+    assert stats["step"] == 7 and 0 <= stats["boundary_ap_short"] <= 1
+    frac = [stats[f"boundary_frac_{o}"] for o in AFFINITY_OFFSETS_XYZ[:3]]
+    assert abs(frac[0] - 1 / 31) < 0.003 and frac[1] == frac[2] == 0
+    from artifact import open_artifact
+    art = open_artifact(tmp_path / "run/probe/test/hemibrain_eb_test.zarr")
+    assert art.spatial_shape == (32, 32, 32) and list(art.origin) == [24, 20, 24]
+    arr = np.asarray(zarr.open_array(str(tmp_path / "run/probe/test/hemibrain_eb_test.zarr"), mode="r")[:])
+    assert arr.shape == (6, 32, 32, 32) and 0 <= arr.min() and arr.max() <= 1  # tiled over the 48^3 padded region, then trimmed
+    assert (tmp_path / "run/probe.png").is_file() and (tmp_path / "run/probe/fit/hemibrain_eb_fit.zarr").is_dir()
+    fit = [json.loads(l) for l in (tmp_path / "run/probe_fit.json").read_text().splitlines()]
+    assert fit[0]["step"] == 0 and fit[-1]["step"] == 19 and all(f["tbl"] == "probe_fit" for f in fit)
+    assert all(0 <= f["held_boundary_ap"] <= 1 and f["held_bce"] > 0 for f in fit)
+
+
 def test_load_checkpoint_init_from(tmp_path, monkeypatch):
     monkeypatch.setattr(experiment, "lejepa_config", lambda par: LejepaConfig(n_layers=1, width=16, num_heads=2, patch_size=(4, 4, 4),
                                                                               proj_hidden=16, proj_dim=8))

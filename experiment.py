@@ -90,6 +90,10 @@ class Params:
 
     # evals
     init_from: str = ""  # weights pca/probe evaluate: "" this run's checkpoint; a run dir, its latest one; "random" untrained
+    decoder: Decoder = "linear"  # probe(): "linear" (per-token Linear, lib.probe.fit_probe) or "unetr" (lib.decoders.unetr)
+    unetr_hidden_dim: int = 64  # decoder="unetr": its decoder channel width (lib.decoders.unetr.UnetrConfig)
+    unetr_steps: int = 3000  # decoder="unetr": fit_unetr training steps (fit_probe's STEPS, for comparison)
+    unetr_freeze_encoder: bool = True  # decoder="unetr": keep the encoder frozen while fitting it (fair vs. the linear probe)
 
     # profiling params
     warmup_steps: int = 10
@@ -172,29 +176,70 @@ def paramsall():
     flops_per_hour_m = 3600 / step_s("m", BATCH) * flops("m") * BATCH
     BUDGET_HOURS_AT_M = {"c1": 1, "c2": 2, "c3": 4, "c4": 8}  # m's wall-clock at each budget; other sizes get more/fewer steps
     BUDGETS = {b: h * flops_per_hour_m for b, h in BUDGET_HOURS_AT_M.items()}
-    for bi, budget_flops in enumerate(BUDGETS.values()):
-        for si, (name, (n_layers, width)) in enumerate(SIZES.items()):
-            p = Params()
-            p.savedir = f"outdir/e00/scaling-law/d{bi * len(SIZES) + si}/"
-            p.data = "hemibrain_wide"
-            p.views = "displace"
-            p.patch_size = (128, 128, 128)
-            p.global_size = (96, 96, 96)
-            p.local_size = (64, 64, 64)
-            p.n_layers, p.width = n_layers, width
-            p.lr = lr(width) * CALIB_BEST_LR_MULT.get(name, 1.0)  # xl: no calib data (OOM at every lr), rule lr unscaled
-            p.batch_size = BATCH
-            steps = budget_flops / (flops(name) * BATCH)
-            p.steps_per_epoch = round(steps)
-            p.max_hours = 2 * steps * step_s(name, BATCH) / 3600
-            p.weight_decay = 0.05
-            p.adam_beta2 = 0.95
-            p.cudagraphs = True
-            p.batch_views = True
-            p.n_workers = 11  # 12 cores per GPU
-            p.n_gpus = 1
-            p.queue = "gpu_b300"
-            params.append(p)
+    # for bi, budget_flops in enumerate(BUDGETS.values()):
+    #     for si, (name, (n_layers, width)) in enumerate(SIZES.items()):
+    #         p = Params()
+    #         p.savedir = f"outdir/e00/scaling-law/d{bi * len(SIZES) + si}/"
+    #         p.data = "hemibrain_wide"
+    #         p.views = "displace"
+    #         p.patch_size = (128, 128, 128)
+    #         p.global_size = (96, 96, 96)
+    #         p.local_size = (64, 64, 64)
+    #         p.n_layers, p.width = n_layers, width
+    #         p.lr = lr(width) * CALIB_BEST_LR_MULT.get(name, 1.0)  # xl: no calib data (OOM at every lr), rule lr unscaled
+    #         p.batch_size = BATCH
+    #         steps = budget_flops / (flops(name) * BATCH)
+    #         p.steps_per_epoch = round(steps)
+    #         p.max_hours = 2 * steps * step_s(name, BATCH) / 3600
+    #         p.weight_decay = 0.05
+    #         p.adam_beta2 = 0.95
+    #         p.cudagraphs = True
+    #         p.batch_views = True
+    #         p.n_workers = 11  # 12 cores per GPU
+    #         p.n_gpus = 1
+    #         p.queue = "gpu_b300"
+    #         params.append(p)
+
+    # Dense-decoder probe comparison: does a UNETR decoder (lib.decoders.unetr, skip connections into the frozen
+    # encoder's own intermediate blocks) beat the linear probe's boundary AP? e00/scaling-law already probed every
+    # checkpoint here with the linear decoder (run()'s automatic probe(n), since every entry above has max_hours >
+    # 0), so this sweep only adds the unetr variant -- analysis.probe_vs_compute("e00/unetr-probe",
+    # "e00/scaling-law") compares them directly. Probe-only (init_from): submit with probelsf, not runlsf/runall.
+    # One checkpoint per size, budget c4 (d15-d19: the most-trained of each size), same patch/global/local sizes
+    # as scaling-law, so par.global_size is also Unetr's crop size (fit_unetr trains on the view distribution the
+    # encoder itself saw).
+    for i, (name, (n_layers, width)) in enumerate(SIZES.items()):
+        p = Params()
+        p.savedir = f"outdir/e00/unetr-probe/d{i}/"
+        p.init_from = f"outdir/e00/scaling-law/d{15 + i}/"
+        p.n_layers, p.width = n_layers, width
+        p.patch_size = (128, 128, 128)
+        p.global_size = (96, 96, 96)
+        p.local_size = (64, 64, 64)
+        p.decoder = "unetr"
+        params.append(p)
+    # Random-init baseline (the repo's one validated size, m: n_layers=12, width=512) -- "the baseline every
+    # trained encoder must beat" (load_checkpoint).
+    p = Params()
+    p.savedir = "outdir/e00/unetr-probe/d5/"
+    p.init_from = "random"
+    p.n_layers, p.width = SIZES["m"]
+    p.patch_size = (128, 128, 128)
+    p.global_size = (96, 96, 96)
+    p.local_size = (64, 64, 64)
+    p.decoder = "unetr"
+    params.append(p)
+    # Same, but the random encoder trains end to end with the decoder: the from-scratch (no pretraining) reference.
+    p = Params()
+    p.savedir = "outdir/e00/unetr-probe/d6/"
+    p.init_from = "random"
+    p.n_layers, p.width = SIZES["m"]
+    p.patch_size = (128, 128, 128)
+    p.global_size = (96, 96, 96)
+    p.local_size = (64, 64, 64)
+    p.decoder = "unetr"
+    p.unetr_freeze_encoder = False
+    params.append(p)
     return params
 
 def record(par: Params, fn: str):
@@ -704,19 +749,40 @@ def tile_features(encoder, img, tile):
             feats[z // p[0]:z // p[0] + g[0], y // p[1]:y // p[1] + g[1], x // p[2]:x // p[2] + g[2]] = t[0].reshape(*g, -1)
     return feats
 
-def probe(n:int):
-    """Linear affinity probe of paramsall()[n]'s latest checkpoint, scored as mia-evals' neuron-instance task.
+def tile_logits(model, img, tile):
+    """A dense model's (lib.decoders.unetr.Unetr) raw per-voxel logits over img (Z Y X in [0, 1], on the model's
+    device, a multiple of tile), from non-overlapping tile-sized crops at the training global-view size, stitched:
+    OutDim Z Y X. Unlike tile_features (whose Linear head needs no spatial context beyond one token's own patch),
+    this tiles the whole model (encoder + decoder), since Unetr's skip connections need a full crop each call."""
+    import torch
+    out = None
+    with torch.no_grad():
+        for z, y, x in product(*(range(0, s, t) for s, t in zip(img.shape, tile))):
+            logits = model(img[None, None, z:z + tile[0], y:y + tile[1], x:x + tile[2]])[0]  # OutDim tz ty tx
+            if out is None:
+                out = torch.empty(logits.shape[0], *img.shape, dtype=logits.dtype, device=img.device)
+            out[:, z:z + tile[0], y:y + tile[1], x:x + tile[2]] = logits
+    assert out is not None, "img must be nonempty"
+    return out
 
-    Frozen encoder; one Linear per token from its features to mia-evals' 6 affinity channels at every voxel of its
-    patch (lib.probe), fitted on HEMIBRAIN_EB_PROBE_BOXES["train"] against proofread-cell-hemibrain-v1.2. Then:
+def probe(n:int):
+    """Linear or dense (par.decoder) affinity probe of paramsall()[n]'s latest checkpoint, scored as mia-evals'
+    neuron-instance task, fitted on HEMIBRAIN_EB_PROBE_BOXES["train"] against proofread-cell-hemibrain-v1.2.
+
+    decoder="linear" (default, lib.probe): frozen encoder, one Linear per token to mia-evals' 6 affinity channels
+      at every voxel of its patch.
+    decoder="unetr" (lib.decoders.unetr): Unetr, with skip connections into the encoder's own intermediate blocks,
+      fitted end to end on crops the same size as the encoder's own training views (par.global_size); frozen
+      unless par.unetr_freeze_encoder=False.
+    Either way:
       savedir/probe.json          test-block BCE and boundary AP per channel (cheap, immediate)
-      savedir/probe_fit.json      the probe's fit curve every 100 steps: training BCE, and BCE and boundary AP on
-                                  a fixed held-out sample of test-block tokens (monitoring only, nothing selects on it)
+      savedir/probe_fit.json      the fit curve every 100 steps: training loss, and BCE and boundary AP on a
+                                  fixed held-out sample (monitoring only, nothing selects on it)
     Weights: par.init_from (load_checkpoint): this run's checkpoint, an older run's, or random (the baseline).
       savedir/probe/{fit,test}/hemibrain_eb_{split}.zarr   mia-evals affinity artifacts, (6, X, Y, Z) float16, for
                                   `mia-evals score` with truth_kind = "instances" (reads the GT from the store)
       savedir/probe.png           test block, middle z: EM | true boundaries | predicted boundaries
-    Tokens get whole tiles of context around each 896^3 block, as in training.
+    Reads get whole tiles of context (par.global_size) around each 896^3 block, as in training.
     """
     import math
     import torch
@@ -733,7 +799,10 @@ def probe(n:int):
     raw, lab = zarr.open_array(f"{vol.path}/raw/s0", mode="r"), zarr.open_array(f"{vol.path}/{HEMIBRAIN_EB_LABELS}/s0", mode="r")
     offsets = [o[::-1] for o in AFFINITY_OFFSETS_XYZ]  # the store is x y z; the model sees z y x
 
-    def block(box):  # (token features N D, labels Z Y X, EM Z Y X) for an x y z box of the store
+    def block(box):  # (token features N D, labels Z Y X, EM Z Y X, padded img Z Y X [a multiple of par.global_size],
+        # margin m, box size) for an x y z box of the store: img/m/size let a dense model (unetr) tile the padded
+        # region (tile_logits needs an exact multiple of par.global_size, unlike em, trimmed to the box's own size)
+        # and then trim its predictions back to the box with the same margin feats are trimmed by, in token space.
         lo, size = [b[0] for b in box][::-1], [b[1] - b[0] for b in box][::-1]  # z y x
         region = [math.ceil(s / t) * t for s, t in zip(size, par.global_size)]  # whole tiles around the box
         m = [(r - s) // 2 for r, s in zip(region, size)]
@@ -747,31 +816,65 @@ def probe(n:int):
         (bx0, bx1), (by0, by1), (bz0, bz1) = box
         labels = torch.from_numpy(np.asarray(lab[bx0:bx1, by0:by1, bz0:bz1]).astype(np.int64)).permute(2, 1, 0).to(device)
         em = img[m[0]:m[0] + size[0], m[1]:m[1] + size[1], m[2]:m[2] + size[2]]
-        return feats.reshape(-1, feats.shape[-1]), labels.contiguous(), em
+        return feats.reshape(-1, feats.shape[-1]), labels.contiguous(), em, img, m, size
 
     assert len(set(p)) == 1, f"patch {p} must be cubic"
-    test = block(HEMIBRAIN_EB_PROBE_BOXES["test"])  # reused for the predictions below
-    aff, valid = affinities(test[1], offsets)
-    g = torch.Generator(device=device).manual_seed(0)
-    i = torch.randperm(len(test[0]), device=device, generator=g)[:16384]  # held-out tokens, for the fit curve only
-    held = (test[0][i], to_tokens(aff, p[0])[i], to_tokens(valid, p[0])[i])
-    del aff, valid
-    feats, labels, _ = block(HEMIBRAIN_EB_PROBE_BOXES["train"])
-    aff, valid = affinities(labels, offsets)
-    del labels
-    head, curve = fit_probe(feats, to_tokens(aff, p[0]), to_tokens(valid, p[0]), held)
-    del feats, aff, valid, held
+    test_feats, test_labels, test_em, test_img, test_m, test_size = block(HEMIBRAIN_EB_PROBE_BOXES["test"])  # reused below
+
+    if par.decoder == "linear":
+        del test_img, test_m, test_size  # only unetr's tiled inference needs the padded region + its trim margin
+        aff, valid = affinities(test_labels, offsets)
+        g = torch.Generator(device=device).manual_seed(0)
+        i = torch.randperm(len(test_feats), device=device, generator=g)[:16384]  # held-out tokens, fit curve only
+        held = (test_feats[i], to_tokens(aff, p[0])[i], to_tokens(valid, p[0])[i])
+        del aff, valid
+        feats, labels, _, _, _, _ = block(HEMIBRAIN_EB_PROBE_BOXES["train"])
+        aff, valid = affinities(labels, offsets)
+        del labels
+        head, curve = fit_probe(feats, to_tokens(aff, p[0]), to_tokens(valid, p[0]), held)
+        del feats, aff, valid, held
+
+        def predict(box):
+            if box is HEMIBRAIN_EB_PROBE_BOXES["test"]:
+                feats, labels, em = test_feats, test_labels, test_em
+            else:
+                feats, labels, em, _, _, _ = block(box)
+            with torch.no_grad():
+                prob = torch.cat([torch.sigmoid(head(f.float())).half() for f in feats.split(65536)])
+            return to_voxels(prob, tuple(s // p[0] for s in labels.shape), p[0]), labels, em
+    else:
+        assert par.decoder == "unetr", f"unknown decoder {par.decoder!r}"
+        from lib.decoders import Unetr, UnetrConfig, fit_unetr
+        from lib.decoders.unetr import random_crop
+        del test_feats  # unetr tiles the raw image itself (tile_logits); the linear head's per-token features aren't used
+        unetr = Unetr(encoder, UnetrConfig(out_dim=len(AFFINITY_OFFSETS_XYZ), hidden_dim=par.unetr_hidden_dim)).to(device)
+        if par.unetr_freeze_encoder:
+            encoder.requires_grad_(False)
+        test_aff, test_valid = affinities(test_labels, offsets)
+        g = torch.Generator().manual_seed(0)
+        held = random_crop(test_em[None], test_aff, test_valid, par.global_size, g)  # one crop, monitoring only
+        del test_aff, test_valid
+        _, train_labels, train_em, _, _, _ = block(HEMIBRAIN_EB_PROBE_BOXES["train"])
+        train_aff, train_valid = affinities(train_labels, offsets)
+        del train_labels
+        curve = fit_unetr(unetr, train_em[None], train_aff, train_valid, par.global_size, held, steps=par.unetr_steps)
+        del train_em, train_aff, train_valid, held
+
+        def predict(box):
+            if box is HEMIBRAIN_EB_PROBE_BOXES["test"]:
+                labels, em, img, m, size = test_labels, test_em, test_img, test_m, test_size
+            else:
+                _, labels, em, img, m, size = block(box)
+            logits = tile_logits(unetr, img, par.global_size)  # OutDim (padded region) Z Y X
+            pred = torch.sigmoid(logits[:, m[0]:m[0] + size[0], m[1]:m[1] + size[1], m[2]:m[2] + size[2]])
+            return pred, labels, em
+
     (Path(par.savedir) / "probe_fit.json").write_text("".join(json.dumps({"tbl": "probe_fit", **c}) + "\n" for c in curve))
     run_name = "-".join(Path(par.savedir).parts[1:])  # mia-evals row name: letters, digits, _ and - only
     stats = {"tbl": "probe", "step": step, "run": run_name}
     for split in ["fit", "test"]:
         box = HEMIBRAIN_EB_PROBE_BOXES[split]
-        feats, labels, em = test if split == "test" else block(box)
-        with torch.no_grad():
-            prob = torch.cat([torch.sigmoid(head(f.float())).half() for f in feats.split(65536)])
-        grid = tuple(s // p[0] for s in labels.shape)
-        pred = to_voxels(prob, grid, p[0])  # C Z Y X
-        del feats, prob
+        pred, labels, em = predict(box)  # C Z Y X sigmoid probabilities, Z Y X instance labels, Z Y X EM
         if split == "test":  # cheap scores, on a fixed random subset of the valid edges
             aff, valid = affinities(labels, offsets)
             g = torch.Generator(device=device).manual_seed(0)
@@ -791,11 +894,10 @@ def probe(n:int):
             del aff, valid
         (x0, x1), (y0, y1), (z0, z1) = box
         write_artifact(Path(par.savedir) / "probe" / split / f"hemibrain_eb_{split}.zarr", pred.permute(0, 3, 2, 1).cpu().numpy(),
-                       kind="affinity", origin=(x0, y0, z0), convention="sigmoid(logit), linear probe on frozen tokens",
+                       kind="affinity", origin=(x0, y0, z0), convention=f"sigmoid(logit), {par.decoder} decoder",
                        run=run_name, step=step, axes="xyz", source_path=vol.path, source_label_key=HEMIBRAIN_EB_LABELS,
                        native_box=box, annotated_box=HEMIBRAIN_EB_PROBE_ANNOTATED[split], covers_full_box=False)
         del pred, labels, em
-    del test
     (Path(par.savedir) / "probe.json").write_text(json.dumps(stats) + "\n")
     print(f"{par.savedir}: probe at step {step}: boundary AP (short-range mean) {stats['boundary_ap_short']:.3f}; wrote probe/", flush=True)
 
@@ -848,6 +950,7 @@ def probelsf(n:int):
 
 def probeall():
     for i in range(len(paramsall())):
+        if i == 4: return
         probelsf(i)
 
 def scorelsf(n:int):
@@ -886,12 +989,13 @@ def runall_sequential():
         run(i)
 
 def mpix_per_week():
-    a = 525e6 * 8 # pix/s on 1 node = 8 gpu (ViT size m)
+    a = 511e6 * 8 # input-vox/s/node
     b = 3600 * 24 * 7 # s/week
-    # c = 10_000**3
+    c = 10_000**3 # pix / volume
     d = 103_884_030_089_749
 
-    r1 = a*b # pix/week 1 node
+    r1 = a*b # pix/week 1 node = 2.5e15 = 2500 * c = 2500 volumes / week = 25 volumes / week * 100x augmentation
+    print(r1, c, r1/c)
     r2 = d   # pix/dataset
     print(d/(a*b))
 
