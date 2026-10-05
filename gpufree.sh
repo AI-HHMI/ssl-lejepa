@@ -3,6 +3,8 @@
 # EMPTY_NODES: hosts with no jobs at all (what an 8-GPU full-node job needs).
 # GPU_HOSTS: hosts with at least one free GPU. FREE_SLOTS: free CPU slots on open hosts.
 # PEND_SLOTS: slots requested by pending jobs in the queue.
+# The second table is the CPU queue `local` (scoring jobs). Its host groups are the CPU hosts of GPU nodes, so
+# bhosts reports GPUs there, but those are not counted: a CPU job only needs slots.
 ssh -o ConnectTimeout=15 login1.int.janelia.org 'bash -s' <<'EOF'
 printf "%-12s %9s %11s %11s %10s %9s\n" QUEUE FREE_GPUS EMPTY_NODES GPU_HOSTS FREE_SLOTS PEND_SLOTS
 for q in $(bqueues -w | awk '$1 ~ /^gpu_/ && $1 !~ /_parallel$/ {print $1}'); do
@@ -17,4 +19,11 @@ for q in $(bqueues -w | awk '$1 ~ /^gpu_/ && $1 !~ /_parallel$/ {print $1}'); do
     }
     END { printf "%-12s %4d/%-4d %11d %11d %10d %9s\n", q, free, total, empty, hosts, slots, pend }'
 done
+printf "\n%-12s %11s %11s %10s %9s\n" CPU_QUEUE EMPTY_NODES OPEN_HOSTS FREE_SLOTS PEND_SLOTS
+q=local
+groups=$(bqueues -l "$q" | awk '/^HOSTS:/ {for (i = 2; i <= NF; i++) {g = $i; sub(/\/.*$/, "", g); print g}}')
+pend=$(bqueues -w "$q" | awk 'NR == 2 {print $9}')
+bhosts -o "host_name status max njobs" -noheader $groups | awk -v q="$q" -v pend="$pend" '
+  $2 == "ok" { hosts++; slots += $3 - $4; if ($4 == 0) empty++ }
+  END { printf "%-12s %11d %11d %10d %9s\n", q, empty, hosts, slots, pend }'
 EOF

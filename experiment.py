@@ -53,7 +53,7 @@ SNAPSHOT_PATHS = ["experiment.py", "lib", "mia_evals"]
 CPUS_PER_GPU = 12  # LSF slots per GPU: 8 GPUs -> all 96 cores; training processes need cores beyond the data workers
 # mia-evals scoring (score): CPU only. mia-evals: ~1 h and ~200 GB peak for the mutex watershed at 896^3, "give it a
 # whole node". The shortest CPU queue; check its run limit and memory per slot with `bqueues -l short`.
-SCORE_QUEUE, SCORE_SLOTS, SCORE_MINUTES = "short", 16, 60
+SCORE_QUEUE, SCORE_SLOTS, SCORE_MINUTES = "local", 16, 4*60
 SCORE_CONFIG = "mia_evals/gary_comparison_neuron_instance/mws.toml"  # ours: truth_kind = "instances"
 
 @dataclass(slots=True)
@@ -851,9 +851,13 @@ def probeall():
         probelsf(i)
 
 def scorelsf(n:int):
-    """score(n) as a CPU job on SCORE_QUEUE: mia-evals' mutex watershed over probe(n)'s affinity artifacts."""
+    """score(n) as a CPU job on SCORE_QUEUE: mia-evals' mutex watershed over probe(n)'s affinity artifacts.
+    A run without them (not probed, or its training failed) is logged and skipped, so scoreall goes on to the rest."""
     par = paramsall()[n]
-    assert (Path(par.savedir) / "probe/test").is_dir(), f"no probe artifacts in {par.savedir}: probe first (probelsf)"
+    test = Path(par.savedir) / "probe/test"
+    if not test.is_dir():
+        print(f"ERR: MISSING: {test}: probe first (probelsf)", flush=True)
+        return
     assert_committed()
     bsub(par, "score", SCORE_MINUTES, 0, f"python {{code}}/experiment.py score {n}", queue=SCORE_QUEUE, slots=SCORE_SLOTS)
 
