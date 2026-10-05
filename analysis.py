@@ -55,7 +55,9 @@ def profile_device_ms(path: str | Path) -> tuple[float, dict[str, float]]:
     return float(total[1]) * scale[total[2]] / n, rows
 
 def run_dirs(sweep: str) -> list[Path]:
-    """outdir/<sweep>/dN/ run dirs in numeric order."""
+    """outdir/<sweep>/dN/ run dirs in numeric order. A sweep that is itself a run dir (e00/probe-test/d1) gives just it."""
+    if re.fullmatch(r"d\d+", Path(sweep).name) and Path("outdir", sweep).is_dir():
+        return [Path("outdir", sweep)]
     dirs = [d for d in Path("outdir", sweep).glob("d*/") if re.fullmatch(r"d\d+", d.name)]
     assert dirs, f"no run dirs in outdir/{sweep}/; run ./pull.sh?"
     return sorted(dirs, key=lambda d: int(d.name[1:]))
@@ -252,8 +254,10 @@ def varying_params(params: list[dict]) -> set:
     return {k for k in dict.fromkeys(k for p in known for k in p) if len({json.dumps(p.get(k)) for p in known}) > 1}
 
 def sweep_name(sweep: str) -> str:
-    """The sweep's short name, e.g. 'e00/viewsizes-v2' -> 'viewsizes-v2'."""
-    return sweep.split("/")[-1]
+    """The sweep's short name, e.g. 'e00/viewsizes-v2' -> 'viewsizes-v2'; for a single run dir, its sweep's
+    ('e00/probe-test/d2' -> 'probe-test')."""
+    parts = sweep.split("/")
+    return parts[-2] if re.fullmatch(r"d\d+", parts[-1]) else parts[-1]
 
 def view_sizes(p: dict) -> str:
     """'<patch>/<global>/<local>' view-size label from saved params, e.g. '16/128/96'."""
@@ -366,9 +370,33 @@ def probe_source(d: Path) -> tuple[Path, dict, str]:
     src = Path(init) if init and init != "random" else d
     return src, saved_params(src), init
 
-def size_label(p: dict) -> str:
-    """'<patch>/<global>/<local> w<width>' view-size + width label from saved params, or '?' if missing."""
-    return f'{view_sizes(p)} w{p["width"]}' if p else "?"
+def size_label(p: dict, varying: set) -> str:
+    """Label from saved params with only what differs between the plotted runs (varying_params): width, view sizes,
+    GPU count. '?' if params are missing."""
+    if not p:
+        return "?"
+    parts = [f'w{p["width"]}'] if "width" in varying else []
+    if varying & {"patch_size", "global_size", "local_size"}:
+        parts.append(view_sizes(p))
+    if "n_gpus" in varying:
+        parts.append(f'x{p.get("n_gpus", 1)}')
+    return " ".join(parts)
+
+def probe_runs(sweeps: tuple[str, ...]) -> tuple[list[tuple], dict[str, dict[str, float]]]:
+    """((sweep, run dir, source run dir, source params, init_from) per probed run, boundary AP per random-baseline name)
+    over sweeps: the runs probe_vs_compute and probe_short_vs_long plot, with the init_from random runs split out as
+    baselines named by their decoder, e.g. 'random, linear' / 'random, unetr' / 'random, unetr (encoder trained)'."""
+    runs, random = [], {}
+    for sw in sweeps:
+        for d in probed_dirs(sw):
+            src, p, init = probe_source(d)
+            if init == "random":
+                dec = p.get("decoder", "linear")
+                random[f"random, {dec}" + ("" if dec == "linear" or p.get("unetr_freeze_encoder", True) else " (encoder trained)")] = boundary_ap(probe_stats(d))
+            else:
+                runs.append((sw, d, src, p, init))
+    assert runs, f"no probe.json in {sweeps}; run ./pull.sh?"
+    return runs, random
 
 def probe_table(sweep: str) -> pandas.DataFrame:
     """One row per run with a probe.json: config, the pretraining checkpoint step it probed, how many steps the
@@ -399,21 +427,17 @@ def probe_vs_compute(sweep: str, *compare: str):
     """Probe boundary AP vs total training compute, one point per probed run of sweep and any compare sweeps, for
     short-range (+1 voxel: membranes) and long-range (+10: same neuron?) affinities. A probe-only run (init_from a run
     dir) is placed at its source run's compute; init_from random is the dashed baseline in each panel."""
-    points, random = [], {}
-    for sw in (sweep, *compare):
-        for d in probed_dirs(sw):
-            ap = boundary_ap(probe_stats(d))
-            src, p, init = probe_source(d)
-            if init == "random":
-                random = ap
-                continue
-            steps, eflop = run_compute(src)
-            label = size_label(p) + (f' x{p["n_gpus"]}' if p.get("n_gpus", 1) > 1 else "")
-            points += [{"range": r, "AP": v, "EFLOP": eflop, "steps": steps, "run": f"{sweep_name(sw)}/{d.name}", "config": label,
-                        "source": "/".join(src.parts[-2:]), "sweep": sweep_name(sw) if not init else "/".join(src.parts[-2:-1])} for r, v in ap.items()]
-    assert points, f"no probe.json in {(sweep, *compare)}; run ./pull.sh?"
+    runs, random = probe_runs((sweep, *compare))
+    varying = varying_params([r[3] for r in runs])
+    points = []
+    for sw, d, src, p, init in runs:
+        steps, eflop = run_compute(src)
+        points += [{"range": r, "AP": v, "EFLOP": eflop, "steps": steps, "run": f"{sweep_name(sw)}/{d.name}",
+                    "config": size_label(p, varying), "source": "/".join(src.parts[-2:]), "sweep": sweep_name(sw),
+                    "origin": sweep_name(sw) if not init else "/".join(src.parts[-2:-1])}
+                   for r, v in boundary_ap(probe_stats(d)).items()]
     res = pandas.DataFrame(points)
-    res["label"] = res.config.where(res.sweep != sweep_name(sweep), "")  # name only the reference models; hover the rest
+    res["label"] = res.config.where(res.origin != sweep_name(sweep), "")  # name only the reference models (by source run); hover the rest
     fig = px.scatter(res, x="EFLOP", y="AP", color="sweep", facet_col="range", text="label", log_x=True,
                      hover_data=["config", "run", "source", "steps"], category_orders={"range": list(BOUNDARY_CHANNELS)},
                      title=f"Linear-probe boundary AP vs training compute: {', '.join((sweep, *compare))}")
@@ -421,33 +445,25 @@ def probe_vs_compute(sweep: str, *compare: str):
     fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
     lo, hi = res.EFLOP.min() * 0.8, res.EFLOP.max() * 1.25
     for col, r in enumerate(BOUNDARY_CHANNELS, start=1):
-        if r in random:  # dashed line across the panel
-            fig.add_scatter(x=[lo, hi], y=[random[r]] * 2, mode="lines", line=dict(dash="dash", color="gray"),
-                            name="random encoder", showlegend=col == 1, row=1, col=col)
+        for (name, ap), dash in zip(random.items(), ["dash", "dot", "dashdot"]):  # a gray line across the panel each
+            fig.add_scatter(x=[lo, hi], y=[ap[r]] * 2, mode="lines", line=dict(dash=dash, color="gray"),
+                            name=name, legendgroup=name, showlegend=col == 1, row=1, col=col)
     show(fig, f"{sweep}/probe_vs_compute")
 
 def probe_short_vs_long(sweep: str, *compare: str):
     """Scatter of linear-probe boundary AP, short-range (+1 voxel: membranes) vs long-range (+10: same neuron?), one
     point per probed run of sweep and any compare sweeps: do configs that separate membranes also separate neurons?
     init_from random is the dashed crosshair baseline."""
-    points, random = [], {}
-    for sw in (sweep, *compare):
-        for d in probed_dirs(sw):
-            ap = boundary_ap(probe_stats(d))
-            _, p, init = probe_source(d)
-            row = {**ap, "run": f"{sweep_name(sw)}/{d.name}", "config": size_label(p), "sweep": sweep_name(sw)}
-            if init == "random":
-                random = row
-            else:
-                points.append(row)
-    assert points, f"no probe.json in {(sweep, *compare)}; run ./pull.sh?"
-    res = pandas.DataFrame(points)
+    runs, random = probe_runs((sweep, *compare))
+    varying = varying_params([r[3] for r in runs])
+    res = pandas.DataFrame([{**boundary_ap(probe_stats(d)), "run": f"{sweep_name(sw)}/{d.name}",
+                             "config": size_label(p, varying), "sweep": sweep_name(sw)} for sw, d, _, p, _ in runs])
     fig = px.scatter(res, x="short (+1)", y="long (+10)", color="sweep", text="config", hover_data=["run"],
                      title=f"Linear-probe boundary AP, short vs long range: {', '.join((sweep, *compare))}")
     fig.update_traces(textposition="top center", textfont_size=10)
-    if random:
-        fig.add_scatter(x=[random["short (+1)"]], y=[random["long (+10)"]], mode="markers",
-                        marker=dict(symbol="x", size=12, color="black"), name="random encoder")
+    for (name, ap), symbol in zip(random.items(), ["x", "cross", "star"]):
+        fig.add_scatter(x=[ap["short (+1)"]], y=[ap["long (+10)"]], mode="markers",
+                        marker=dict(symbol=symbol, size=12, color="black"), name=name)
     show(fig, f"{sweep}/probe_short_vs_long")
 
 def mia_evals_table(sweep: str) -> pandas.DataFrame:
@@ -481,7 +497,7 @@ def probe_curves(sweep: str):
     metrics = [m for m in ["loss", "held_bce", "held_boundary_ap"] if m in res]  # held_* since the held-out eval (probe-test)
     long = res.melt(id_vars=["step", "run"], value_vars=metrics, var_name="metric")
     fig = px.line(long, x="step", y="value", color="run", facet_row="metric", height=250 * len(metrics),
-                  category_orders={"metric": metrics}, title=f"Linear probe fit: {sweep}")
+                  category_orders={"metric": metrics}, title=f"Probe fit: {sweep}")
     fig.update_yaxes(matches=None, title="").for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
     show(fig, f"{sweep}/probe_fit")
 
@@ -882,9 +898,12 @@ def e00_scaling_law():
 
 def e00_unetr_probe():
     """UNETR decoder vs the linear probe on the scaling-law c4 checkpoints (probe-only runs, init_from scaling-law/d15-d19):
-    probe table and boundary AP vs training compute, next to scaling-law's own linear-probe points."""
+    probe table, fit curves (held-out boundary AP vs probe step) and boundary AP vs training compute, next to
+    scaling-law's own linear-probe points."""
     probe_table("e00/unetr-probe")
-    probe_vs_compute("e00/unetr-probe", "e00/scaling-law")
+    probe_curves("e00/unetr-probe")
+    # probe-test: d1 is the linear probe on random features, d2/d3 on b300-train8h-dynamic d0/d1 (12x512 / 12x1024, 8 h)
+    probe_vs_compute("e00/unetr-probe", "e00/scaling-law", "e00/probe-test/d1", "e00/probe-test/d2", "e00/probe-test/d3")
 
 def e00_viewsizes_v2():
     """View-size study with the fixed stack: training loss, probe scores per config (d0-d16 and repeats d17-d33)."""
