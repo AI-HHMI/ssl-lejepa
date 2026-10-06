@@ -200,45 +200,30 @@ def paramsall():
     #         p.queue = "gpu_b300"
     #         params.append(p)
 
-    # Dense-decoder probe comparison: does a UNETR decoder (lib.decoders.unetr, skip connections into the frozen
-    # encoder's own intermediate blocks) beat the linear probe's boundary AP? e00/scaling-law already probed every
-    # checkpoint here with the linear decoder (run()'s automatic probe(n), since every entry above has max_hours >
-    # 0), so this sweep only adds the unetr variant -- analysis.probe_vs_compute("e00/unetr-probe",
-    # "e00/scaling-law") compares them directly. Probe-only (init_from): submit with probelsf, not runlsf/runall.
-    # One checkpoint per size, budget c4 (d15-d19: the most-trained of each size), same patch/global/local sizes
-    # as scaling-law, so par.global_size is also Unetr's crop size (fit_unetr trains on the view distribution the
-    # encoder itself saw).
-    for i, (name, (n_layers, width)) in enumerate(SIZES.items()):
+    # PCA maps of the scaling-law encoders (pcaall; savedir/pca2.png, pca.json). Through init_from, which load_checkpoint
+    # loads strictly into par's architecture without asserting the saved params match: scaling-law/d* were trained from a
+    # commit whose Params predate decoder/unetr_*, so pca(n) in their own savedir fails that assertion from this commit.
+    # scaling-law/d{k} is budget k // 5, size k % 5 of its grid; xl (no checkpoint) is skipped, so this sweep's d{i}
+    # (i = its index here) reads scaling-law/d{ks[i]}. Same patch/global/local sizes.
+    ks = [k for k in range(4 * len(SIZES)) if k % len(SIZES) != len(SIZES) - 1]
+    for i, k in enumerate(ks):
+        n_layers, width = list(SIZES.values())[k % len(SIZES)]
         p = Params()
-        p.savedir = f"outdir/e00/unetr-probe/d{i}/"
-        p.init_from = f"outdir/e00/scaling-law/d{15 + i}/"
+        p.savedir = f"outdir/e00/scaling-law-pca/d{i}/"
+        p.init_from = f"outdir/e00/scaling-law/d{k}/"
         p.n_layers, p.width = n_layers, width
         p.patch_size = (128, 128, 128)
         p.global_size = (96, 96, 96)
         p.local_size = (64, 64, 64)
-        p.decoder = "unetr"
         params.append(p)
-    # Random-init baseline (the repo's one validated size, m: n_layers=12, width=512) -- "the baseline every
-    # trained encoder must beat" (load_checkpoint).
+    # Random-init baseline (m): what the maps look like with no training.
     p = Params()
-    p.savedir = "outdir/e00/unetr-probe/d5/"
+    p.savedir = f"outdir/e00/scaling-law-pca/d{len(ks)}/"
     p.init_from = "random"
     p.n_layers, p.width = SIZES["m"]
     p.patch_size = (128, 128, 128)
     p.global_size = (96, 96, 96)
     p.local_size = (64, 64, 64)
-    p.decoder = "unetr"
-    params.append(p)
-    # Same, but the random encoder trains end to end with the decoder: the from-scratch (no pretraining) reference.
-    p = Params()
-    p.savedir = "outdir/e00/unetr-probe/d6/"
-    p.init_from = "random"
-    p.n_layers, p.width = SIZES["m"]
-    p.patch_size = (128, 128, 128)
-    p.global_size = (96, 96, 96)
-    p.local_size = (64, 64, 64)
-    p.decoder = "unetr"
-    p.unetr_freeze_encoder = False
     params.append(p)
     return params
 
@@ -633,19 +618,22 @@ def pca(n:int):
     pca_maps(model.encoder, par, Path(par.savedir), step)
 
 def pca_maps(encoder, par: Params, savedir: Path, step: int):
-    """PCA maps of patch-token embeddings on a held-out EB val crop -> savedir/pca.png, pca.json.
+    """PCA maps of patch-token embeddings on a held-out EB val crop -> savedir/pca2.png, pca.json.
 
-    pca.png columns: EM | PCA of tokens | PCA after subtracting each tile's mean token | pre-LayerNorm token L2 norm.
+    pca2.png rows: the middle z-slice of each of the crop's 3 tile layers (a token's tile is the 96^3 view the encoder
+    saw at once, so rows from one layer would share one tile code). Columns: EM | PCA of tokens | PCA after subtracting
+    each tile's mean token | PCA fitted within each tile (colors are not comparable across tiles) | pre-LayerNorm
+    token L2 norm.
     """
     import torch
     from PIL import Image
     device = next(encoder.parameters()).device
     encoder.eval()
 
-    # One (g, 4g, 4g) window (z y x, g = global view size, so it tiles exactly) inside EB's val slab
-    # (EB z 3000-4000), held out from training.
+    # One (3g, 4g, 4g) window (z y x, g = global view size, so it tiles exactly) inside EB's val slab
+    # (EB z 3000-4000), held out from training. 3 tiles deep in z so each row of pca2.png is a different tile.
     # miao needs the box strictly larger than the patch: one extra voxel per axis leaves exactly one window.
-    shape, z0, y0, x0 = (par.global_size[0], 4 * par.global_size[1], 4 * par.global_size[2]), 3400, 2000, 2000
+    shape, z0, y0, x0 = (3 * par.global_size[0], 4 * par.global_size[1], 4 * par.global_size[2]), 3400, 2000, 2000
     vol = lmd.get(HEMIBRAIN_EB).to_miao(bounding_box=[[o, o + s + 1] for o, s in zip((z0, y0, x0), shape)])
     mcfg = MiaoConfig(volumes=[vol], patch_size=list(shape), resolutions=[[8.0, 8.0, 8.0]],
                       samples_per_epoch=1, sampling="random", output_axes="lzyx")
@@ -666,12 +654,12 @@ def pca_maps(encoder, par: Params, savedir: Path, step: int):
             feats[tz:tz + gz, ty:ty + gy, tx:tx + gx] = t[0].float().reshape(gz, gy, gx, -1).cpu()
             norms[tz:tz + gz, ty:ty + gy, tx:tx + gx] = r[0].float().norm(dim=-1).reshape(gz, gy, gx).cpu()
 
-    def pca_rgb(f):  # N D tokens -> (Z Y X 3 uint8 top-3 PCs, effective rank, top-10 explained variance)
+    def pca_rgb(f, size):  # N D tokens of a size (Z Y X) box -> (Z Y X 3 uint8 top-3 PCs, effective rank, top-10 explained variance)
         f = f - f.mean(0)
         _, sv, vh = torch.linalg.svd(f, full_matrices=False)
         p = sv / sv.sum()
         erank = float(torch.exp(-(p * p.clamp_min(1e-12).log()).sum()))  # effective rank; ~1 means collapse
-        pcs = (f @ vh[:3].T).reshape(*grid, 3)
+        pcs = (f @ vh[:3].T).reshape(*size, 3)
         lo, hi = torch.quantile(pcs.reshape(-1, 3), torch.tensor([0.01, 0.99]), dim=0)
         rgb = ((pcs - lo) / (hi - lo)).clamp(0, 1).mul(255).byte().numpy()
         return rgb, erank, (sv ** 2 / (sv ** 2).sum())[:10].tolist()
@@ -681,8 +669,11 @@ def pca_maps(encoder, par: Params, savedir: Path, step: int):
     nt = [n // gi for n, gi in zip(grid, g)]  # tiles per axis
     tiled = feats.reshape(nt[0], g[0], nt[1], g[1], nt[2], g[2], encoder.embed_dim)
     centered = (tiled - tiled.mean(dim=(1, 3, 5), keepdim=True)).reshape(*grid, encoder.embed_dim)
-    rgb, erank, var = pca_rgb(feats.reshape(-1, encoder.embed_dim))
-    rgb_c, erank_c, var_c = pca_rgb(centered.reshape(-1, encoder.embed_dim))
+    rgb, erank, var = pca_rgb(feats.reshape(-1, encoder.embed_dim), grid)
+    rgb_c, erank_c, var_c = pca_rgb(centered.reshape(-1, encoder.embed_dim), grid)
+    rgb_t = np.empty((*grid, 3), np.uint8)  # PCA fitted separately within each tile
+    for i, j, k in product(*map(range, nt)):
+        rgb_t[i * g[0]:(i + 1) * g[0], j * g[1]:(j + 1) * g[1], k * g[2]:(k + 1) * g[2]] = pca_rgb(tiled[i, :, j, :, k, :].reshape(-1, encoder.embed_dim), g)[0]
     between_tile = 1 - float(centered.var(dim=(0, 1, 2)).sum() / feats.var(dim=(0, 1, 2)).sum())
 
     # Pre-LayerNorm token norms: "register"-like tokens that store global information show up as sparse
@@ -691,17 +682,17 @@ def pca_maps(encoder, par: Params, savedir: Path, step: int):
     lo, hi = torch.quantile(norms.flatten(), torch.tensor([0.01, 0.999]))
     norm_u8 = ((norms - lo) / (hi - lo)).clamp(0, 1).mul(255).byte().numpy()
 
-    # Rows: 3 z-slices; columns: EM | PCA | tile-centered PCA | token norm, upsampled to voxels.
+    # Rows: the middle z-slice of each tile layer; columns: EM | PCA | tile-centered PCA | per-tile PCA | token norm, upsampled to voxels.
     up = lambda a: a.repeat(patch[1], axis=0).repeat(patch[2], axis=1)
     vgap = np.full((shape[1], 8, 3), 255, np.uint8)
     rows = []
-    for gz in [grid[0] // 6, grid[0] // 2, grid[0] * 5 // 6]:
+    for gz in [g[0] // 2 + g[0] * i for i in range(nt[0])]:
         zv = gz * patch[0] + patch[0] // 2
         em = np.repeat((img[0, zv].numpy() * 255).astype(np.uint8)[..., None], 3, axis=2)
         nm = np.repeat(norm_u8[gz][..., None], 3, axis=2)
-        rows.append(np.concatenate([em, vgap, up(rgb[gz]), vgap, up(rgb_c[gz]), vgap, up(nm)], axis=1))
+        rows.append(np.concatenate([em, vgap, up(rgb[gz]), vgap, up(rgb_c[gz]), vgap, up(rgb_t[gz]), vgap, up(nm)], axis=1))
     gap = np.full((8, rows[0].shape[1], 3), 255, np.uint8)
-    Image.fromarray(np.concatenate([r for row in rows for r in (row, gap)][:-1], axis=0)).save(savedir / "pca.png")
+    Image.fromarray(np.concatenate([r for row in rows for r in (row, gap)][:-1], axis=0)).save(savedir / "pca2.png")
     stats = {"tbl": "pca", "step": step, "effective_rank": erank, "explained_variance": var,
              "centered_effective_rank": erank_c, "centered_explained_variance": var_c,
              "between_tile_variance": between_tile,  # fraction of token variance explained by tile means
@@ -709,7 +700,7 @@ def pca_maps(encoder, par: Params, savedir: Path, step: int):
              "norm_outliers": int((norms > 2 * med).sum()), "n_tokens": norms.numel()}
     (savedir / "pca.json").write_text(json.dumps(stats) + "\n")
     print(f"{savedir}: step {step}, effective rank {erank:.1f}, top-3 variance {sum(var[:3]):.2f}, "
-          f"between-tile variance {between_tile:.2f}, norm outliers (>2x median) {stats['norm_outliers']}/{norms.numel()}; wrote pca.png")
+          f"between-tile variance {between_tile:.2f}, norm outliers (>2x median) {stats['norm_outliers']}/{norms.numel()}; wrote pca2.png")
 
 def score(n:int):
     """Score probe(n)'s affinities as mia-evals' neuron-instance task (SCORE_CONFIG: mutex watershed + size filter,
@@ -938,8 +929,10 @@ def runlsf(n:int):
 
 def pcalsf(n:int):
     """Redo pca(n) on LSF, e.g. after changing pca_maps in this experiment's change (run() already does it once)."""
+    par = paramsall()[n]
     assert_committed()
-    bsub(paramsall()[n], "pca", 30, 1, f"python {{code}}/experiment.py pca {n}")
+    Path(par.savedir).mkdir(parents=True, exist_ok=True)  # a pca-only run (par.init_from set) has no training job to create it
+    bsub(par, "pca", 30, 1, f"python {{code}}/experiment.py pca {n}")
 
 def probelsf(n:int):
     """probe(n) as its own LSF job: redo a training run's probe, or a probe-only run (par.init_from set)."""

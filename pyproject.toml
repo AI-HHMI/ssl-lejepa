@@ -25,6 +25,9 @@ dependencies = [
 dev = [
     "pytest>=7.0",
 ]
+analysis = [
+    "matplotlib",  # report.py's plots.py (copied from lmd-catalog's scripts/analysis)
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["lib"]
