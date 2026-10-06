@@ -241,7 +241,7 @@ wheels = [
 [[package]]
 name = "mia-evals"
 version = "0.0.1"
-source = { git = "https://github.com/AI-HHMI/mia-evals?branch=main#d1fb90b3fcd1c52195a39bfedef600805d62d564" }
+source = { git = "https://github.com/AI-HHMI/mia-evals?branch=fix-read-labels-open-array#85fd0aae19831a672d19629cb396545bbafaf9b2" }
 dependencies = [
     { name = "miao-io" },
     { name = "networkx" },
@@ -830,7 +830,7 @@ dev = [
 requires-dist = [
     { name = "einops", specifier = ">=0.7.0" },
     { name = "lmd-catalog", git = "https://github.com/AI-HHMI/lmd-catalog?branch=main" },
-    { name = "mia-evals", git = "https://github.com/AI-HHMI/mia-evals?branch=main" },
+    { name = "mia-evals", git = "https://github.com/AI-HHMI/mia-evals?branch=fix-read-labels-open-array" },
     { name = "miao-io", git = "https://github.com/AI-HHMI/miao.git?branch=master" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "pandas" },

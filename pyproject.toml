@@ -39,7 +39,7 @@ environments = [
 [tool.uv.sources]
 lmd-catalog = { git = "https://github.com/AI-HHMI/lmd-catalog", branch = "main" }
 miao-io = { git = "https://github.com/AI-HHMI/miao.git", branch = "master" }
-mia-evals = { git = "https://github.com/AI-HHMI/mia-evals", branch = "main" }
+mia-evals = { git = "https://github.com/AI-HHMI/mia-evals", branch = "fix-read-labels-open-array" }
 # lmd-catalog = { path = "../lmd-data-versioning", editable = true }
 # miao-io = { path = "../miao", editable = true }
 
