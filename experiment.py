@@ -5,6 +5,7 @@ Analysis of the results lives in analysis.py."""
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict, fields
+import hashlib
 import os, sys
 import json
 import time
@@ -55,6 +56,7 @@ CPUS_PER_GPU = 12  # LSF slots per GPU: 8 GPUs -> all 96 cores; training process
 # whole node". The shortest CPU queue; check its run limit and memory per slot with `bqueues -l short`.
 SCORE_QUEUE, SCORE_SLOTS, SCORE_MINUTES = "local", 16, 4*60
 SCORE_CONFIG = "mia_evals/gary_comparison_neuron_instance/mws.toml"  # ours: truth_kind = "instances"
+N_PARAMS_CACHE = Path(".cache/lejepa_n_params.json")  # machine-local (gitignored): see lejepa_n_params
 
 @dataclass(slots=True)
 class Params:
@@ -107,6 +109,22 @@ def on_queue(p: Params, queue: str) -> Params:
     p.width, p.batch_size = QUEUE_ARCH[queue]
     return p
 
+def lejepa_n_params(n_layers: int, width: int) -> tuple[int, int]:
+    """(encoder, projector) parameter counts of the scaling-law grid's Lejepa at this size. Building the model just to
+    count them takes seconds and paramsall() runs on every call, so they are cached in N_PARAMS_CACHE, keyed by size and
+    by a hash of the model and encoder code (a changed architecture recounts)."""
+    lib = Path(__file__).resolve().parent / "lib"  # the snapshot's own, when run from one
+    code = hashlib.sha256(b"".join(p.read_bytes() for d in ("models", "encoders") for p in sorted((lib / d).glob("*.py")))).hexdigest()[:12]
+    key = f"{code}/{n_layers}x{width}"
+    cache = json.loads(N_PARAMS_CACHE.read_text()) if N_PARAMS_CACHE.is_file() else {}
+    if key not in cache:
+        model = Lejepa(LejepaConfig(n_layers=n_layers, width=width, views="displace",
+                                    global_size=(96, 96, 96), local_size=(64, 64, 64), batch_views=True, lamb=0.1))
+        cache[key] = [model._n_encoder_params, model._n_projector_params]
+        N_PARAMS_CACHE.parent.mkdir(exist_ok=True)
+        N_PARAMS_CACHE.write_text(json.dumps(cache))
+    return cache[key][0], cache[key][1]
+
 def paramsall():
     params = []
     # Scaling-law probe: does model size vs. training tokens follow Chinchilla's N* ~ C^0.5, or does it skew like
@@ -133,9 +151,7 @@ def paramsall():
     CALIB_BEST_LR_MULT = {"xs": 0.5, "s": 2.0, "m": 1.0, "l": 2.0}
     n_params, n_proj = {}, {}
     for name, (n_layers, width) in SIZES.items():
-        model = Lejepa(LejepaConfig(n_layers=n_layers, width=width, views="displace",
-                                    global_size=(96, 96, 96), local_size=(64, 64, 64), batch_views=True, lamb=0.1))
-        n_params[name], n_proj[name] = model._n_encoder_params, model._n_projector_params
+        n_params[name], n_proj[name] = lejepa_n_params(n_layers, width)
     print("e00/scaling-law N_params (encoder):", {k: f"{v:,}" for k, v in n_params.items()})
 
     # for i, (name, (n_layers, width)) in enumerate(SIZES.items()):

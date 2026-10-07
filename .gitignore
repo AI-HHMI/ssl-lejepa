@@ -4,3 +4,5 @@ outdir/
 # Local analysis output (figures, tables, summaries), written by analysis.py; not committed.
 # results/perf_journey.html stays tracked: it's the hand-written page perf_journey() fills in.
 results/
+# Machine-local cache of expensive-to-compute values (experiment.lejepa_n_params).
+.cache/

@@ -180,3 +180,18 @@ def test_scorelsf_submits_a_cpu_job(tmp_path, monkeypatch):
     (cmd,) = submitted
     assert f"-q {experiment.SCORE_QUEUE}" in cmd and f"-n {experiment.SCORE_SLOTS}" in cmd and "-gpu" not in cmd
     assert "experiment.py score 0" in cmd and "job_score_%J.log" in cmd
+
+
+def test_lejepa_n_params_builds_the_model_once_per_size(tmp_path, monkeypatch):
+    built = []
+
+    def fake_lejepa(config):
+        built.append((config.n_layers, config.width))
+        return SimpleNamespace(_n_encoder_params=config.n_layers * config.width, _n_projector_params=7)
+
+    monkeypatch.setattr(experiment, "N_PARAMS_CACHE", tmp_path / ".cache/n_params.json")
+    monkeypatch.setattr(experiment, "Lejepa", fake_lejepa)
+    assert experiment.lejepa_n_params(4, 256) == (1024, 7)
+    assert experiment.lejepa_n_params(4, 256) == (1024, 7)  # read back from the cache file
+    assert experiment.lejepa_n_params(6, 384) == (2304, 7)
+    assert built == [(4, 256), (6, 384)]
