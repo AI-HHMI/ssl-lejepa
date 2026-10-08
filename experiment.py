@@ -903,7 +903,7 @@ def probe(n:int):
         write_artifact(Path(par.savedir) / "probe" / split / f"hemibrain_eb_{split}.zarr", pred.permute(0, 3, 2, 1).cpu().numpy(),
                        kind="affinity", origin=(x0, y0, z0), convention=f"sigmoid(logit), {par.decoder} decoder",
                        run=run_name, step=step, axes="xyz", source_path=vol.path, source_label_key=HEMIBRAIN_EB_LABELS,
-                       native_box=box, annotated_box=HEMIBRAIN_EB_PROBE_ANNOTATED[split], covers_full_box=False)
+                       native_box=box, scale=(1, 1, 1), annotated_box=HEMIBRAIN_EB_PROBE_ANNOTATED[split], covers_full_box=False)
         del pred, labels, em
     (Path(par.savedir) / "probe.json").write_text(json.dumps(stats) + "\n")
     print(f"{par.savedir}: probe at step {step}: boundary AP (short-range mean) {stats['boundary_ap_short']:.3f}; wrote probe/", flush=True)
@@ -1014,7 +1014,8 @@ def test():
     from math import prod
     for vol in lmd.all():
         print(vol.name, vol.shape)
-        tot += prod(vol.shape[-3:])
+        if vol.shape:
+            tot += prod(vol.shape[-3:])
 
     print("tot = ", tot) # 103_884_030_089_749
 
