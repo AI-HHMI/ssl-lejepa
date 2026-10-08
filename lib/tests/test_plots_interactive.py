@@ -20,13 +20,15 @@ def test_scatter_has_tooltips_baselines_and_axis_buttons():
     (fig,) = islands(frag)
     assert fig["data"][0]["text"] == ["EFLOP: 1<br>AP: 0.5<br>run: a</script>"]  # escaped in the page, intact once parsed
     assert fig["layout"]["shapes"][0]["name"] == "random" and fig["layout"]["shapes"][0]["y0"] == 0.1
-    assert fig["layout"]["xaxis"]["type"] == "log" and fig["layout"]["updatemenus"][0]["active"] == 1
+    assert fig["layout"]["xaxis"]["type"] == "log" and "<input type='checkbox' checked>log x" in frag and "<input type='checkbox'>log y" in frag
 
 
 def test_bar_keeps_the_given_order_top_to_bottom():
-    (fig,) = islands(pi.bar([("b", 2.0, "g1"), ("a", 1.0, "g2"), ("c", 3.0, "g1")], "x"))
+    frag = pi.bar([("b", 2.0, "g1"), ("a", 1.0, "g2"), ("c", 3.0, "g1")], "x")
+    (fig,) = islands(frag)
     assert fig["layout"]["yaxis"]["categoryarray"] == ["b", "a", "c"] and [t["name"] for t in fig["data"]] == ["g1", "g2"]
-    assert [m["buttons"][0]["label"] for m in fig["layout"]["updatemenus"]] == ["x linear"]  # no log buttons on the labels
+    assert fig["layout"]["yaxis"]["fixedrange"] and "fixedrange" not in fig["layout"]["xaxis"]  # zoom/pan the values only
+    assert "data-axis='x'" in frag and "data-axis='y'" not in frag  # no lin/log toggle on the labels
 
 
 def test_table_is_sortable_with_numeric_cells():
@@ -49,9 +51,12 @@ def test_runtime_only_on_interactive_pages(tmp_path):
     report_page.write(tmp_path / "static.html", "t", "", [], [("S", [("c", "<svg></svg>")])])
     report_page.write(tmp_path / "live.html", "t", "", [], [("S", [("c", pi.table(["a"], [[1]]))])])
     assert "plotly" not in (tmp_path / "static.html").read_text() and "plotly" in (tmp_path / "live.html").read_text()
+    assert "var ON = true;" in (tmp_path / "live.html").read_text()
+    report_page.write(tmp_path / "off.html", "t", "", [], [("S", [("c", pi.table(["a"], [[1]]))])], interactive=False)
+    assert "var ON = false;" in (tmp_path / "off.html").read_text()
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="needs node for a JS syntax check")
 def test_runtime_js_parses(tmp_path):
-    (tmp_path / "runtime.js").write_text(pi.JS)
+    (tmp_path / "runtime.js").write_text(pi.JS.replace("__ON__", "true"))
     subprocess.run(["node", "--check", str(tmp_path / "runtime.js")], check=True)

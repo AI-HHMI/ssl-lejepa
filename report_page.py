@@ -48,8 +48,9 @@ def anchor(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
 
 
-def write(out: Path, title: str, intro: str, tiles: list, sections: list):
-    """tiles: (number, label); sections: (title, [(card title, svg or table html)])."""
+def write(out: Path, title: str, intro: str, tiles: list, sections: list, interactive: bool = True):
+    """tiles: (number, label); sections: (title, [(card title, svg or table html)]). interactive: whether a page with
+    plots_interactive fragments opens interactive or static (its corner toggle switches either way)."""
     toc = [("overview", "Overview")] + [(anchor(t), t) for t, _ in sections]
     nav = "<nav class='toc'><b>Contents</b>" + "".join(f"<a href='#{a}'>{t}</a>" for a, t in toc) + "</nav>"
     main_html = (
@@ -58,7 +59,7 @@ def write(out: Path, title: str, intro: str, tiles: list, sections: list):
         + "".join(f"<h2 id='{anchor(t)}'>{t}</h2><div class='grid'>" + "".join(card(ct, c) for ct, c in cards) + "</div>" for t, cards in sections)
         + "</main>"
     )
-    runtime = plots_interactive.RUNTIME if plots_interactive.MARK in main_html else ""
+    runtime = plots_interactive.runtime(interactive) if plots_interactive.MARK in main_html else ""
     body = f"<div class='layout'>{nav}{main_html}</div><script>{TOC_JS}</script>{runtime}"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(

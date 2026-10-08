@@ -1,7 +1,9 @@
 """Interactive counterparts of plots.py for report_page: Plotly charts (scroll or drag to zoom, pan, linear/log axis
 buttons, hover tooltips, click a legend entry to hide it), click-to-sort tables, and image grids whose full-screen
 viewer zooms (nearest neighbour), pans, steps across the grid with the arrow keys and toggles a cell's overlay layers.
-Each helper returns an HTML fragment marked with MARK; report_page.write appends RUNTIME to any page holding one.
+Each helper returns an HTML fragment marked with MARK; report_page.write appends runtime() to any page holding one.
+report_page.write(..., interactive=False) writes the page static (charts without zoom, pan or tooltips; no sorting or
+viewer); either way an "interactive" toggle in the page corner switches it for the current view.
 Stdlib only: figures are Plotly JSON built here and drawn by plotly.js from a CDN. The viewer is spearmint's lightbox
 (spearmint/viz.py, from mia-muvit's report.py) with layer toggles in place of its j/k overlay cycling."""
 
@@ -19,6 +21,11 @@ DASHES = ["dash", "dot", "dashdot"]
 THUMB = 220  # image-grid thumbnail width, px
 PLOTLY = "https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"
 CSS = r"""
+div.axes{font-size:10px;color:#999;text-align:right;line-height:1} div.axes label{margin-left:10px;cursor:pointer}
+div.axes input,#interactive input{appearance:none;margin:0 3px 0 0;width:8px;height:8px;border:1px solid #999;border-radius:50%;vertical-align:-1px;cursor:pointer}
+div.axes input:checked,#interactive input:checked{background:#0072B2;border-color:#0072B2}
+#interactive{position:fixed;top:8px;right:12px;z-index:999;font-size:11px;color:#999;cursor:pointer;background:#fff;padding:2px 6px}
+body.static div.axes{visibility:hidden} body.static table.sortable th,body.static table.imggrid img.zoom{cursor:auto}
 table.sortable th{cursor:pointer;user-select:none} table.sortable th.asc::after{content:" \25B4"} table.sortable th.desc::after{content:" \25BE"}
 table.imggrid td{vertical-align:top} table.imggrid img.zoom{cursor:zoom-in;border:1px solid #ddd}
 #viewer{position:fixed;inset:0;background:rgba(0,0,0,.93);display:none;z-index:1000;cursor:grab;overflow:hidden}
@@ -27,16 +34,35 @@ table.imggrid td{vertical-align:top} table.imggrid img.zoom{cursor:zoom-in;borde
 #viewer-bar label{margin-right:12px} #viewer-bar .hint{float:right;color:#999}
 """
 JS = r"""
+// The corner "interactive" toggle: off, every chart is redrawn static (no zoom, pan or tooltips; it keeps its current
+// view) and sorting and the image viewer stop. It starts as the page was written (runtime(interactive)).
+var ON = __ON__;
+function config() { return {responsive: true, scrollZoom: ON, displaylogo: false, staticPlot: !ON}; }
 document.querySelectorAll("div.iplot").forEach(function(div) {
   var d = JSON.parse(document.getElementById(div.id + "-data").textContent);
-  Plotly.newPlot(div, d.data, d.layout, {responsive: true, scrollZoom: true, displaylogo: false});
+  Plotly.newPlot(div, d.data, d.layout, config());
+});
+(function() {
+  var box = document.querySelector("#interactive input");
+  function set(on) {
+    ON = on; box.checked = on; document.body.classList.toggle("static", !on);
+    document.querySelectorAll("div.iplot").forEach(function(div) { Plotly.react(div, div.data, div.layout, config()); });
+  }
+  box.addEventListener("change", function() { set(box.checked); });
+  set(ON);
+})();
+document.addEventListener("change", function(e) {  // a log-scale checkbox above a plot
+  var label = e.target.closest && e.target.closest("div.axes label");
+  if (!label) return;
+  var u = {}; u[label.dataset.axis + "axis.type"] = e.target.checked ? "log" : "linear";
+  Plotly.relayout(label.parentNode.dataset.plot, u);
 });
 
 // Click a header to sort its column (descending first, then toggling); numbers compare as numbers and stay above
 // text (e.g. "—" for missing) either way.
 document.addEventListener("click", function(e) {
   var th = e.target.closest && e.target.closest("table.sortable th");
-  if (!th) return;
+  if (!th || !ON) return;
   var t = th.closest("table"), i = th.cellIndex, dir = th.classList.contains("desc") ? 1 : -1;
   var body = t.tBodies[0], rows = Array.prototype.slice.call(body.rows);
   function key(r) { var s = r.cells[i] ? r.cells[i].textContent : "", n = parseFloat(s.replace(/,/g, "")); return isNaN(n) ? s : n; }
@@ -111,7 +137,7 @@ document.addEventListener("click", function(e) {
     }
   }
   function close() { V.classList.remove("open"); }
-  document.addEventListener("click", function(e) { if (e.target.matches && e.target.matches("table.imggrid img.zoom")) open(e.target); });
+  document.addEventListener("click", function(e) { if (ON && e.target.matches && e.target.matches("table.imggrid img.zoom")) open(e.target); });
   V.addEventListener("click", function(e) { if (e.target === V) close(); });
   BAR.addEventListener("input", function(e) {
     if (e.target.type === "checkbox") on[+e.target.dataset.i] = e.target.checked; else alpha = +e.target.value;
@@ -141,10 +167,15 @@ document.addEventListener("click", function(e) {
   window.addEventListener("mouseup", function() { drag = false; V.style.cursor = "grab"; });
 })();
 """
-RUNTIME = (f"<style>{CSS}</style><div id='viewer'><div id='viewer-bar'></div></div>"
-           f"<script src='{PLOTLY}'></script><script>{JS}</script>")
 
 _ids = itertools.count()  # unique plot div ids within one process
+
+
+def runtime(interactive: bool) -> str:
+    """Styles, the corner toggle, the viewer and the scripts; the page starts interactive or static."""
+    return (f"<style>{CSS}</style><label id='interactive'><input type='checkbox'>interactive</label>"
+            f"<div id='viewer'><div id='viewer-bar'></div></div>"
+            f"<script src='{PLOTLY}'></script><script>{JS.replace('__ON__', json.dumps(interactive))}</script>")
 
 
 def tooltip(row: dict) -> str:
@@ -152,21 +183,23 @@ def tooltip(row: dict) -> str:
 
 
 def figure(data: list, layout: dict, logx: bool = False) -> str:
-    """A Plotly figure: an empty div and its JSON, drawn by RUNTIME. Buttons above the plot switch each numeric axis
-    between linear and log (a "category" axis, e.g. bar labels, gets none)."""
-    layout = {"height": 380, "margin": {"t": 40, "r": 10, "b": 50, "l": 60}, "hovermode": "closest", "font": {"size": 11},
+    """A Plotly figure: an empty div and its JSON, drawn by runtime(), under a small round log-scale checkbox per numeric axis.
+    A "category" axis (e.g. bar labels) gets no toggle and is fixed, so zoom and pan move only the numeric axis."""
+    layout = {"height": 380, "margin": {"t": 16, "r": 10, "b": 50, "l": 60}, "hovermode": "closest", "font": {"size": 11},
               "paper_bgcolor": "#fff", "plot_bgcolor": "#fff", "legend": {"font": {"size": 10}}, **layout}
     layout["xaxis"] = {"type": "log" if logx else "linear", "gridcolor": "#eee", **layout.get("xaxis", {})}
     layout["yaxis"] = {"type": "linear", "gridcolor": "#eee", **layout.get("yaxis", {})}
-    numeric = [ax for ax in "xy" if layout[f"{ax}axis"]["type"] != "category"]
-    layout["updatemenus"] = [
-        {"type": "buttons", "direction": "right", "x": 0.35 * i, "y": 1.02, "xanchor": "left", "yanchor": "bottom",
-         "active": int(layout[f"{ax}axis"]["type"] == "log"), "pad": {"t": 0, "b": 0}, "font": {"size": 10},
-         "buttons": [{"label": f"{ax} {t}", "method": "relayout", "args": [{f"{ax}axis.type": t}]} for t in ("linear", "log")]}
-        for i, ax in enumerate(numeric)]
     pid = f"iplot{next(_ids)}"
+    toggles = []
+    for ax in "xy":
+        t = layout[f"{ax}axis"]["type"]
+        if t == "category":
+            layout[f"{ax}axis"]["fixedrange"] = True
+            continue
+        toggles.append(f"<label data-axis='{ax}'><input type='checkbox'{' checked' if t == 'log' else ''}>log {ax}</label>")
     payload = json.dumps({"data": data, "layout": layout}).replace("</", "<\\/")  # a string can't close the script
-    return f"<div class='iplot' id='{pid}' {MARK}></div><script type='application/json' id='{pid}-data'>{payload}</script>"
+    return (f"<div class='axes' data-plot='{pid}'>{''.join(toggles)}</div><div class='iplot' id='{pid}' {MARK}></div>"
+            f"<script type='application/json' id='{pid}-data'>{payload}</script>")
 
 
 def scatter(groups: dict, x: str, y: str, hlines: dict | None = None, logx: bool = False) -> str:
@@ -197,7 +230,8 @@ def bar(rows: list, xlabel: str) -> str:
              "y": [label for label, _, gr in rows if gr == g], "x": [v for _, v, gr in rows if gr == g],
              "hovertemplate": "%{y}: %{x:.4g}<extra></extra>"}
             for g, c in zip(groups, itertools.cycle(COLORS))]
-    yaxis = {"type": "category", "categoryorder": "array", "categoryarray": [label for label, _, _ in rows], "autorange": "reversed", "automargin": True}
+    yaxis = {"type": "category", "categoryorder": "array", "categoryarray": [label for label, _, _ in rows], "autorange": "reversed", "automargin": True,
+             "ticklabelstandoff": 6}  # px between a bar's label and the axis
     return figure(data, {"height": 22 * len(rows) + 110, "xaxis": {"title": xlabel}, "yaxis": yaxis, "barmode": "group"})
 
 
