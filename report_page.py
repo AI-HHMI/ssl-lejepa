@@ -1,8 +1,11 @@
 """The experiment-independent half of a one-page HTML report in lmd-catalog's style (scripts/analysis/report.py):
-CSS, the side contents bar, tiles and cards. An experiment's report_*.py builds (tiles, sections) and calls write()."""
+CSS, the side contents bar, tiles and cards. An experiment's report_*.py builds (tiles, sections) from plots.py (static
+SVG) or plots_interactive.py fragments and calls write()."""
 
 import re
 from pathlib import Path
+
+import plots_interactive
 
 # Copied from lmd-catalog's scripts/analysis/report.py (CSS and TOC_JS verbatim).
 CSS = """
@@ -55,7 +58,8 @@ def write(out: Path, title: str, intro: str, tiles: list, sections: list):
         + "".join(f"<h2 id='{anchor(t)}'>{t}</h2><div class='grid'>" + "".join(card(ct, c) for ct, c in cards) + "</div>" for t, cards in sections)
         + "</main>"
     )
-    body = f"<div class='layout'>{nav}{main_html}</div><script>{TOC_JS}</script>"
+    runtime = plots_interactive.RUNTIME if plots_interactive.MARK in main_html else ""
+    body = f"<div class='layout'>{nav}{main_html}</div><script>{TOC_JS}</script>{runtime}"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(
         "<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"

@@ -41,6 +41,7 @@ def test_report_compares_unetr_with_linear_on_the_same_encoder_and_notes_unscore
     (e00 / "unetr-probe/d2/probe.json").unlink()
     for d in ("d0", "d1"):
         (e00 / "unetr-probe" / d / "job_probe_1.log").write_text("Run time :   600 sec.\n")
+        (e00 / "unetr-probe" / d / "probe.png").write_bytes(b"\x89PNG\r\n\x1a\n")
 
     tiles, sections = report.build()
     assert dict((label, n) for n, label in tiles)["runs probed"] == "2/3"
@@ -49,5 +50,6 @@ def test_report_compares_unetr_with_linear_on_the_same_encoder_and_notes_unscore
     assert dict(sections)["Compute"]  # 100 TFLOP/s x 0.5 s x 100 steps = 5e-3 EFLOP, so log10 is finite
     report.main()
     page = (tmp_path / report.OUT).read_text()
-    assert "<svg" in page and "xs (d15)" in page and "random, encoder frozen" in page
+    assert "xs (d15)" in page and "random, encoder frozen" in page
     assert "unetr, unetr-probe" in page and "linear, probe-test" in page and "random, linear" in page  # ap_vs_compute legend
+    assert "plotly" in page and "id='viewer'" in page and "class='imggrid'" in page  # the interactive runtime is on the page
