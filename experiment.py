@@ -157,31 +157,30 @@ def submit(n):
 
 def paramsall():
     params = []
-    # PCA maps of the scaling-law encoders (submitall; savedir/pca2.png, pca.json). Through init_from, which load_checkpoint
-    # loads strictly into par's architecture without asserting the saved params match: scaling-law/d* were trained from a
-    # commit whose Params predate decoder/unetr_*, so pca(n) in their own savedir fails that assertion from this commit.
-    # scaling-law/d{k} is budget k // 5, size k % 5 of its grid; xl (no checkpoint) is skipped, so this sweep's d{i}
-    # (i = its index here) reads scaling-law/d{ks[i]}. Same patch/global/local sizes.
-    ks = [k for k in range(4 * len(SIZES)) if k % len(SIZES) != len(SIZES) - 1]
-    for i, k in enumerate(ks):
-        n_layers, width = list(SIZES.values())[k % len(SIZES)]
+    # PCA maps (savedir/pca2.png, pca.json) of the 34 viewsizes-v2 encoders: 17 (input, global, local) configs x
+    # 2 repeats, all m (12x512), 8 h on one B300 each, each already linear-probed (viewsizes-v2/d*/probe.json). In
+    # scaling-law-pca, tokens collapsed onto their 96^3 view's code as models grew. View geometry sets what the views
+    # share, so it should move that too: smaller locals or globals relative to the input force context-level features
+    # (more tile code), larger overlap lets local texture count as invariant (less). Does between-tile variance track
+    # view size, and the probe's boundary AP, across configs and beyond the repeat-to-repeat noise?
+    # d{i} reads viewsizes-v2/d{i} through init_from (its params predate decoder/unetr_*, so pca in its own savedir
+    # fails load_checkpoint's saved-params assertion). The crop is 3 x 4 x 4 of each run's own global view (pca_maps),
+    # so up to 576 x 768 x 768 at g=192: still inside EB's held-out val slab (z 3000-4000) from z0 = 3400.
+    base = (128, 96, 64)
+    configs = [base]  # viewsizes-v2's order
+    configs += [(p, 96, 64) for p in [104, 160, 192, 256]]  # input patch: room for globals to move
+    configs += [(128, g, 64) for g in [64, 80, 112, 128]]  # global view size
+    configs += [(128, 96, l) for l in [32, 48, 80, 96]]  # local view size
+    configs += [(96, 64, 32), (160, 128, 80), (192, 144, 96), (256, 192, 128)]  # all scaled together
+    for i, (inp, g, l) in enumerate(configs * 2):  # the two repeats: viewsizes-v2/d0-d16, d17-d33
         p = Params()
-        p.savedir = f"outdir/e00/scaling-law-pca/d{i}/"
-        p.init_from = f"outdir/e00/scaling-law/d{k}/"
-        p.n_layers, p.width = n_layers, width
-        p.patch_size = (128, 128, 128)
-        p.global_size = (96, 96, 96)
-        p.local_size = (64, 64, 64)
+        p.savedir = f"outdir/e00/viewsizes-pca/d{i}/"
+        p.init_from = f"outdir/e00/viewsizes-v2/d{i}/"
+        p.views = "displace"
+        p.patch_size = (inp, inp, inp)
+        p.global_size = (g, g, g)
+        p.local_size = (l, l, l)
         params.append(p)
-    # Random-init baseline (m): what the maps look like with no training.
-    p = Params()
-    p.savedir = f"outdir/e00/scaling-law-pca/d{len(ks)}/"
-    p.init_from = "random"
-    p.n_layers, p.width = SIZES["m"]
-    p.patch_size = (128, 128, 128)
-    p.global_size = (96, 96, 96)
-    p.local_size = (64, 64, 64)
-    params.append(p)
     pprint(params)
     return params
 
