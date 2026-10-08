@@ -12,13 +12,13 @@ import html
 import itertools
 import json
 import mimetypes
+import os
 from pathlib import Path
 
 MARK = "data-interactive"  # attribute on every fragment's root element
 COLORS = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#56B4E9", "#D55E00", "#F0E442", "#000000"]  # plots.COLORS
 GREY = "#999999"
 DASHES = ["dash", "dot", "dashdot"]
-THUMB = 220  # image-grid thumbnail width, px
 PLOTLY = "https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"
 CSS = r"""
 div.axes{font-size:10px;color:#999;text-align:right;line-height:1} div.axes label{margin-left:10px;cursor:pointer}
@@ -27,7 +27,8 @@ div.axes input:checked,#interactive input:checked{background:#0072B2;border-colo
 #interactive{position:fixed;top:8px;right:12px;z-index:999;font-size:11px;color:#999;cursor:pointer;background:#fff;padding:2px 6px}
 body.static div.axes{visibility:hidden} body.static table.sortable th,body.static table.imggrid img.zoom{cursor:auto}
 table.sortable th{cursor:pointer;user-select:none} table.sortable th.asc::after{content:" \25B4"} table.sortable th.desc::after{content:" \25BE"}
-table.imggrid td{vertical-align:top} table.imggrid img.zoom{cursor:zoom-in;border:1px solid #ddd}
+table.imggrid{table-layout:fixed;width:100%} table.imggrid th:first-child{width:64px} table.imggrid td{vertical-align:top}
+table.imggrid img.zoom{cursor:zoom-in;border:1px solid #ddd;width:100%;max-width:220px;height:auto;box-sizing:border-box}
 #viewer{position:fixed;inset:0;background:rgba(0,0,0,.93);display:none;z-index:1000;cursor:grab;overflow:hidden}
 #viewer.open{display:block} #viewer img{position:absolute;left:0;top:0;image-rendering:pixelated}
 #viewer-bar{position:fixed;top:0;left:0;right:0;padding:6px 12px;color:#ddd;font-size:13px;background:rgba(0,0,0,.6);z-index:1001}
@@ -217,7 +218,7 @@ def scatter(groups: dict, x: str, y: str, hlines: dict | None = None, logx: bool
 
 def lines(series: dict, xlabel: str, ylabel: str) -> str:
     """series: label -> (xs, ys), one line each. The tooltip lists every line's value at the hovered x."""
-    data = [{"type": "scatter", "mode": "lines", "name": label, "x": list(xs), "y": list(ys), "line": {"color": c, "width": 1.8},
+    data = [{"type": "scatter", "mode": "lines+markers", "marker": {"size": 5}, "name": label, "x": list(xs), "y": list(ys), "line": {"color": c, "width": 1.8},
              "hovertemplate": "%{y:.4g}"}
             for (label, (xs, ys)), c in zip(series.items(), itertools.cycle(COLORS))]
     return figure(data, {"hovermode": "x unified", "xaxis": {"title": xlabel}, "yaxis": {"title": ylabel}})
@@ -246,18 +247,20 @@ def table(header: list, rows: list) -> str:
     return f"<table class='sortable' {MARK}><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
 
 
-def img(path: Path, **attrs) -> str:
+def img(path: Path, base: Path | None, **attrs) -> str:
+    """An <img> of path: embedded (base None), or linked relative to base, the page's dir."""
     assert path.is_file(), f"no image at {path}; run ./pull.sh?"
     mime = mimetypes.guess_type(path.name)[0]
     assert mime and mime.startswith("image/"), f"{path}: not an image"
-    src = f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode()}"
-    return "<img " + " ".join(f"{k}='{html.escape(str(v), quote=True)}'" for k, v in attrs.items()) + f" src='{src}'>"
+    src = os.path.relpath(path, base) if base else f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode()}"
+    return "<img " + " ".join(f"{k}='{html.escape(str(v), quote=True)}'" for k, v in attrs.items()) + f" src='{html.escape(src, quote=True)}'>"
 
 
-def images(grid: dict) -> str:
-    """grid: row label -> {column label: [image paths]}, embedded in the page. A cell's first image is its thumbnail;
-    the rest are layers drawn over it in the viewer, toggled by checkbox or 1-9 (layer names: file stems). An empty or
-    absent cell shows a dash."""
+def images(grid: dict, base: Path | None = None) -> str:
+    """grid: row label -> {column label: [image paths]}. A cell's first image is its thumbnail; the rest are layers drawn
+    over it in the viewer, toggled by checkbox or 1-9 (layer names: file stems). An empty or absent cell shows a dash.
+    Images are embedded in the page, or, with base (the page's dir), linked relative to it: for images too big to
+    embed (MBs each), at the price of a page that works only beside them (e.g. results/ next to outdir/)."""
     cols = list(dict.fromkeys(c for cells in grid.values() for c in cells))
     head = "<tr><th></th>" + "".join(f"<th>{html.escape(str(c))}</th>" for c in cols) + "</tr>"
     rows = []
@@ -266,7 +269,7 @@ def images(grid: dict) -> str:
         for c in cols:
             paths = cells.get(c, [])
             title = f"{r} · {c}"
-            layers = [img(p, alt=p.stem, title=title, **({"class": "zoom", "width": THUMB} if i == 0 else {"hidden": ""}))
+            layers = [img(p, base, alt=p.stem, title=title, **({"class": "zoom"} if i == 0 else {"hidden": ""}))  # thumbnail: the column's width, at most 220 px
                       for i, p in enumerate(paths)]
             note = f"<br><small>{len(paths)} layers</small>" if len(paths) > 1 else ""
             tds.append(f"<td>{''.join(layers)}{note}</td>" if paths else "<td>–</td>")
