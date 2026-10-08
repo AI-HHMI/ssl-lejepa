@@ -23,8 +23,8 @@ import plotly.graph_objects as go
 from lmd_catalog.catalog import DEFAULT_DATA_ROOT
 from lmd_catalog.viewers import make_neuroglancer_url, parse_neuroglancer_url, to_fileglancer_content_url
 
-from analysis import (BOUNDARY_CHANNELS, boundary_ap, job_walltime_s, probe_runs, probe_stats, probe_walltime_s, probed_dirs,
-                      read_jsonl, run_compute, run_dirs, saved_params, sweep_name, tflop_per_step)
+from analysis import (BOUNDARY_CHANNELS, boundary_ap, job_walltime_s, probe_runs, probe_source, probe_stats, probe_walltime_s,
+                      probed_dirs, read_jsonl, run_compute, run_dirs, saved_params, sweep_name, tflop_per_step)
 from lib.util import call_entrypoint, pick_entrypoint
 
 
@@ -789,6 +789,46 @@ def scaling_law_isoflop():
                  title="e00/scaling-law: current loss vs model width per compute budget (IsoFLOP)")
     show(fig, "e00/scaling-law/isoflop")
 
+def scaling_law_tile_code_vs_probe():
+    """Between-tile variance (scaling-law-pca/d*/pca.json: the share of token variance that is just each 96^3 view's
+    own code) vs the linear probe's boundary AP on the same checkpoint (its scaling-law source run's probe.json), short
+    and long range: one point per checkpoint, colour = model size, symbol = budget. The loss sees only the token mean,
+    so nothing keeps tokens local; do checkpoints whose tokens collapse onto their view's code (bigger, longer trained)
+    separate boundaries worse? The black x is a random 12x512 encoder (scaling-law-pca's init_from random run, and
+    probe-test/d1's linear probe on another random 12x512). Prints Spearman rank correlations, overall and within size.
+    Output: results/e00/scaling-law-pca/tile_code_vs_probe.{csv,html}."""
+    rows, random_tile = [], None
+    for d in run_dirs("e00/scaling-law-pca"):
+        pca = read_jsonl(d / "pca.json")
+        assert pca, f"{d}: no pca.json; run ./pull.sh?"
+        src, p, init = probe_source(d)
+        if init == "random":
+            random_tile = pca[-1]["between_tile_variance"]
+            continue
+        assert (src / "probe.json").is_file(), f"{src}: no probe.json, the linear probe of {d}'s checkpoint"
+        rows.append({"run": d.name, "source": src.name, "size": f'{p["n_layers"]}x{p["width"]}', "width": p["width"],
+                     "budget": scaling_law_budget(src), "EFLOP": run_compute(src)[1], "between_tile": pca[-1]["between_tile_variance"],
+                     "effective_rank": pca[-1]["effective_rank"], **boundary_ap(probe_stats(src))})
+    assert random_tile is not None, "no init_from random run in e00/scaling-law-pca"
+    res = pandas.DataFrame(rows).sort_values(["width", "budget"])
+    save_table(res.round(3), "e00/scaling-law-pca/tile_code_vs_probe")
+    for r in BOUNDARY_CHANNELS:
+        within = {s: g.between_tile.corr(g[r], method="spearman") for s, g in res.groupby("size")}
+        print(f"Spearman(between_tile, AP {r}): all {res.between_tile.corr(res[r], method='spearman'):+.2f}; "
+              f"within size {', '.join(f'{s} {v:+.2f}' for s, v in within.items())}")
+    long = res.melt(id_vars=["run", "source", "size", "budget", "EFLOP", "between_tile", "effective_rank"],
+                    value_vars=list(BOUNDARY_CHANNELS), var_name="range", value_name="AP")
+    fig = px.scatter(long, x="between_tile", y="AP", color="size", symbol="budget", facet_col="range",
+                     hover_data=["run", "source", "EFLOP", "effective_rank"], category_orders={"range": list(BOUNDARY_CHANNELS)},
+                     title="e00/scaling-law-pca: tokens' tile code (between-tile variance) vs linear-probe boundary AP")
+    fig.update_yaxes(matches=None, showticklabels=True).for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+    random_ap = boundary_ap(probe_stats(Path("outdir/e00/probe-test/d1")))
+    for col, r in enumerate(BOUNDARY_CHANNELS, start=1):
+        fig.add_scatter(x=[random_tile], y=[random_ap[r]], mode="markers", marker=dict(symbol="x", size=12, color="black"),
+                        name="random 12x512", showlegend=col == 1, row=1, col=col)
+    fig.update_xaxes(title="between-tile variance")
+    show(fig, "e00/scaling-law-pca/tile_code_vs_probe")
+
 def e00_scaling_law():
     """Main IsoFLOP grid (4 budgets x 5 sizes): status/progress table, loss curves per budget, loss vs compute
     (valid mid-run), lr vs compute per size, and the current IsoFLOP U-curve per budget (only trustworthy once
@@ -798,6 +838,11 @@ def e00_scaling_law():
     scaling_law_loss_vs_flops()
     scaling_law_lr_vs_flops()
     scaling_law_isoflop()
+
+def e00_scaling_law_pca():
+    """Why do the scaling-law PCA maps look the same in every row? Tokens collapse onto their 96^3 view's code as models
+    grow and train longer; does that cost the linear probe? (pca2.png maps: outdir/e00/scaling-law-pca/d*/)"""
+    scaling_law_tile_code_vs_probe()
 
 def e00_unetr_probe():
     """UNETR decoder vs the linear probe on the scaling-law c4 checkpoints (probe-only runs, init_from scaling-law/d15-d19):

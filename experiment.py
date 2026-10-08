@@ -57,6 +57,54 @@ CPUS_PER_GPU = 12  # LSF slots per GPU: 8 GPUs -> all 96 cores; training process
 SCORE_QUEUE, SCORE_SLOTS, SCORE_MINUTES = "local", 16, 4*60
 SCORE_CONFIG = "mia_evals/gary_comparison_neuron_instance/mws.toml"  # ours: truth_kind = "instances"
 N_PARAMS_CACHE = Path(".cache/lejepa_n_params.json")  # machine-local (gitignored): see lejepa_n_params
+# Model sizes and compute budgets of e00/scaling-law's IsoFLOP grid (scaling_budgets), for designing size x budget sweeps.
+SIZES = {"xs": (4, 256), "s": (6, 384), "m": (12, 512), "l": (16, 768), "xl": (24, 1024)}  # (n_layers, width); m = Params' default
+SCALING_BATCH = 64  # per GPU, fixed across sizes (== gpu_b300's validated default at m); xl OOMs at it on one B300
+ANCHOR_STEP_S_M_B84 = 0.32  # cudagraph-fix/d3: 1425 ktok/s at b84, flash + eager-pe cudagraphs (m: n_layers=12, width=512)
+BUDGET_HOURS_AT_M = {"c1": 1, "c2": 2, "c3": 4, "c4": 8}  # m's wall-clock at each budget; other sizes get more/fewer steps
+
+def on_queue(p: Params, queue: str) -> Params:
+    """Put p on an LSF GPU queue with that queue's default architecture (QUEUE_ARCH)."""
+    assert queue in QUEUE_ARCH, f"no default architecture for {queue!r}; add it to QUEUE_ARCH"
+    p.queue = queue
+    p.width, p.batch_size = QUEUE_ARCH[queue]
+    return p
+
+def lejepa_n_params(n_layers: int, width: int) -> tuple[int, int]:
+    """(encoder, projector) parameter counts of the scaling-law grid's Lejepa at this size. Building the model just to
+    count them takes seconds, so they are cached in N_PARAMS_CACHE, keyed by size and by a hash of the model and encoder
+    code (a changed architecture recounts)."""
+    lib = Path(__file__).resolve().parent / "lib"  # the snapshot's own, when run from one
+    code = hashlib.sha256(b"".join(p.read_bytes() for d in ("models", "encoders") for p in sorted((lib / d).glob("*.py")))).hexdigest()[:12]
+    key = f"{code}/{n_layers}x{width}"
+    cache = json.loads(N_PARAMS_CACHE.read_text()) if N_PARAMS_CACHE.is_file() else {}
+    if key not in cache:
+        model = Lejepa(LejepaConfig(n_layers=n_layers, width=width, views="displace",
+                                    global_size=(96, 96, 96), local_size=(64, 64, 64), batch_views=True, lamb=0.1))
+        cache[key] = [model._n_encoder_params, model._n_projector_params]
+        N_PARAMS_CACHE.parent.mkdir(exist_ok=True)
+        N_PARAMS_CACHE.write_text(json.dumps(cache))
+    return cache[key][0], cache[key][1]
+
+def sample_flops(name: str) -> float:
+    """Model training FLOPs per sample of SIZES[name] (exact: lib.models.lejepa.Lejepa.forward's own out.n_flops
+    accounting), at the scaling-law view sizes' fixed token counts (2 globals of 12^3, 4 locals of 8^3 tokens; patch 8)."""
+    n_layers, width = SIZES[name]
+    n_params, n_proj = lejepa_n_params(n_layers, width)
+    return sum(k * (n * (6 * n_params + 12 * n_layers * width * n) + 6 * n_proj) for k, n in [(2, 12 ** 3), (4, 8 ** 3)])
+
+def step_seconds(name: str, batch: int) -> float:
+    """Estimated seconds per training step of SIZES[name] at this per-GPU batch: ANCHOR_STEP_S_M_B84 scaled by FLOPs per
+    step relative to m at batch 84. An a-priori estimate (it under-predicted small sizes' cost in mia-muvit's e07)."""
+    return ANCHOR_STEP_S_M_B84 * (batch * sample_flops(name)) / (84 * sample_flops("m"))
+
+def scaling_budgets() -> dict[str, float]:
+    """Training FLOPs of each compute budget (c1..c4): BUDGET_HOURS_AT_M x m's estimated FLOPs per hour at SCALING_BATCH.
+    A size's steps at a budget: budget / (sample_flops(name) * batch); e00/scaling-law set max_hours to 2x
+    step_seconds' estimate of those steps, as a safety cap. Only for grid design: analysis reads back each run's real
+    EFLOP (analysis.run_compute), so a wrong estimate over/under-shoots the nominal budget rather than corrupting a fit."""
+    flops_per_hour_m = 3600 / step_seconds("m", SCALING_BATCH) * sample_flops("m") * SCALING_BATCH
+    return {b: h * flops_per_hour_m for b, h in BUDGET_HOURS_AT_M.items()}
 
 @dataclass(slots=True)
 class Params:
@@ -102,121 +150,14 @@ class Params:
     benchmark_steps: int = 50
     profile_steps: int = 10  # Set to zero to disable trace collection.
 
-def on_queue(p: Params, queue: str) -> Params:
-    """Put p on an LSF GPU queue with that queue's default architecture (QUEUE_ARCH)."""
-    assert queue in QUEUE_ARCH, f"no default architecture for {queue!r}; add it to QUEUE_ARCH"
-    p.queue = queue
-    p.width, p.batch_size = QUEUE_ARCH[queue]
-    return p
-
-def lejepa_n_params(n_layers: int, width: int) -> tuple[int, int]:
-    """(encoder, projector) parameter counts of the scaling-law grid's Lejepa at this size. Building the model just to
-    count them takes seconds and paramsall() runs on every call, so they are cached in N_PARAMS_CACHE, keyed by size and
-    by a hash of the model and encoder code (a changed architecture recounts)."""
-    lib = Path(__file__).resolve().parent / "lib"  # the snapshot's own, when run from one
-    code = hashlib.sha256(b"".join(p.read_bytes() for d in ("models", "encoders") for p in sorted((lib / d).glob("*.py")))).hexdigest()[:12]
-    key = f"{code}/{n_layers}x{width}"
-    cache = json.loads(N_PARAMS_CACHE.read_text()) if N_PARAMS_CACHE.is_file() else {}
-    if key not in cache:
-        model = Lejepa(LejepaConfig(n_layers=n_layers, width=width, views="displace",
-                                    global_size=(96, 96, 96), local_size=(64, 64, 64), batch_views=True, lamb=0.1))
-        cache[key] = [model._n_encoder_params, model._n_projector_params]
-        N_PARAMS_CACHE.parent.mkdir(exist_ok=True)
-        N_PARAMS_CACHE.write_text(json.dumps(cache))
-    return cache[key][0], cache[key][1]
+# This experiment's one entrypoint: submitall() submits every paramsall() run with it (README: one experiment, one
+# entrypoint). A follow-up step on the same runs (probe after training, a redone pca) is a new experiment commit.
+def submit(n):
+    pcalsf(n)
 
 def paramsall():
     params = []
-    # Scaling-law probe: does model size vs. training tokens follow Chinchilla's N* ~ C^0.5, or does it skew like
-    # Gary's MAE study on mia-muvit (an IsoFLOP grid there fit N* ~ C^0.67)? Fixed background from the past
-    # viewsizes-v2 sweep (its base view sizes, safe stack): only n_layers/width (and lr) vary, so the model-size/data
-    # tradeoff isn't confounded with the view-size study.
-    #
-    # A single shared lr across sizes is exactly the confound Chinchilla found in Kaplan et al.'s over-large-favoring
-    # estimate (small models look artificially worse without their own tuned lr) -- so lr is scaled ~1/width from
-    # this repo's one validated lr (m, w512), the leading-order correction muP formalizes (not full muP: init is
-    # untouched, and depth isn't covered by this rule at all). e00/scaling-law-calib checks that before the real grid
-    # runs: 5 sizes x 3 lr (0.5x/1x/2x) at max_hours=0.25 (15 min) each -- watch for divergence, or a non-monotonic
-    # loss-vs-lr at any size, before trusting main's lr choice. Its real measured throughput should also replace
-    # ANCHOR_STEP_S_M_B84 below before submitting main, the same way mia-muvit's e07 probe tier's numbers replaced
-    # its initial FLOPs-ratio extrapolation (which turned out to under-predict small sizes' relative cost).
-    SIZES = {"xs": (4, 256), "s": (6, 384), "m": (12, 512), "l": (16, 768), "xl": (24, 1024)}  # (n_layers, width); m = current default
-    BATCH = 64  # fixed across sizes (== gpu_b300's validated default at m); l/xl may OOM at 2x/4x m's depth -- untested, watch status
-    BASE_LR = 1e-4  # this repo's only lr so far, always at width=512
-    lr = lambda width: BASE_LR * (512 / width)
-    # Best lr per size found by e00/scaling-law-calib's 0.5x/1x/2x scan (lowest final loss at 15 min, one B300 each):
-    # xs and l/s disagree in direction with the 1/width rule above (xs wants less, s and l want more); m was flat
-    # (0.5x and 2x tied within noise) so its rule lr is kept. xl OOM'd at every lr (batch 64 doesn't fit); untested,
-    # so it still falls back to the rule until a batch/parallelism fix lets it calibrate.
-    CALIB_BEST_LR_MULT = {"xs": 0.5, "s": 2.0, "m": 1.0, "l": 2.0}
-    n_params, n_proj = {}, {}
-    for name, (n_layers, width) in SIZES.items():
-        n_params[name], n_proj[name] = lejepa_n_params(n_layers, width)
-    print("e00/scaling-law N_params (encoder):", {k: f"{v:,}" for k, v in n_params.items()})
-
-    # for i, (name, (n_layers, width)) in enumerate(SIZES.items()):
-    #     for j, mult in enumerate([0.5, 1.0, 2.0]):
-    #         p = Params()
-    #         p.savedir = f"outdir/e00/scaling-law-calib/d{i * 3 + j}/"
-    #         p.data = "hemibrain_wide"
-    #         p.views = "displace"
-    #         p.patch_size = (128, 128, 128)
-    #         p.global_size = (96, 96, 96)
-    #         p.local_size = (64, 64, 64)
-    #         p.n_layers, p.width = n_layers, width
-    #         p.lr = lr(width) * mult
-    #         p.batch_size = BATCH
-    #         p.steps_per_epoch = 100_000  # not the real horizon: max_hours below is what stops this run
-    #         p.max_hours = 0.25
-    #         p.weight_decay = 0.05
-    #         p.adam_beta2 = 0.95
-    #         p.cudagraphs = True
-    #         p.batch_views = True
-    #         p.n_workers = 11  # 12 cores per GPU
-    #         p.n_gpus = 1
-    #         p.queue = "gpu_b300"
-    #         params.append(p)
-
-    # Main IsoFLOP grid: its own experiment/commit, once e00/scaling-law-calib's results replace ANCHOR_STEP_S_M_B84
-    # and any size's lr below. 4 compute budgets (anchored on m's ~0.32 s/step at b84, cudagraph-fix/d3, adjusted for
-    # batch and model size) x the 5 sizes above = 20 runs. steps_per_epoch is the real cosine-schedule horizon (this
-    # sweep's best a-priori estimate; see the calib note above); max_hours is a 2x safety cap, not the primary stop.
-    # Analysis reads back each run's REAL EFLOP (analysis_plots.bench_table, analysis.run_compute) after the fact, so an inaccurate
-    # estimate under/over-shoots the nominal budget rather than corrupting the fit -- c1..c4 are only for grid design.
-    # Model FLOPs per sample (exact: lib.models.lejepa.Lejepa.forward's own out.n_flops accounting), at the base view
-    # sizes' fixed token counts (2 globals of 12^3, 4 locals of 8^3 tokens; patch=8, LejepaConfig's default).
-    flops = lambda name: sum(k * (n * (6 * n_params[name] + 12 * SIZES[name][0] * SIZES[name][1] * n) + 6 * n_proj[name])
-                             for k, n in [(2, 12 ** 3), (4, 8 ** 3)])
-    ANCHOR_STEP_S_M_B84 = 0.32  # cudagraph-fix/d3: 1425 ktok/s at b84, flash + eager-pe cudagraphs (m: n_layers=12, width=512)
-    step_s = lambda name, batch: ANCHOR_STEP_S_M_B84 * (batch * flops(name)) / (84 * flops("m"))
-    flops_per_hour_m = 3600 / step_s("m", BATCH) * flops("m") * BATCH
-    BUDGET_HOURS_AT_M = {"c1": 1, "c2": 2, "c3": 4, "c4": 8}  # m's wall-clock at each budget; other sizes get more/fewer steps
-    BUDGETS = {b: h * flops_per_hour_m for b, h in BUDGET_HOURS_AT_M.items()}
-    # for bi, budget_flops in enumerate(BUDGETS.values()):
-    #     for si, (name, (n_layers, width)) in enumerate(SIZES.items()):
-    #         p = Params()
-    #         p.savedir = f"outdir/e00/scaling-law/d{bi * len(SIZES) + si}/"
-    #         p.data = "hemibrain_wide"
-    #         p.views = "displace"
-    #         p.patch_size = (128, 128, 128)
-    #         p.global_size = (96, 96, 96)
-    #         p.local_size = (64, 64, 64)
-    #         p.n_layers, p.width = n_layers, width
-    #         p.lr = lr(width) * CALIB_BEST_LR_MULT.get(name, 1.0)  # xl: no calib data (OOM at every lr), rule lr unscaled
-    #         p.batch_size = BATCH
-    #         steps = budget_flops / (flops(name) * BATCH)
-    #         p.steps_per_epoch = round(steps)
-    #         p.max_hours = 2 * steps * step_s(name, BATCH) / 3600
-    #         p.weight_decay = 0.05
-    #         p.adam_beta2 = 0.95
-    #         p.cudagraphs = True
-    #         p.batch_views = True
-    #         p.n_workers = 11  # 12 cores per GPU
-    #         p.n_gpus = 1
-    #         p.queue = "gpu_b300"
-    #         params.append(p)
-
-    # PCA maps of the scaling-law encoders (pcaall; savedir/pca2.png, pca.json). Through init_from, which load_checkpoint
+    # PCA maps of the scaling-law encoders (submitall; savedir/pca2.png, pca.json). Through init_from, which load_checkpoint
     # loads strictly into par's architecture without asserting the saved params match: scaling-law/d* were trained from a
     # commit whose Params predate decoder/unetr_*, so pca(n) in their own savedir fails that assertion from this commit.
     # scaling-law/d{k} is budget k // 5, size k % 5 of its grid; xl (no checkpoint) is skipped, so this sweep's d{i}
@@ -241,6 +182,7 @@ def paramsall():
     p.global_size = (96, 96, 96)
     p.local_size = (64, 64, 64)
     params.append(p)
+    pprint(params)
     return params
 
 def record(par: Params, fn: str):
@@ -481,7 +423,11 @@ def train(n:int):
                         g = par.global_size
                         with torch.no_grad(), torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.amp):
                             resid = lejepa.encoder.forward_residual(x[:4, :, :g[0], :g[1], :g[2]])
+                        # loss = inv + lamb * sigreg, logged apart: sigreg is ~1.05 for exactly Gaussian projections
+                        # (its floor), and its pull scales with the per-GPU batch, so the total alone mixes invariance
+                        # with how Gaussian the projections are.
                         metrics_file.write(json.dumps({"tbl": "metrics", "idx_step": idx_step, "time": time.time() - start_time, "loss": loss,
+                                                       "inv": out.inv.detach().item(), "sigreg": out.sigreg.detach().item(),
                                                        "grad_norm": grad_norm.item(), "lr": sched.get_last_lr()[0],
                                                        "resid_norm": resid.float().norm(dim=-1).median().item(),
                                                        "skipped": n_skipped}) + "\n")
@@ -936,7 +882,7 @@ def bsub(par: Params, job: str, minutes: int, n_gpus: int, cmd: str, queue: str 
 def runlsf(n:int):
     """Train paramsall()[n] on LSF, in a fresh savedir (old contents -> outdir/.trash/)."""
     par:Params = paramsall()[n]
-    assert not par.init_from, f"{par.savedir}: init_from={par.init_from!r} is a probe-only run (training ignores it); submit with probeall"
+    assert not par.init_from, f"{par.savedir}: init_from={par.init_from!r} is an eval-only run (training ignores it)"
     assert par.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={par.n_workers} leaves no core for the training process"
     assert_committed()
     trash(par.savedir)
@@ -957,14 +903,9 @@ def probelsf(n:int):
     Path(par.savedir).mkdir(parents=True, exist_ok=True)  # a probe-only run has no training job to create it
     bsub(par, "probe", 60, 1, f"python {{code}}/experiment.py probe {n}")
 
-def probeall():
-    for i in range(len(paramsall())):
-        if i == 4: return
-        probelsf(i)
-
 def scorelsf(n:int):
     """score(n) as a CPU job on SCORE_QUEUE: mia-evals' mutex watershed over probe(n)'s affinity artifacts.
-    A run without them (not probed, or its training failed) is logged and skipped, so scoreall goes on to the rest."""
+    A run without them (not probed, or its training failed) is logged and skipped, so submitall goes on to the rest."""
     par = paramsall()[n]
     test = Path(par.savedir) / "probe/test"
     if not test.is_dir():
@@ -972,14 +913,6 @@ def scorelsf(n:int):
         return
     assert_committed()
     bsub(par, "score", SCORE_MINUTES, 0, f"python {{code}}/experiment.py score {n}", queue=SCORE_QUEUE, slots=SCORE_SLOTS)
-
-def scoreall():
-    for i in range(len(paramsall())):
-        scorelsf(i)
-
-def pcaall():
-    for i in range(len(paramsall())):
-        pcalsf(i)
 
 def replaylsf(n:int):
     """replay_bad_batch on LSF for paramsall()[n]'s first bad_batch dump. CUDA_LAUNCH_BLOCKING names a crashing kernel."""
@@ -989,13 +922,10 @@ def replaylsf(n:int):
     assert_committed()
     bsub(par, "replay", 30, 1, f"env CUDA_LAUNCH_BLOCKING=1 python {{code}}/experiment.py replay_bad_batch {dumps[0]}")
 
-def runall():
+def submitall():
     for i in range(len(paramsall())):
-        runlsf(i)
+        submit(i)
 
-def runall_sequential():
-    for i in range(len(paramsall())):
-        run(i)
 
 def mpix_per_week():
     a = 511e6 * 8 # input-vox/s/node

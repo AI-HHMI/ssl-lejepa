@@ -17,7 +17,7 @@ uv run python analysis_plots.py loss_curves e00/nanhunt_flash   # analysis of an
 Remote workflow (experiments run on the Janelia cluster, `login1.int.janelia.org:~/proj/ssl-lejepa`):
 - VCS is **jj** (colocated with git). Remotes: `origin` (GitHub) and `janelia` (the cluster checkout).
 - `./push.sh` pushes `main` to the `janelia` remote and runs `jj new main` on the cluster. It does not touch `origin`: moving `main@origin` makes those commits immutable in jj.
-- `sh jrun.sh <bookmark> experiment.py runall` pushes the bookmark to `janelia`, runs `jj new <bookmark>` on the cluster, then `uv run python experiment.py runall` on the login node. For experiments the bookmark is `exp` (see below).
+- `sh jrun.sh <bookmark> experiment.py submitall` pushes the bookmark to `janelia`, runs `jj new <bookmark>` on the cluster, then `uv run python experiment.py submitall` on the login node. For experiments the bookmark is `exp` (see below).
 - `./pull.sh` rsyncs the small result files (`*.json`, `*.jsonl`, `*.log`, `*.png`, `profile.out`) from the cluster's `outdir/` into local `outdir/` with `--delete`. It skips large `profile.json` traces and `outdir/.trash/`.
 
 ## How this repo works
@@ -31,7 +31,7 @@ Every piece of code is either **remote** or **local**, and depends either on **m
 | **glue** | either | neither | `jrun.sh`, `pull.sh`, `gpufree.sh` | |
 
 - **An experiment is one jj change**, described `exp: e00/<name>. <question>`. Its `paramsall()` writes only to `outdir/e00/<name>/d{i}/`. The change ID stays the same while you fix it: cancel jobs, amend, resubmit. Each run records the commit hash it actually ran.
-- **Keep experiment changes thin, and don't merge them.** An `exp:` change holds `paramsall()` plus comments. Model, training, lib and analysis changes go in their own commits on `main`, underneath. `main` carries only those, never experiments.
+- **Keep experiment changes thin, and don't merge them.** An `exp:` change holds `paramsall()` and its `submit(n)` plus comments. **One experiment, one entrypoint**: `submit(n)` is the experiment's one job (e.g. `pcalsf(n)`, `runlsf(n)`), and `submitall` calls it for every run, so an experiment's commit plus `submitall` is its whole repro. A follow-up step on the same runs (probe after training, a redone pca) is a new experiment commit. Model, training, lib and analysis changes go in their own commits on `main`, underneath. `main` carries only those, never experiments.
   - Each experiment stays an **unmerged leaf** on the `main` commit it branched from. Concurrent experiments are sibling leaves. Before leaving one, move any other code it picked up onto `main` (`jj split`, then rebase).
   - **Find experiments by description**, not bookmarks: `jj log -r 'description(glob:"exp: e00/b300*")'`.
   - **Never `jj abandon` an experiment that has runs.** Leaves stay visible heads, which is what keeps description search working. An abandoned commit still resolves by ID, but revsets no longer see it. If finished leaves clutter `jj log`, hide them from the default view in `.jj/repo/config.toml`, e.g. `[revsets] log = "@ | ancestors(immutable_heads().., 2) | trunk() | ~description(glob:'exp:*')"` (untested).
@@ -40,7 +40,7 @@ Every piece of code is either **remote** or **local**, and depends either on **m
   - Only committed code is submitted: `bsub` jobs come from `runlsf` (train), `pcalsf` (redo PCA maps) and `replaylsf` (replay a bad batch). Each first calls `assert_committed()`.
   - Each job runs a snapshot of the code plus its commit (`.tmpcode/<sweep>/`, `provenance.json`), and records that commit, argv and LSF job ID in `runs.json`. Repro for any run: *commit X, `experiment.py run n`*.
   - **Two logs, each fact once:**
-    - `outdir/_log/commands.jsonl` gets the commands you issue: every CLI call of `experiment.py` outside an LSF job, via `log_command` in its `__main__`. These are the login-node `runall` / `runlsf n` / `pcalsf` / `replaylsf` calls.
+    - `outdir/_log/commands.jsonl` gets the commands you issue: every CLI call of `experiment.py` outside an LSF job, via `log_command` in its `__main__`. These are the login-node `submitall` / `runlsf n` / `pcalsf n` / `replaylsf` calls.
     - Each job records what it ran in its savedir's `runs.json` instead. This keeps it one file from one host (`login1`, through `jrun.sh`). Appends from many cluster hosts to one NFS file could interleave or overwrite each other.
     - Older per-host `commands-<host>.jsonl` files are history. Analysis doesn't log.
   - Resubmitting moves the old savedir to `outdir/.trash/<path>/<time>/` (`lib.util.trash`) instead of deleting it. Empty `.trash` by hand.
@@ -49,7 +49,7 @@ Every piece of code is either **remote** or **local**, and depends either on **m
   - `outdir/` is an exact mirror of the cluster's append-only run dirs, written only by remote runs, never locally. That's why `./pull.sh --delete` is safe. Never edit or `rm` experiment dirs.
   - `results/` is local analysis output (figures, tables, summaries, screenshots) and is not committed. `results/perf_journey.html` is the one tracked file: the hand-written page that `perf_journey()` fills in.
 - **Analysis reads each run's saved `params`, never the current `paramsall()`**, so fixing a figure means rerunning it at HEAD. Each experiment gets one entrypoint named after its sweep (`e00/b300-compile` → `analysis_plots.py e00_b300_compile`) that makes all its figures and tables (`results/<sweep>/`). It's built from generic pieces: `bench`, `loss_curves`, `load_table`. `lib/tests/test_analysis.py` checks `analysis.py` and `analysis_plots.py` import neither `experiment.py` nor anything from `lib/` except `lib.util`.
-- **Launching and replaying**: one reusable bookmark, `exp`, marks what's being launched: `jj bookmark set exp -r <change>`, then `sh jrun.sh exp experiment.py runall`. No per-experiment bookmarks. Once pushed, a commit exists both locally and in the cluster's repo, even after `exp` moves on. Replaying an old experiment is the same with its commit, e.g. `jj bookmark set exp -r <commit id from runs.json>`. It writes to the same savedirs, so the original results move to `.trash/`.
+- **Launching and replaying**: one reusable bookmark, `exp`, marks what's being launched: `jj bookmark set exp -r <change>`, then `sh jrun.sh exp experiment.py submitall`. No per-experiment bookmarks. A single run is resubmitted with its entrypoint's `*lsf n` (e.g. `pcalsf 16` after a timeout). Once pushed, a commit exists both locally and in the cluster's repo, even after `exp` moves on. Replaying an old experiment is the same with its commit, e.g. `jj bookmark set exp -r <commit id from runs.json>`. It writes to the same savedirs, so the original results move to `.trash/`.
 
 ## experiment.py
 
@@ -57,7 +57,7 @@ A script is a flat module of top-level functions. `lib.util.call_entrypoint` / `
 
 The pattern in `experiment.py`:
 - `Params` dataclass holds one run's config. `paramsall()` returns the sweep as a list of `Params`, each with its own `savedir` (`outdir/e00/<exp>/d{i}/`). Each sweep is recorded in a commit message prefixed `exp:` that names the outdir. Results are recorded in commits prefixed `result:`.
-- `run(n)` is the job: `train(n)` trains `paramsall()[n]` on every DDP rank and tears down the process group; then, for training runs (`max_hours > 0`), rank 0 runs the evals `pca(n)` and `probe(n)` on the last checkpoint. `runlsf(n)` moves any old savedir to `outdir/.trash/` and `bsub`s it to the `gpu_b300` queue (project `miaai`) as `torchrun --standalone --nproc_per_node={n_gpus} experiment.py run n`, requesting `n_gpus` GPUs and `n_gpus * (n_workers + 1)` CPU slots. `runall()` submits the whole sweep.
+- `run(n)` is the job: `train(n)` trains `paramsall()[n]` on every DDP rank and tears down the process group; then, for training runs (`max_hours > 0`), rank 0 runs the evals `pca(n)` and `probe(n)` on the last checkpoint. `runlsf(n)` moves any old savedir to `outdir/.trash/` and `bsub`s it to the `gpu_b300` queue (project `miaai`) as `torchrun --standalone --nproc_per_node={n_gpus} experiment.py run n`, requesting `n_gpus` GPUs and `n_gpus * (n_workers + 1)` CPU slots. `submitall()` submits the whole sweep (with `submit(n)` = `runlsf(n)`).
 - Optimization knobs in `Params`:
   - `amp`: bf16 autocast for forward + loss; SIGReg stays fp32.
   - `compile`: `torch.compile(dynamic=True)` on the encoder.
@@ -75,7 +75,7 @@ The pattern in `experiment.py`:
   - `probe.json`, `probe.png`, `probe/{fit,test}/hemibrain_eb_{split}.zarr`: the linear affinity probe (`probe`, `lib/probe.py`). It runs at the end of training after `pca`.
     - It fits one Linear per frozen token to mia-evals' 6 neuron affinities on an EB val-slab block, then predicts mia-evals' `gary_comparison` fit and test blocks (`lib/data.py` `HEMIBRAIN_EB_PROBE_BOXES`).
     - `probe.json` holds test-block boundary AP and BCE. The `.zarr` files are mia-evals affinity artifacts for `mia-evals score` with `truth_kind = "instances"`, which reads the ground truth from the store. They stay on the cluster.
-  - `mia_evals/<task>/records/*.json`, `resolved_config.json`, `git_commit.txt`: mia-evals' neuron-segmentation scores of the probe's affinities (`score`, submitted by `scorelsf`/`scoreall` as CPU jobs on the `short` queue).
+  - `mia_evals/<task>/records/*.json`, `resolved_config.json`, `git_commit.txt`: mia-evals' neuron-segmentation scores of the probe's affinities (`score`, submitted by `scorelsf`, or `submitall` with `submit(n)` = `scorelsf(n)`, as CPU jobs on `SCORE_QUEUE`).
     - Scoring runs mutex watershed plus a size filter fitted on the fit block, reported on the test block (PQ, VOI, ARE), with `mia_evals/gary_comparison_neuron_instance/mws.toml`: a copy of mia-evals' config with `truth_kind = "instances"`.
     - Read with `analysis_plots.mia_evals_table`.
   - `trace_summary.json`: from `lib.util.trace_summary`. GPU busy fraction (union of kernel intervals) and per-phase host ms over the profiled steps.

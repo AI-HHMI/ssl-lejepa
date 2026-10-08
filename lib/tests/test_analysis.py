@@ -2,6 +2,7 @@
 
 import json
 
+import pandas
 import plotly.express as px
 import pytest
 
@@ -105,6 +106,33 @@ def test_probe_vs_compute(tmp_path, monkeypatch):
     assert {round(x, 6) for t in pts for x in t.x} == {0.05}  # 100 steps x 500 TFLOP = 0.05 EFLOP, for both
     assert sorted({round(y, 6) for t in pts for y in t.y}) == [0.6, 0.7]  # random is a baseline, not a point
     assert [round(t.y[0], 6) for t in fig.data if t.mode == "lines"] == [0.4, 0.4] and name == "e00/train/probe_vs_compute"
+
+
+def test_scaling_law_tile_code_vs_probe(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    figs = []
+    monkeypatch.setattr(analysis_plots, "show", lambda fig, name: figs.append((fig, name)))
+    ap = lambda v: {f"boundary_ap_{c}": v for c in ["(1, 0, 0)", "(0, 1, 0)", "(0, 0, 1)", "(10, 0, 0)", "(0, 10, 0)", "(0, 0, 10)"]}
+    write = lambda d, name, row: (d.mkdir(parents=True, exist_ok=True), (d / name).write_text(json.dumps(row) + "\n"))
+    # source k = budget * 5 + size; tile code grows and AP falls with size and budget
+    for i, (k, width, tile, v) in enumerate([(0, 256, 0.1, 0.6), (5, 256, 0.2, 0.5), (3, 768, 0.5, 0.4), (8, 768, 0.9, 0.3)]):
+        src, pca = tmp_path / f"outdir/e00/scaling-law/d{k}", tmp_path / f"outdir/e00/scaling-law-pca/d{i}"
+        write(src, "runs.json", {"fn": "run", "params": {"n_layers": width // 64, "width": width}})
+        write(src, "probe.json", ap(v))
+        write(pca, "runs.json", {"fn": "pca", "params": {"init_from": f"outdir/e00/scaling-law/d{k}/"}})
+        write(pca, "pca.json", {"between_tile_variance": tile, "effective_rank": 100.0})
+    rand = tmp_path / "outdir/e00/scaling-law-pca/d4"
+    write(rand, "runs.json", {"fn": "pca", "params": {"init_from": "random", "n_layers": 12, "width": 512}})
+    write(rand, "pca.json", {"between_tile_variance": 0.02, "effective_rank": 50.0})
+    write(tmp_path / "outdir/e00/probe-test/d1", "probe.json", ap(0.2))
+    analysis_plots.scaling_law_tile_code_vs_probe()
+    res = pandas.read_csv(tmp_path / "results/e00/scaling-law-pca/tile_code_vs_probe.csv")
+    assert list(res.source) == ["d0", "d5", "d3", "d8"] and list(res.budget) == ["c1", "c2", "c1", "c2"]
+    assert "all -1.00; within size 12x768 -1.00, 4x256 -1.00" in capsys.readouterr().out
+    (fig, name), = figs
+    random = [(t.x[0], t.y[0]) for t in fig.data if t.name == "random 12x512"]
+    assert len(random) == 2 and random[1] == pytest.approx((0.02, 0.2))  # one per range panel
+    assert name == "e00/scaling-law-pca/tile_code_vs_probe"
 
 
 def test_mia_evals_table(tmp_path, monkeypatch):

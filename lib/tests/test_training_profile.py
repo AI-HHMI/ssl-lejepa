@@ -95,6 +95,8 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
     metrics = [json.loads(line) for line in (tmp_path / "metrics.json").read_text().splitlines()]
     assert metrics[-1]["idx_step"] == n_steps - 1  # Training continues beyond capture.
     assert all(torch.isfinite(torch.tensor(row["loss"])) for row in metrics)
+    lamb = LejepaConfig().lamb  # small_model_config keeps the default
+    assert all(row["loss"] == pytest.approx(row["inv"] + lamb * row["sigreg"], rel=1e-5) for row in metrics)  # logged apart
     performance = json.loads((tmp_path / "performance.json").read_text())
     assert performance["steps"] == 2
     assert performance["samples_per_second"] > 0
@@ -169,9 +171,17 @@ def test_run_trains_then_evals_training_runs_only(monkeypatch, max_hours, evals)
 
 
 def test_runlsf_refuses_probe_only_runs(tmp_path, monkeypatch):
-    # init_from runs are evaluated with probeall; training would silently ignore init_from and start from scratch.
+    # init_from runs are eval-only (pca, probe); training would silently ignore init_from and start from scratch.
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(experiment, "paramsall", lambda: [experiment.Params(savedir="outdir/e00/x/d0", init_from="random")])
-    with pytest.raises(AssertionError, match="probeall"):
+    with pytest.raises(AssertionError, match="eval-only"):
         experiment.runlsf(0)
     assert not (tmp_path / "outdir").exists()  # refused before trash() or bsub
+
+
+def test_submitall_submits_every_run_with_the_experiments_entrypoint(monkeypatch):
+    submitted = []
+    monkeypatch.setattr(experiment, "paramsall", lambda: [experiment.Params()] * 3)
+    monkeypatch.setattr(experiment, "submit", lambda n: submitted.append(n))
+    experiment.submitall()
+    assert submitted == [0, 1, 2]

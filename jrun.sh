@@ -1,6 +1,6 @@
 # Push a jj bookmark to the cluster and check it out there; optionally run a python command on the login node.
 #   sh jrun.sh <branch>                          push only
-#   sh jrun.sh <branch> experiment.py runall     push, then `uv run python experiment.py runall` on the cluster
+#   sh jrun.sh <branch> experiment.py submitall  push, then `uv run python experiment.py submitall` on the cluster
 set -e
 BRANCH=${1:?usage: sh jrun.sh <branch> [script.py args...]}
 shift

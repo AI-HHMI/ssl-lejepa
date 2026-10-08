@@ -59,6 +59,18 @@ def test_sigreg():
     assert loss.item() >= 0.0
 
 
+def test_sigreg_floor_is_batch_independent_but_its_pull_is_not():
+    """Exactly Gaussian projections score about 1.05 at any batch size: the statistic is N x the empirical-CF distance,
+    whose expectation under the null is 1/N x the integral of (1 - phi^2) times the window. A fixed real departure from
+    Gaussian (here: variance 1.2^2) scores about N times higher, so the pull of lamb * sigreg grows with the batch."""
+    torch.manual_seed(0)
+    sigreg = SIGReg()
+    null = {n: torch.stack([sigreg(torch.randn(n, 128)) for _ in range(20)]).mean().item() for n in (64, 1024)}
+    off = {n: torch.stack([sigreg(1.2 * torch.randn(n, 128)) for _ in range(20)]).mean().item() for n in (64, 1024)}
+    assert null[64] == pytest.approx(1.05, abs=0.1) and null[1024] == pytest.approx(1.05, abs=0.1), null
+    assert (off[1024] - null[1024]) / (off[64] - null[64]) == pytest.approx(16, rel=0.25), (off, null)
+
+
 def test_lejepa_loss():
     sigreg = SIGReg(num_slices=32, knots=9, t_max=3.0)
     globals_ = torch.randn(2, 4, 64)
