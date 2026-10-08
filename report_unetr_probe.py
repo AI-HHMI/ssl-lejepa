@@ -14,7 +14,7 @@ from analysis import (boundary_ap, probe_runs, probe_source, probe_stats, probe_
 
 SWEEP = "e00/unetr-probe"
 LINEAR_RANDOM = Path("outdir/e00/probe-test/d1")  # the linear probe on a random encoder, same probe blocks
-# The earlier linear probes, as in analysis.e00_unetr_probe's probe_vs_compute: every probed scaling-law run, and
+# The earlier linear probes, as in analysis_plots.e00_unetr_probe's probe_vs_compute: every probed scaling-law run, and
 # probe-test d1 (random encoder), d2/d3 (b300-train8h-dynamic d0/d1: 12x512 / 12x1024, 8 h).
 COMPARE = ("e00/scaling-law", "e00/probe-test/d1", "e00/probe-test/d2", "e00/probe-test/d3")
 OUT = Path("results") / SWEEP / "report.html"
@@ -59,7 +59,7 @@ def ap_bars(runs, linear_random, key: str) -> str:
 
 
 def ap_vs_compute(key: str) -> str:
-    """analysis.probe_vs_compute: boundary AP vs the encoder's pretraining compute, one point per probed run of SWEEP
+    """analysis_plots.probe_vs_compute: boundary AP vs the encoder's pretraining compute, one point per probed run of SWEEP
     and COMPARE, coloured by decoder and sweep; each random-encoder baseline is a gray line across the plot."""
     runs, random = probe_runs((SWEEP, *COMPARE))
     groups = {}

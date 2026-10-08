@@ -1,6 +1,6 @@
 """Experiment code (remote): LeJEPA 3D ViT training runs, benchmarks, inference (pca) and replays, and their LSF
 sweep (paramsall, savedirs under outdir/e00/). Depends on lib/, so it runs only from its experiment's commit.
-Analysis of the results lives in analysis.py."""
+Analysis of the results lives in analysis.py (readers), analysis_plots.py (figures, tables) and report_*.py."""
 
 from __future__ import annotations
 
@@ -181,7 +181,7 @@ def paramsall():
     # and any size's lr below. 4 compute budgets (anchored on m's ~0.32 s/step at b84, cudagraph-fix/d3, adjusted for
     # batch and model size) x the 5 sizes above = 20 runs. steps_per_epoch is the real cosine-schedule horizon (this
     # sweep's best a-priori estimate; see the calib note above); max_hours is a 2x safety cap, not the primary stop.
-    # Analysis reads back each run's REAL EFLOP (analysis.bench_table/run_compute) after the fact, so an inaccurate
+    # Analysis reads back each run's REAL EFLOP (analysis_plots.bench_table, analysis.run_compute) after the fact, so an inaccurate
     # estimate under/over-shoots the nominal budget rather than corrupting the fit -- c1..c4 are only for grid design.
     # Model FLOPs per sample (exact: lib.models.lejepa.Lejepa.forward's own out.n_flops accounting), at the base view
     # sizes' fixed token counts (2 globals of 12^3, 4 locals of 8^3 tokens; patch=8, LejepaConfig's default).
@@ -723,7 +723,7 @@ def score(n:int):
     fitted on the fit block, reported on the test block; panoptic quality ranks, VOI and ARE reported).
 
     Writes the record into the run's own dir, savedir/mia_evals/<task>/records/*.json (pull.sh brings it down;
-    analysis.mia_evals_table reads it), not mia-evals' repo. resolved_config.json (params) and git_commit.txt (the
+    analysis_plots.mia_evals_table reads it), not mia-evals' repo. resolved_config.json (params) and git_commit.txt (the
     commit that ran) go in the savedir first: mia-evals copies them into the record from --run-dir.
     Depends on the pinned mia-evals (uv.lock) and SCORE_CONFIG, so like probe it runs from this commit (scorelsf).
     """
