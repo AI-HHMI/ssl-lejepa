@@ -31,6 +31,8 @@ def test_report_compares_unetr_with_linear_on_the_same_encoder_and_notes_unscore
         "metrics.json": [{"idx_step": 99}],
         "performance.json": [{"tbl": "throughput", "tflops_per_second": 100.0, "seconds_per_step": 0.5}]})
     make_run(e00 / "probe-test/d1", {"n_layers": 12, "width": 512, "init_from": "random"}, 0.1)  # linear, random encoder
+    for d in ("d2", "d3"):  # earlier linear probes on another pretraining run (here the same one)
+        make_run(e00 / "probe-test" / d, {**arch, "init_from": "outdir/e00/scaling-law/d15"}, 0.3)
     fit = [{"step": s, "held_boundary_ap": 0.3 + s / 1000} for s in (0, 100)]
     make_run(e00 / "unetr-probe/d0", {**arch, "init_from": "outdir/e00/scaling-law/d15/", "decoder": "unetr"}, 0.4, **{"probe_fit.json": fit})
     make_run(e00 / "unetr-probe/d1", {"n_layers": 12, "width": 512, "init_from": "random", "decoder": "unetr",
@@ -48,3 +50,4 @@ def test_report_compares_unetr_with_linear_on_the_same_encoder_and_notes_unscore
     report.main()
     page = (tmp_path / report.OUT).read_text()
     assert "<svg" in page and "xs (d15)" in page and "random, encoder frozen" in page
+    assert "unetr, unetr-probe" in page and "linear, probe-test" in page and "random, linear" in page  # ap_vs_compute legend

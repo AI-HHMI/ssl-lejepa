@@ -1,5 +1,6 @@
 """Small matplotlib/HTML helpers: each chart returns an inline SVG string, each table an HTML string.
-Verbatim from lmd-catalog's scripts/analysis/plots.py (9b1475d) except this docstring: keep the two in sync."""
+Started from lmd-catalog's scripts/analysis/plots.py (9b1475d); diverges freely. Line and scatter legends sit outside
+the axes, on the right (LEGEND_RIGHT), so they never cover data."""
 
 import html
 import io
@@ -8,11 +9,13 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 
 # Okabe-Ito colorblind-safe palette; grey is reserved for "Other".
 COLORS = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#56B4E9", "#D55E00", "#F0E442", "#000000"]
 GREY = "#999999"
 MAX_SLICES = 8
+LEGEND_RIGHT = dict(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.01, 1))  # to_svg's tight bbox grows to fit
 
 plt.rcParams.update({"svg.fonttype": "none", "font.size": 10, "axes.spines.top": False, "axes.spines.right": False, "svg.hashsalt": "lmd"})  # fixed salt: same data -> byte-identical SVG
 
@@ -72,7 +75,7 @@ def scatter(groups: dict, xlabel: str, ylabel: str) -> str:
         ax.scatter(xs, ys, s=14, alpha=0.6, color=c, label=label)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
-    ax.legend(frameon=False)
+    ax.legend(**LEGEND_RIGHT)
     return to_svg(fig)
 
 
@@ -86,7 +89,7 @@ def group_bar(rows: list, xlabel: str) -> str:
     ax.set_yticks(ys)
     ax.set_yticklabels([label for label, _, _ in rows])
     ax.set_xlabel(xlabel)
-    ax.legend([plt.Rectangle((0, 0), 1, 1, color=color[g]) for g in groups], groups, frameon=False, fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=4)
+    ax.legend([Rectangle((0, 0), 1, 1, color=color[g]) for g in groups], groups, frameon=False, fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=4)
     return to_svg(fig)
 
 
@@ -132,7 +135,7 @@ def lines(series: dict, ylabel: str, log: bool = False) -> str:
     ax.set_ylabel(ylabel)
     if log:
         ax.set_yscale("log")
-    ax.legend(frameon=False, fontsize=8, loc="upper left")
+    ax.legend(**LEGEND_RIGHT)
     fig.autofmt_xdate()
     return to_svg(fig)
 
