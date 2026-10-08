@@ -8,6 +8,7 @@ from dataclasses import dataclass, asdict, fields
 import hashlib
 import os, sys
 import json
+import re
 import time
 from pathlib import Path
 
@@ -150,6 +151,11 @@ class Params:
     benchmark_steps: int = 50
     profile_steps: int = 10  # Set to zero to disable trace collection.
 
+# This experiment's id (README: experiment ids): its runs are outdir/<EXPERIMENT>/d<i>/. viewsizes-pca ran before
+# numbering (from the commit below), so it keeps its name, which submitall's check_experiment refuses: resubmit it from
+# that commit. The next experiment is e00/e01-<slug>.
+EXPERIMENT = "e00/viewsizes-pca"
+
 # This experiment's one entrypoint: submitall() submits every paramsall() run with it (README: one experiment, one
 # entrypoint). A follow-up step on the same runs (probe after training, a redone pca) is a new experiment commit.
 def submit(n):
@@ -174,15 +180,18 @@ def paramsall():
     configs += [(96, 64, 32), (160, 128, 80), (192, 144, 96), (256, 192, 128)]  # all scaled together
     for i, (inp, g, l) in enumerate(configs * 2):  # the two repeats: viewsizes-v2/d0-d16, d17-d33
         p = Params()
-        p.savedir = f"outdir/e00/viewsizes-pca/d{i}/"
+        p.savedir = f"outdir/{EXPERIMENT}/d{i}/"
         p.init_from = f"outdir/e00/viewsizes-v2/d{i}/"
         p.views = "displace"
         p.patch_size = (inp, inp, inp)
         p.global_size = (g, g, g)
         p.local_size = (l, l, l)
         params.append(p)
-    pprint(params)
     return params
+
+def printparams():
+    for p in paramsall():
+        pprint(p)
 
 def record(par: Params, fn: str):
     """Append one row to par.savedir/runs.json: which experiment function ran (fn), its params, code_provenance(),
@@ -921,7 +930,37 @@ def replaylsf(n:int):
     assert_committed()
     bsub(par, "replay", 30, 1, f"env CUDA_LAUNCH_BLOCKING=1 python {{code}}/experiment.py replay_bad_batch {dumps[0]}")
 
+def experiment_id(name: str) -> str | None:
+    """The id of a sweep dir name under outdir/<series>/: 'e15-02-pca' -> 'e15-02'. None for one from before
+    numbering (e.g. 'viewsizes-v2')."""
+    m = re.fullmatch(r"(e\d\d(?:-\d\d)*)-[a-z][a-z0-9-]*", name)
+    return m[1] if m else None
+
+def check_experiment():
+    """EXPERIMENT's id rules (README: experiment ids), checked against outdir/, the cluster's source of truth: the id is
+    well formed and no other sweep dir has it; every run is under outdir/<EXPERIMENT>/; a child (e15-02) builds on its
+    parent (e15), i.e. every init_from points into outdir/<series>/e15-*/; a root (e15) builds on no numbered experiment.
+    One that depends on two experiments can't be named, by design."""
+    series, name = EXPERIMENT.split("/")
+    eid = experiment_id(name)
+    assert eid, f"EXPERIMENT={EXPERIMENT!r}: want e<series>/e<NN>[-<NN>...]-<slug>, e.g. e00/e15-02-pca"
+    sweeps = [d.name for d in Path("outdir", series).glob("*")]
+    taken = [s for s in sweeps if experiment_id(s) == eid and s != name]
+    assert not taken, f"{EXPERIMENT}: id {eid} is taken by {series}/{taken[0]}"
+    params = paramsall()
+    assert all(p.savedir.startswith(f"outdir/{EXPERIMENT}/") for p in params), f"every savedir must be under outdir/{EXPERIMENT}/"
+    deps = sorted({Path(p.init_from).parts[2] for p in params if p.init_from not in ("", "random")})  # outdir/<series>/<sweep>/dN
+    parent = eid.rsplit("-", 1)[0] if "-" in eid else None
+    if parent:
+        parents = [s for s in sweeps if experiment_id(s) == parent]
+        assert parents, f"{EXPERIMENT} builds on {series}/{parent}, which doesn't exist in outdir/"
+        assert deps == parents, f"{EXPERIMENT} builds on {series}/{parents[0]}, but its init_from read {deps}"
+    else:
+        numbered = [d for d in deps if experiment_id(d)]
+        assert not numbered, f"{EXPERIMENT} builds on {series}/{numbered[0]}: name it {experiment_id(numbered[0])}-<NN>-<slug>"
+
 def submitall():
+    check_experiment()
     for i in range(len(paramsall())):
         submit(i)
 

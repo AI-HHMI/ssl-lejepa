@@ -1,6 +1,7 @@
 """Exercise the full training-loop profiler without the remote volume store."""
 
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -179,9 +180,44 @@ def test_runlsf_refuses_probe_only_runs(tmp_path, monkeypatch):
     assert not (tmp_path / "outdir").exists()  # refused before trash() or bsub
 
 
-def test_submitall_submits_every_run_with_the_experiments_entrypoint(monkeypatch):
+def sweep(monkeypatch, name, init_from=""):
+    """Point experiment at EXPERIMENT = name with 3 runs (reading init_from + d<i>/ if set), submit() recording them."""
     submitted = []
-    monkeypatch.setattr(experiment, "paramsall", lambda: [experiment.Params()] * 3)
+    monkeypatch.setattr(experiment, "EXPERIMENT", name)
+    monkeypatch.setattr(experiment, "paramsall", lambda: [experiment.Params(savedir=f"outdir/{name}/d{i}/",
+                                                                            init_from=init_from and f"{init_from}/d{i}/") for i in range(3)])
     monkeypatch.setattr(experiment, "submit", lambda n: submitted.append(n))
+    return submitted
+
+
+def test_submitall_submits_every_run_with_the_experiments_entrypoint(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    submitted = sweep(monkeypatch, "e00/e01-pca", init_from="outdir/e00/viewsizes-v2")  # a root may read a pre-numbering sweep
     experiment.submitall()
     assert submitted == [0, 1, 2]
+
+
+@pytest.mark.parametrize("name,init_from,existing,error", [
+    ("e00/viewsizes-pca", "", [], "want e<series>"),  # no id
+    ("e00/e01-pca", "", ["e01-train"], "id e01 is taken by e00/e01-train"),
+    ("e00/e01-02-pca", "outdir/e00/e01-train", [], "builds on e00/e01, which doesn't exist"),
+    ("e00/e01-02-pca", "outdir/e00/e03-train", ["e01-train", "e03-train"], "init_from read ['e03-train']"),
+    ("e00/e04-pca", "outdir/e00/e01-train", ["e01-train"], "name it e01-<NN>-<slug>"),  # a root can't hide its parent
+])
+def test_submitall_refuses_an_experiment_misnamed(tmp_path, monkeypatch, name, init_from, existing, error):
+    monkeypatch.chdir(tmp_path)
+    for s in existing:
+        (tmp_path / "outdir/e00" / s).mkdir(parents=True)
+    submitted = sweep(monkeypatch, name, init_from)
+    with pytest.raises(AssertionError, match=re.escape(error)):
+        experiment.submitall()
+    assert submitted == []  # refused before any job
+
+
+def test_submitall_takes_a_child_of_its_parent(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    for s in ("e01-train", "e01-01-pca", "e01-02-probe"):  # e01-02-probe: this experiment's own dir, from a first submit
+        (tmp_path / "outdir/e00" / s).mkdir(parents=True)
+    submitted = sweep(monkeypatch, "e00/e01-02-probe", init_from="outdir/e00/e01-train")
+    experiment.submitall()
+    assert submitted == [0, 1, 2] and experiment.experiment_id("e01-02-probe") == "e01-02"
