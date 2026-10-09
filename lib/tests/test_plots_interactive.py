@@ -8,7 +8,7 @@ import subprocess
 import pytest
 
 import plots_interactive as pi
-import report_page
+from reports import page
 
 
 def islands(fragment: str) -> list[dict]:
@@ -47,13 +47,13 @@ def test_images_embed_every_layer_and_mark_missing_cells(tmp_path):
         pi.images({"xs": {"c1": [tmp_path / "missing.png"]}})
 
 
-def test_runtime_only_on_interactive_pages(tmp_path):
-    report_page.write(tmp_path / "static.html", "t", "", [], [("S", [("c", "<svg></svg>")])])
-    report_page.write(tmp_path / "live.html", "t", "", [], [("S", [("c", pi.table(["a"], [[1]]))])])
-    assert "plotly" not in (tmp_path / "static.html").read_text() and "plotly" in (tmp_path / "live.html").read_text()
-    assert "var ON = true;" in (tmp_path / "live.html").read_text()
-    report_page.write(tmp_path / "off.html", "t", "", [], [("S", [("c", pi.table(["a"], [[1]]))])], interactive=False)
-    assert "var ON = false;" in (tmp_path / "off.html").read_text()
+def test_runtime_only_on_interactive_pages(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    static = page.write("e00/static", "a static page", [], [("S", [("c", "<svg></svg>")])]).read_text()
+    live = page.write("e00/live", "a live page", [], [("S", [("c", pi.table(["a"], [[1]]))])]).read_text()
+    assert "plotly" not in static and "plotly" in live and "var ON = true;" in live
+    off = page.write("e00/off", "an off page", [], [("S", [("c", pi.table(["a"], [[1]]))])], interactive=False).read_text()
+    assert "var ON = false;" in off and (tmp_path / "results/e00/off/report.html").is_file()
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="needs node for a JS syntax check")

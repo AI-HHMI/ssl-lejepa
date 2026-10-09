@@ -12,7 +12,8 @@ uv run pytest                                    # all tests (testpaths = lib/te
 uv run pytest lib/tests/test_lejepa.py::test_lejepa_config   # single test
 uv run python experiment.py                       # fzf picker over top-level fns (experiment code)
 uv run python experiment.py run 3                 # call run(3) directly (single process, no DDP)
-uv run python analysis_plots.py loss_curves e00/nanhunt_flash   # analysis of any pulled sweep
+uv run --extra analysis python -m reports.nanhunt_flash  # an experiment's report: results/e00/nanhunt_flash/report.html
+uv run --extra analysis python analysis.py check_runs     # tools: check_runs, ng_link, ...
 ```
 
 Remote workflow (experiments run on the Janelia cluster, `login1.int.janelia.org:~/proj/ssl-lejepa`):
@@ -28,7 +29,7 @@ Every piece of code is either **remote** or **local**, and depends either on **m
 | class | runs | depends on | examples | rule |
 |---|---|---|---|---|
 | **experiment** | remote (LSF) | `lib/` (treat all of it as mutable, `util.py` included), `mia_evals/` configs | `experiment.py`: `run`, `pca`, `probe`, `score`, `replay_bad_batch`; submitted by `runlsf`/`pcalsf`/`probelsf`/`scorelsf`/`replaylsf` | Only for **this commit's own `paramsall()`**, run from its committed snapshot. Training, inference (`pca`) and replays of an old sweep need time travel: `jj new <its commit>`. |
-| **analysis** | local | only `outdir/` (saved artifacts); never builds a `Lejepa`: imports neither `experiment.py` nor `lib/` model code, only `lib.util`'s entrypoint CLI | `analysis.py`: run-dir readers (`run_dirs`, `saved_params`, `run_compute`, `probe_runs`, ...); `analysis_plots.py`: figures and tables (`loss_curves`, `nanhunt_plot`, `flash_perf`, `perf_journey`, `check_runs`); `report_*.py`: one-page HTML reports | Runs at HEAD on **any** past sweep. It depends on `lib/` only transitively, through `outdir/`, which is an append-only log. |
+| **analysis** | local | only `outdir/` (saved artifacts); never builds a `Lejepa`: imports neither `experiment.py` nor `lib/` model code, only `lib.util`'s entrypoint CLI | `analysis.py`: run-dir readers (`run_dirs`, `saved_params`, `run_compute`, `bench_rows`, `load_table`, ...) and tools (`check_runs`, `ng_link`); `analysis_plots.py`: report cards (`bench`, `loss_curves`, `probe_table`, `probe_vs_compute`, ...); `reports/<sweep>.py`: one page per experiment (`python -m reports.<sweep>` from the repo root); `reports/page.py`: the page shell | Runs at HEAD on **any** past sweep. It depends on `lib/` only transitively, through `outdir/`, which is an append-only log. |
 | **glue** | either | neither | `jrun.sh`, `pull.sh`, `gpufree.sh` | |
 
 - **An experiment is one jj change**, described `exp: e00/<name>. <question>`. Its `paramsall()` writes only to `outdir/e00/<name>/d{i}/`. The change ID stays the same while you fix it: cancel jobs, amend, resubmit. Each run records the commit hash it actually ran.
@@ -48,8 +49,8 @@ Every piece of code is either **remote** or **local**, and depends either on **m
 - **`pca` and `replay_bad_batch` assert they're working on this commit's own runs.** `pca(n)` checks the checkpoint's saved params equal `paramsall()[n]`. `replay_bad_batch` checks the dump sits in one of this commit's savedirs.
 - **Two artifact places**:
   - `outdir/` is an exact mirror of the cluster's append-only run dirs, written only by remote runs, never locally. That's why `./pull.sh --delete` is safe. Never edit or `rm` experiment dirs.
-  - `results/` is local analysis output (figures, tables, summaries, screenshots) and is not committed. `results/perf_journey.html` is the one tracked file: the hand-written page that `perf_journey()` fills in.
-- **Analysis reads each run's saved `params`, never the current `paramsall()`**, so fixing a figure means rerunning it at HEAD. Each experiment gets one entrypoint named after its sweep (`e00/b300-compile` → `analysis_plots.py e00_b300_compile`) that makes all its figures and tables (`results/<sweep>/`). It's built from generic pieces: `bench`, `loss_curves`, `load_table`. `lib/tests/test_analysis.py` checks `analysis.py` and `analysis_plots.py` import neither `experiment.py` nor anything from `lib/` except `lib.util`.
+  - `results/` is local analysis output (figures, tables, summaries, screenshots) and is not committed. `results/perf_journey.html` is the one tracked file: the hand-written page that `reports/perf_journey.py` fills in.
+- **Analysis reads each run's saved `params`, never the current `paramsall()`**, so fixing a figure means rerunning it at HEAD. Each experiment gets one report named after its sweep (`e00/b300-compile` → `reports/b300_compile.py`): a few lines composing `analysis_plots`' cards into one interactive page, `results/<sweep>/report.html` (`reports/page.py`'s `write`, charts and tables from `plots_interactive`); its docstring, the experiment's question, is the page's intro, and says nothing about how the page works. Shared pieces go in `analysis.py` (data) or `analysis_plots.py` (cards), never in a report. `reports/`, not `report/`: mia-evals installs a top-level `report` package. `lib/tests/test_analysis.py` checks `analysis.py`, `analysis_plots.py` and every `reports/*.py` import neither `experiment.py` nor anything from `lib/` except `lib.util`.
 - **Launching and replaying**: one reusable bookmark, `exp`, marks what's being launched: `jj bookmark set exp -r <change>`, then `sh jrun.sh exp experiment.py submitall`. No per-experiment bookmarks. A single run is resubmitted with its entrypoint's `*lsf n` (e.g. `pcalsf 16` after a timeout). Once pushed, a commit exists both locally and in the cluster's repo, even after `exp` moves on. Replaying an old experiment is the same with its commit, e.g. `jj bookmark set exp -r <commit id from runs.json>`. It writes to the same savedirs, so the original results move to `.trash/`.
 
 ## experiment.py
@@ -78,10 +79,10 @@ The pattern in `experiment.py`:
     - `probe.json` holds test-block boundary AP and BCE. The `.zarr` files are mia-evals affinity artifacts for `mia-evals score` with `truth_kind = "instances"`, which reads the ground truth from the store. They stay on the cluster.
   - `mia_evals/<task>/records/*.json`, `resolved_config.json`, `git_commit.txt`: mia-evals' neuron-segmentation scores of the probe's affinities (`score`, submitted by `scorelsf`, or `submitall` with `submit(n)` = `scorelsf(n)`, as CPU jobs on `SCORE_QUEUE`).
     - Scoring runs mutex watershed plus a size filter fitted on the fit block, reported on the test block (PQ, VOI, ARE), with `mia_evals/gary_comparison_neuron_instance/mws.toml`: a copy of mia-evals' config with `truth_kind = "instances"`.
-    - Read with `analysis_plots.mia_evals_table`.
+    - Shown by `analysis_plots.mia_evals_table`.
   - `trace_summary.json`: from `lib.util.trace_summary`. GPU busy fraction (union of kernel intervals) and per-phase host ms over the profiled steps.
 
-- `analysis_plots.load_table(sweep, filename)` joins every run dir's rows with that run's saved `Params` (current defaults for fields added since) into a pandas DataFrame.
+- `analysis.load_table(sweep, filename)` joins every run dir's rows with that run's saved `Params` (current defaults for fields added since) into a pandas DataFrame.
 - Compare runs by `tokens_per_second`, not Mvox/s. Mvox/s counts the input patch, but tokens per sample change with the view scheme and patch-embedding rules. Profile-derived columns (GPU busy %, profiled step ms) depend on `profile_steps`; only compare them within a sweep.
 
 Data comes from `lmd_catalog` (the volume catalog) → `.to_miao()` → `miao.VolumeDataset`, which yields dicts with an `"img"` tensor of shape `Batch C Z Y X`. Both packages are git dependencies (see `[tool.uv.sources]`). `lib/data.py:hemibrain_eb_config(split)` builds the MiaoConfig for the FlyEM hemibrain Ellipsoid Body train/val/test splits used in gary_comparison.

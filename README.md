@@ -12,7 +12,7 @@ uv sync --all-extras
 source .venv/bin/activate
 
 # 2. Run a recent experiment analysis
-python report_viewsizes_pca.py
+python -m reports.viewsizes_pca    ## -> results/e00/viewsizes-pca/report.html
 
 # 3. Run an old experiment
 ## Check out an old experiment commit, i.e. one with `exp: e00/<experiment-name>` in the description.

@@ -1,6 +1,6 @@
 """Experiment code (remote): LeJEPA 3D ViT training runs, benchmarks, inference (pca) and replays, and their LSF
 sweep (paramsall, savedirs under outdir/e00/). Depends on lib/, so it runs only from its experiment's commit.
-Analysis of the results lives in analysis.py (readers), analysis_plots.py (figures, tables) and report_*.py."""
+Analysis of the results lives in analysis.py (readers), analysis_plots.py (report cards) and reports/ (one page per experiment)."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ import lmd_catalog as lmd
 from miao.config import MiaoConfig
 from miao import VolumeDataset, collate_deferred, finish_images
 
-from rich import print as pprint
+from pprint import pprint
 import numpy as np
 
 # Default (width, batch per GPU) per LSF GPU queue, for displace 128^3 / 96^3 / 64^3 views. Measured runs cited;

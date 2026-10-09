@@ -1,9 +1,11 @@
-"""One-page interactive HTML report of e00/viewsizes-pca: PCA maps (pca2.png) of the 34 viewsizes-v2 encoders, laid out
-by the view-size axes that sweep explored, with each map's tile code (between-tile variance) against view size, the
-linear probe's boundary AP and training length. From pulled artifacts in outdir/ only.
-Usage: uv sync --extra analysis && uv run python report_viewsizes_pca.py  ->  results/e00/viewsizes-pca/report.html
-(the maps are linked, not embedded: open the page from this checkout, next to outdir/)
-"""
+"""e00/viewsizes-pca: PCA maps of the 34 viewsizes-v2 encoders (17 input/global/local view-size configs x 2 repeats; all
+12x512, 8 h on one B300), loaded through init_from, laid out by the view-size axes that sweep explored. Each pca2.png
+shows a 3 x 4 x 4 crop of the run's own global view, held out in EB's val slab: columns EM | PCA of tokens | PCA after
+subtracting each tile's mean | PCA fitted within each tile | pre-LayerNorm token norm; rows the middle slice of each of
+the 3 tile layers. Between-tile variance is the share of token variance that is just each global view's own code: in
+e00/scaling-law-pca it grew with model size and training. Does view geometry move it, does it track the linear probe's
+boundary AP (viewsizes-v2's own probe), and is either beyond the repeat-to-repeat noise? Runs trained a fixed 8 h, so
+step counts differ ~4x between configs: see the training-length section before reading a view-size effect."""
 
 import statistics
 from pathlib import Path
@@ -11,13 +13,12 @@ from pathlib import Path
 import pandas
 
 import plots_interactive as pi
-import report_page
 from analysis import boundary_ap, probe_stats, read_jsonl, run_compute, run_dirs, saved_params
+from analysis_plots import LINEAR_RANDOM
+from reports import page
 
 SWEEP = "e00/viewsizes-pca"
-OUT = Path("results") / SWEEP / "report.html"
 N_CONFIGS = 17  # viewsizes-v2's configs; d0-d16 are repeat 1, d17-d33 repeat 2
-LINEAR_RANDOM = Path("outdir/e00/probe-test/d1")  # the linear probe on a random encoder, same probe blocks
 SCALED = [(96, 64, 32), (128, 96, 64), (160, 128, 80), (192, 144, 96), (256, 192, 128)]  # (input, global, local)
 # viewsizes-v2's axes: name -> (x axis label, which (input, global, local) configs lie on it, their x). The base
 # (128, 96, 64) lies on all four.
@@ -27,18 +28,6 @@ AXES = {
     "local view": ("local view (input 128, global 96)", lambda c: c[:2] == (128, 96), lambda c: c[2]),
     "all scaled": ("input patch, views scaled with it", lambda c: c in SCALED, lambda c: c[0]),
 }
-INTRO = """PCA maps of the 34 viewsizes-v2 encoders (17 input/global/local view-size configs x 2 repeats; all 12x512, 8 h
-on one B300), loaded through init_from. Each pca2.png shows a 3 x 4 x 4 crop of the run's own global view, held out
-in EB's val slab: columns EM | PCA of tokens | PCA after subtracting each tile's mean | PCA fitted within each tile |
-pre-LayerNorm token norm; rows the middle slice of each of the 3 tile layers. Between-tile variance is the share of
-token variance that is just each global view's own code: in e00/scaling-law-pca it grew with model size and
-training. Does view geometry move it, does it track the linear probe's boundary AP (viewsizes-v2's own probe), and
-is either beyond the repeat-to-repeat noise? Runs trained a fixed 8 h, so step counts differ ~4x between configs: see
-the training-length section before reading a view-size effect. Charts: scroll or drag to zoom, hover for details.
-Images: click to open, scroll to zoom, drag to pan; arrows step through the grid (up/down: repeat, left/right: the
-axis). Tables: click a header to sort."""
-
-
 def label(c) -> str:
     return "/".join(map(str, c))
 
@@ -66,7 +55,7 @@ def axis_of(c) -> str:
 
 
 def build() -> tuple:
-    """Return (tiles, sections) for report_page.write."""
+    """Return (tiles, sections) for page.write."""
     runs = [run_info(d) for d in run_dirs(SWEEP)]
     probed = [r for r in runs if r["ap_short"] is not None]
     by_config = {}
@@ -87,7 +76,8 @@ def build() -> tuple:
     for name, (xlabel, on, x) in AXES.items():
         configs = sorted((c for c in by_config if on(c)), key=x)
         grid = {f"repeat {k}": {label(c): [by_config[c][k]["pca2"]] for c in configs if k in by_config[c]} for k in (1, 2)}
-        maps.append((f"{xlabel}: input/global/local per column", pi.images(grid, base=OUT.parent)))
+        # Linked, not embedded (42 MB of maps): the page works from this checkout, next to outdir/.
+        maps.append((f"{xlabel}: input/global/local per column", pi.images(grid, base=page.out_path(SWEEP).parent)))
         series = lambda key, k: ([x(c) for c in configs if k in by_config[c] and by_config[c][k][key] is not None],
                                  [by_config[c][k][key] for c in configs if k in by_config[c] and by_config[c][k][key] is not None])
         tile_code.append((xlabel, pi.lines({f"repeat {k}": series("between_tile", k) for k in (1, 2)}, xlabel, "between-tile variance")))
@@ -125,7 +115,7 @@ def build() -> tuple:
 
 
 def main():
-    report_page.write(OUT, f"{SWEEP} report", INTRO, *build())
+    page.write(SWEEP, __doc__, *build())
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 """The experiment-independent half of a one-page HTML report in lmd-catalog's style (scripts/analysis/report.py):
-CSS, the side contents bar, tiles and cards. An experiment's report_*.py builds (tiles, sections) from plots.py (static
-SVG) or plots_interactive.py fragments and calls write()."""
+CSS, the side contents bar, tiles and cards. An experiment's reports/<sweep>.py builds (tiles, sections) from
+analysis_plots' cards (plots_interactive fragments) and calls write()."""
 
 import re
 from pathlib import Path
@@ -48,10 +48,18 @@ def anchor(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
 
 
-def write(out: Path, title: str, intro: str, tiles: list, sections: list, interactive: bool = True):
-    """tiles: (number, label); sections: (title, [(card title, svg or table html)]). interactive: whether a page with
+def out_path(sweep: str) -> Path:
+    """Where write() puts a sweep's page: results/<sweep>/report.html."""
+    return Path("results") / sweep / "report.html"
+
+
+def write(sweep: str, intro: str | None, tiles: list, sections: list, interactive: bool = True) -> Path:
+    """The sweep's page at out_path(sweep), titled after it. intro: what the experiment asks (a report's docstring);
+    tiles: (number, label); sections: (title, [(card title, html fragment)]). interactive: whether a page with
     plots_interactive fragments opens interactive or static (its corner toggle switches either way)."""
-    toc = [("overview", "Overview")] + [(anchor(t), t) for t, _ in sections]
+    assert intro, f"{sweep}: a report's docstring is its page's intro: say what the experiment asks"
+    out, title = out_path(sweep), f"{sweep} report"
+    toc =[("overview", "Overview")] + [(anchor(t), t) for t, _ in sections]
     nav = "<nav class='toc'><b>Contents</b>" + "".join(f"<a href='#{a}'>{t}</a>" for a, t in toc) + "</nav>"
     main_html = (
         f"<main><h1 id='overview'>{title}</h1><p>{intro}</p><div class='tiles'>"
@@ -67,3 +75,4 @@ def write(out: Path, title: str, intro: str, tiles: list, sections: list, intera
         f"<title>{title}</title><style>{CSS}</style></head><body>{body}</body></html>"
     )
     print(f"wrote {out}")
+    return out

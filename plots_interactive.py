@@ -1,8 +1,8 @@
-"""Interactive counterparts of plots.py for report_page: Plotly charts (scroll or drag to zoom, pan, linear/log axis
-buttons, hover tooltips, click a legend entry to hide it), click-to-sort tables, and image grids whose full-screen
-viewer zooms (nearest neighbour), pans, steps across the grid with the arrow keys and toggles a cell's overlay layers.
-Each helper returns an HTML fragment marked with MARK; report_page.write appends runtime() to any page holding one.
-report_page.write(..., interactive=False) writes the page static (charts without zoom, pan or tooltips; no sorting or
+"""Interactive charts and tables for reports/page.py: Plotly charts (scroll or drag to zoom, pan, log-axis toggles, hover
+tooltips, click a legend entry to hide it), click-to-sort tables, and image grids whose full-screen viewer zooms
+(nearest neighbour), pans, steps across the grid with the arrow keys and toggles a cell's overlay layers.
+Each helper returns an HTML fragment marked with MARK; page.write appends runtime() to any page holding one.
+page.write(..., interactive=False) writes the page static (charts without zoom, pan or tooltips; no sorting or
 viewer); either way an "interactive" toggle in the page corner switches it for the current view.
 Stdlib only: figures are Plotly JSON built here and drawn by plotly.js from a CDN. The viewer is spearmint's lightbox
 (spearmint/viz.py, from mia-muvit's report.py) with layer toggles in place of its j/k overlay cycling."""
@@ -183,13 +183,13 @@ def tooltip(row: dict) -> str:
     return "<br>".join(f"{k}: {v:.4g}" if isinstance(v, float) else f"{k}: {v}" for k, v in row.items())
 
 
-def figure(data: list, layout: dict, logx: bool = False) -> str:
+def figure(data: list, layout: dict, logx: bool = False, logy: bool = False) -> str:
     """A Plotly figure: an empty div and its JSON, drawn by runtime(), under a small round log-scale checkbox per numeric axis.
     A "category" axis (e.g. bar labels) gets no toggle and is fixed, so zoom and pan move only the numeric axis."""
     layout = {"height": 380, "margin": {"t": 16, "r": 10, "b": 50, "l": 60}, "hovermode": "closest", "font": {"size": 11},
               "paper_bgcolor": "#fff", "plot_bgcolor": "#fff", "legend": {"font": {"size": 10}}, **layout}
     layout["xaxis"] = {"type": "log" if logx else "linear", "gridcolor": "#eee", **layout.get("xaxis", {})}
-    layout["yaxis"] = {"type": "linear", "gridcolor": "#eee", **layout.get("yaxis", {})}
+    layout["yaxis"] = {"type": "log" if logy else "linear", "gridcolor": "#eee", **layout.get("yaxis", {})}
     pid = f"iplot{next(_ids)}"
     toggles = []
     for ax in "xy":
@@ -203,7 +203,7 @@ def figure(data: list, layout: dict, logx: bool = False) -> str:
             f"<script type='application/json' id='{pid}-data'>{payload}</script>")
 
 
-def scatter(groups: dict, x: str, y: str, hlines: dict | None = None, logx: bool = False) -> str:
+def scatter(groups: dict, x: str, y: str, hlines: dict | None = None, logx: bool = False, logy: bool = False) -> str:
     """groups: label -> rows, dicts holding x and y; all of a row's fields show in its point's tooltip. hlines: name ->
     y, a gray baseline across the plot each (in the legend; dash styles cycle)."""
     data = [{"type": "scatter", "mode": "markers", "name": label, "x": [r[x] for r in rows], "y": [r[y] for r in rows],
@@ -213,30 +213,34 @@ def scatter(groups: dict, x: str, y: str, hlines: dict | None = None, logx: bool
     shapes = [{"type": "line", "xref": "paper", "x0": 0, "x1": 1, "y0": v, "y1": v, "name": name, "showlegend": True,
                "line": {"color": GREY, "width": 1.5, "dash": dash}}
               for (name, v), dash in zip((hlines or {}).items(), itertools.cycle(DASHES))]
-    return figure(data, {"shapes": shapes, "xaxis": {"title": x}, "yaxis": {"title": y}}, logx=logx)
+    return figure(data, {"shapes": shapes, "xaxis": {"title": x}, "yaxis": {"title": y}}, logx=logx, logy=logy)
 
 
-def lines(series: dict, xlabel: str, ylabel: str) -> str:
+def lines(series: dict, xlabel: str, ylabel: str, logx: bool = False, logy: bool = False) -> str:
     """series: label -> (xs, ys), one line each. The tooltip lists every line's value at the hovered x."""
     data = [{"type": "scatter", "mode": "lines+markers", "marker": {"size": 5}, "name": label, "x": list(xs), "y": list(ys), "line": {"color": c, "width": 1.8},
              "hovertemplate": "%{y:.4g}"}
             for (label, (xs, ys)), c in zip(series.items(), itertools.cycle(COLORS))]
-    return figure(data, {"hovermode": "x unified", "xaxis": {"title": xlabel}, "yaxis": {"title": ylabel}})
+    return figure(data, {"hovermode": "x unified", "xaxis": {"title": xlabel}, "yaxis": {"title": ylabel}}, logx=logx, logy=logy)
 
 
-def bar(rows: list, xlabel: str) -> str:
-    """Horizontal bars coloured by group, top to bottom in the order given (plots.group_bar). rows: (label, value, group)."""
+def bar(rows: list, xlabel: str, stack: bool = False) -> str:
+    """Horizontal bars coloured by group, top to bottom in first-seen label order. rows: (label, value, group). stack:
+    a label's groups stack into one bar (e.g. time per kernel group), instead of standing side by side."""
     groups = list(dict.fromkeys(g for _, _, g in rows))
+    labels = list(dict.fromkeys(label for label, _, _ in rows))
     data = [{"type": "bar", "orientation": "h", "name": g, "marker": {"color": c},
              "y": [label for label, _, gr in rows if gr == g], "x": [v for _, v, gr in rows if gr == g],
              "hovertemplate": "%{y}: %{x:.4g}<extra></extra>"}
             for g, c in zip(groups, itertools.cycle(COLORS))]
-    yaxis = {"type": "category", "categoryorder": "array", "categoryarray": [label for label, _, _ in rows], "autorange": "reversed", "automargin": True,
+    yaxis = {"type": "category", "categoryorder": "array", "categoryarray": labels, "autorange": "reversed", "automargin": True,
              "ticklabelstandoff": 6}  # px between a bar's label and the axis
-    return figure(data, {"height": 22 * len(rows) + 110, "xaxis": {"title": xlabel}, "yaxis": yaxis, "barmode": "group"})
+    return figure(data, {"height": 22 * len(labels) + 110, "xaxis": {"title": xlabel}, "yaxis": yaxis, "barmode": "stack" if stack else "group"})
 
 
 def cell(c) -> str:
+    if c is None or c != c:  # None or NaN (a pandas table's missing value)
+        return "<td>—</td>"
     return f"<td class='n'>{c:.4g}</td>" if isinstance(c, float) else f"<td>{html.escape(str(c))}</td>"
 
 

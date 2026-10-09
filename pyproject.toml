@@ -10,13 +10,9 @@ requires-python = ">=3.12"
 dependencies = [
     "torch>=2.0",
     "numpy>=1.24",
-    "rich>=13.0",
-    "einops>=0.7.0",
     "miao-io>=0.4.0",
     "lmd-catalog",
     "zarr>=2.16",
-    "pandas",
-    "plotly",
     "pillow>=12.3.0",
     "mia-evals",
 ]
@@ -26,7 +22,7 @@ dev = [
     "pytest>=7.0",
 ]
 analysis = [
-    "matplotlib",  # report.py's plots.py (copied from lmd-catalog's scripts/analysis)
+    "pandas",  # analysis.py, analysis_plots.py, report_*.py (charts: plots_interactive, plotly.js from a CDN)
 ]
 
 [tool.hatch.build.targets.wheel]
