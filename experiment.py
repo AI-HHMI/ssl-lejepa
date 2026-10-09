@@ -57,6 +57,9 @@ CPUS_PER_GPU = 12  # LSF slots per GPU: 8 GPUs -> all 96 cores; training process
 # whole node". The shortest CPU queue; check its run limit and memory per slot with `bqueues -l short`.
 SCORE_QUEUE, SCORE_SLOTS, SCORE_MINUTES = "local", 16, 4*60
 SCORE_CONFIG = "mia_evals/gary_comparison_neuron_instance/mws.toml"  # ours: truth_kind = "instances"
+# score() runs mia-evals from this sister checkout, with its own .venv (`uv sync` there) and its own commit, which
+# mia-evals records in each score's provenance (mia_evals_commit). Not a dependency of this repo.
+MIA_EVALS = Path.home() / "proj/mia-evals"
 N_PARAMS_CACHE = Path(".cache/lejepa_n_params.json")  # machine-local (gitignored): see lejepa_n_params
 # Model sizes and compute budgets of e00/scaling-law's IsoFLOP grid (scaling_budgets), for designing size x budget sweeps.
 SIZES = {"xs": (4, 256), "s": (6, 384), "m": (12, 512), "l": (16, 768), "xl": (24, 1024)}  # (n_layers, width); m = Params' default
@@ -679,22 +682,25 @@ def score(n:int):
     Writes the record into the run's own dir, savedir/mia_evals/<task>/records/*.json (pull.sh brings it down;
     analysis_plots.mia_evals_table reads it), not mia-evals' repo. resolved_config.json (params) and git_commit.txt (the
     commit that ran) go in the savedir first: mia-evals copies them into the record from --run-dir.
-    Depends on the pinned mia-evals (uv.lock) and SCORE_CONFIG, so like probe it runs from this commit (scorelsf).
+    Runs the sister checkout MIA_EVALS's own CLI and .venv, from that checkout (its commit is in the record), with this
+    commit's SCORE_CONFIG (scorelsf).
     """
     import subprocess
     par = paramsall()[n]
     savedir = Path(par.savedir)
     assert (savedir / "probe/test").is_dir() and (savedir / "probe/fit").is_dir(), f"no probe artifacts in {savedir}: probe first"
+    exe = MIA_EVALS / ".venv/bin/mia-evals"
+    assert exe.is_file(), f"no mia-evals CLI at {exe}: clone github.com/AI-HHMI/mia-evals to {MIA_EVALS} and `uv sync` there"
     record(par, "score")
     (savedir / "resolved_config.json").write_text(json.dumps(asdict(par)) + "\n")
     (savedir / "git_commit.txt").write_text(code_provenance()["commit_id"] + "\n")
     config = Path(__file__).resolve().parent / SCORE_CONFIG  # the snapshot's copy when run by scorelsf
-    cmd = [str(Path(sys.executable).with_name("mia-evals")), "score", str(config),
-           "--test", str(savedir / "probe/test"), "--val", str(savedir / "probe/fit"),
-           "--leaderboard", str(savedir / "mia_evals"), "--run-dir", str(savedir),
+    cmd = [str(exe), "score", str(config),
+           "--test", str(savedir.resolve() / "probe/test"), "--val", str(savedir.resolve() / "probe/fit"),
+           "--leaderboard", str(savedir.resolve() / "mia_evals"), "--run-dir", str(savedir.resolve()),
            "--no-scored"]  # don't keep the 5.8 GB post-processed labelling per run
     print(" ".join(cmd), flush=True)
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, cwd=MIA_EVALS)  # absolute paths: the cwd is mia-evals'
 
 def tile_features(encoder, img, tile):
     """Encoder tokens (after its final LayerNorm) of img (Z Y X in [0, 1], on the encoder's device, a multiple of
@@ -726,6 +732,14 @@ def tile_logits(model, img, tile):
     assert out is not None, "img must be nonempty"
     return out
 
+def write_affinities(path: Path, array, **attrs):
+    """A mia-evals affinity artifact (its artifact.write_artifact layout): one zarr array, Channel X Y Z, whose attrs say
+    how to read it (kind, origin, convention, axes, native_box, scale, ...). mia-evals validates it when it scores it."""
+    import zarr
+    store = zarr.open_array(str(path), mode="w", shape=array.shape, dtype=array.dtype, chunks=tuple(min(256, s) for s in array.shape))
+    store[:] = array
+    store.attrs.update(kind="affinity", **attrs)
+
 def probe(n:int):
     """Linear or dense (par.decoder) affinity probe of paramsall()[n]'s latest checkpoint, scored as mia-evals'
     neuron-instance task, fitted on HEMIBRAIN_EB_PROBE_BOXES["train"] against proofread-cell-hemibrain-v1.2.
@@ -748,7 +762,6 @@ def probe(n:int):
     import math
     import torch
     import zarr
-    from artifact import write_artifact
     from PIL import Image
     from lib.probe import AFFINITY_OFFSETS_XYZ, affinities, average_precision, fit_probe, to_tokens, to_voxels
     par = paramsall()[n]
@@ -854,10 +867,10 @@ def probe(n:int):
             Image.fromarray((torch.cat([row[0], gap, row[1], gap, row[2]], 1) * 255).byte().cpu().numpy()).save(Path(par.savedir) / "probe.png")
             del aff, valid
         (x0, x1), (y0, y1), (z0, z1) = box
-        write_artifact(Path(par.savedir) / "probe" / split / f"hemibrain_eb_{split}.zarr", pred.permute(0, 3, 2, 1).cpu().numpy(),
-                       kind="affinity", origin=(x0, y0, z0), convention=f"sigmoid(logit), {par.decoder} decoder",
-                       run=run_name, step=step, axes="xyz", source_path=vol.path, source_label_key=HEMIBRAIN_EB_LABELS,
-                       native_box=box, scale=(1, 1, 1), annotated_box=HEMIBRAIN_EB_PROBE_ANNOTATED[split], covers_full_box=False)
+        write_affinities(Path(par.savedir) / "probe" / split / f"hemibrain_eb_{split}.zarr", pred.permute(0, 3, 2, 1).cpu().numpy(),
+                         origin=[x0, y0, z0], convention=f"sigmoid(logit), {par.decoder} decoder",
+                         run=run_name, step=step, axes="xyz", source_path=vol.path, source_label_key=HEMIBRAIN_EB_LABELS,
+                         native_box=box, scale=[1, 1, 1], annotated_box=HEMIBRAIN_EB_PROBE_ANNOTATED[split], covers_full_box=False)
         del pred, labels, em
     (Path(par.savedir) / "probe.json").write_text(json.dumps(stats) + "\n")
     print(f"{par.savedir}: probe at step {step}: boundary AP (short-range mean) {stats['boundary_ap_short']:.3f}; wrote probe/", flush=True)

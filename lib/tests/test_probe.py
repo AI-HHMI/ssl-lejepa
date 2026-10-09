@@ -76,10 +76,9 @@ def test_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch):
     # Axes: only +x crosses the x = 40 split (1 of 31 valid layers); +y and +z never do.
     frac = [stats[f"boundary_frac_{o}"] for o in AFFINITY_OFFSETS_XYZ[:3]]
     assert abs(frac[0] - 1 / 31) < 0.003 and frac[1] == frac[2] == 0
-    from artifact import open_artifact
-    art = open_artifact(tmp_path / "run/probe/test/hemibrain_eb_test.zarr")
-    assert art.spatial_shape == (32, 32, 32) and list(art.origin) == [24, 20, 24]
-    arr = np.asarray(zarr.open_array(str(tmp_path / "run/probe/test/hemibrain_eb_test.zarr"), mode="r")[:])
+    art = zarr.open_array(str(tmp_path / "run/probe/test/hemibrain_eb_test.zarr"), mode="r")
+    assert dict(art.attrs)["kind"] == "affinity" and dict(art.attrs)["origin"] == [24, 20, 24] and dict(art.attrs)["scale"] == [1, 1, 1]
+    arr = np.asarray(art[:])
     assert arr.shape == (6, 32, 32, 32) and 0 <= arr.min() and arr.max() <= 1
     assert (tmp_path / "run/probe.png").is_file() and (tmp_path / "run/probe/fit/hemibrain_eb_fit.zarr").is_dir()
     fit = [json.loads(l) for l in (tmp_path / "run/probe_fit.json").read_text().splitlines()]
@@ -114,10 +113,9 @@ def test_unetr_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch):
     assert stats["step"] == 7 and 0 <= stats["boundary_ap_short"] <= 1
     frac = [stats[f"boundary_frac_{o}"] for o in AFFINITY_OFFSETS_XYZ[:3]]
     assert abs(frac[0] - 1 / 31) < 0.003 and frac[1] == frac[2] == 0
-    from artifact import open_artifact
-    art = open_artifact(tmp_path / "run/probe/test/hemibrain_eb_test.zarr")
-    assert art.spatial_shape == (32, 32, 32) and list(art.origin) == [24, 20, 24]
-    arr = np.asarray(zarr.open_array(str(tmp_path / "run/probe/test/hemibrain_eb_test.zarr"), mode="r")[:])
+    art = zarr.open_array(str(tmp_path / "run/probe/test/hemibrain_eb_test.zarr"), mode="r")
+    assert dict(art.attrs)["origin"] == [24, 20, 24] and dict(art.attrs)["convention"] == "sigmoid(logit), unetr decoder"
+    arr = np.asarray(art[:])
     assert arr.shape == (6, 32, 32, 32) and 0 <= arr.min() and arr.max() <= 1  # tiled over the 48^3 padded region, then trimmed
     assert (tmp_path / "run/probe.png").is_file() and (tmp_path / "run/probe/fit/hemibrain_eb_fit.zarr").is_dir()
     fit = [json.loads(l) for l in (tmp_path / "run/probe_fit.json").read_text().splitlines()]
@@ -140,27 +138,35 @@ def test_load_checkpoint_init_from(tmp_path, monkeypatch):
     assert step == 42 and all(torch.equal(x, trained[k]) for k, x in c.state_dict().items())
 
 
-def test_scoring_config_loads_with_instances_truth():
-    from config import load_scoring_config  # mia-evals' own loader
+def test_scoring_config_reads_instances_truth_from_its_own_data_configs():
+    import tomllib
     from pathlib import Path
-    c = load_scoring_config(Path(experiment.__file__).parent / experiment.SCORE_CONFIG)
-    assert c.task.kwargs["truth_kind"] == "instances"  # GT read from the store, no .gt.zarr copies
-    assert [v.name for v in c.volumes] == ["hemibrain_eb_test"] and [v.name for v in c.fit_volumes or ()] == ["hemibrain_eb_fit"]
-    assert c.volumes[0].bounding_box == ((4000, 5000),) * 3 and c.volumes[0].label_key == experiment.HEMIBRAIN_EB_LABELS
+    path = Path(experiment.__file__).parent / experiment.SCORE_CONFIG
+    c = tomllib.loads(path.read_text())
+    assert c["task"]["truth_kind"] == "instances"  # GT read from the store, no .gt.zarr copies
+    for split, box in [("test", "[[4000, 5000], [4000, 5000], [4000, 5000]]"), ("fit", "[[4000, 5000], [4000, 5000], [3000, 4000]]")]:
+        data = (path.parent / c["data"][split]["config_path"]).read_text()  # mia-evals reads these YAMLs relative to the config
+        assert box in data and experiment.HEMIBRAIN_EB_LABELS in data
 
 
-def test_score_runs_mia_evals_on_the_probe_artifacts(tmp_path, monkeypatch):
+def test_score_runs_the_sister_mia_evals_on_the_probe_artifacts(tmp_path, monkeypatch):
     par = experiment.Params(savedir=str(tmp_path / "run"))
     for split in ["fit", "test"]:
         (tmp_path / "run/probe" / split).mkdir(parents=True)
     monkeypatch.setattr(experiment, "paramsall", lambda: [par])
     monkeypatch.setattr(experiment, "code_provenance", lambda: {"commit_id": "abc123"})
+    monkeypatch.setattr(experiment, "MIA_EVALS", tmp_path / "mia-evals")
     calls = []
     import subprocess
-    monkeypatch.setattr(subprocess, "run", lambda cmd, check: calls.append(cmd))
+    monkeypatch.setattr(subprocess, "run", lambda cmd, check, cwd: calls.append((cmd, cwd)))
+    with pytest.raises(AssertionError, match="no mia-evals CLI"):  # not cloned and synced yet
+        experiment.score(0)
+    (tmp_path / "mia-evals/.venv/bin").mkdir(parents=True)
+    (tmp_path / "mia-evals/.venv/bin/mia-evals").touch()
     experiment.score(0)
-    (cmd,) = calls
-    assert cmd[0].endswith("mia-evals") and cmd[1] == "score" and cmd[2].endswith(experiment.SCORE_CONFIG)
+    ((cmd, cwd),) = calls
+    assert cmd[0] == str(tmp_path / "mia-evals/.venv/bin/mia-evals") and cwd == tmp_path / "mia-evals"
+    assert cmd[1] == "score" and cmd[2].endswith(experiment.SCORE_CONFIG)
     args = dict(zip(cmd[3::2], cmd[4::2]))
     assert args["--test"] == str(tmp_path / "run/probe/test") and args["--val"] == str(tmp_path / "run/probe/fit")
     assert args["--leaderboard"] == str(tmp_path / "run/mia_evals") and "--no-scored" in cmd

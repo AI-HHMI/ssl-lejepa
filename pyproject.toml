@@ -14,7 +14,6 @@ dependencies = [
     "lmd-catalog",
     "zarr>=2.16",
     "pillow>=12.3.0",
-    "mia-evals",
 ]
 
 [project.optional-dependencies]
@@ -22,7 +21,8 @@ dev = [
     "pytest>=7.0",
 ]
 analysis = [
-    "pandas",  # analysis.py, analysis_plots.py, report_*.py (charts: plots_interactive, plotly.js from a CDN)
+    "pandas",  # analysis.py, analysis_plots.py, reports/ (charts: plots_interactive, plotly.js from a CDN)
+    "scipy",  # pandas' corr(method="spearman")
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -38,7 +38,6 @@ environments = [
 [tool.uv.sources]
 lmd-catalog = { git = "https://github.com/AI-HHMI/lmd-catalog", branch = "main" }
 miao-io = { git = "https://github.com/AI-HHMI/miao.git", branch = "master" }
-mia-evals = { git = "https://github.com/AI-HHMI/mia-evals", branch = "fix-read-labels-open-array" }
 # lmd-catalog = { path = "../lmd-data-versioning", editable = true }
 # miao-io = { path = "../miao", editable = true }
 

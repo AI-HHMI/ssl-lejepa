@@ -10,6 +10,8 @@ git clone git@github.com:AI-HHMI/ssl-lejepa.git
 cd ssl-lejepa/
 uv sync --all-extras
 source .venv/bin/activate
+## Scoring (experiment.score) runs mia-evals from its own checkout at ~/proj/mia-evals (MIA_EVALS):
+## git clone git@github.com:AI-HHMI/mia-evals.git ~/proj/mia-evals && (cd ~/proj/mia-evals && uv sync)
 
 # 2. Run a recent experiment analysis
 python -m reports.viewsizes_pca    ## -> results/e00/viewsizes-pca/report.html
