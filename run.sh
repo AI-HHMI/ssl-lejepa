@@ -1,4 +1,0 @@
-set -e
-CMD=$(printf '%q ' "$@")
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] [main] $CMD" >> experiment.log
-ssh -o ConnectTimeout=15 login1.int.janelia.org "cd ~/proj/ssl-lejepa/ && uv run python $CMD" 

@@ -1,4 +1,4 @@
-"""Report cards for e00 results (local): each builder reads pulled run dirs (through analysis.py) and returns a list of
+"""Report cards for e00 results (local): each builder reads pulled run dirs (through analysis_utils.py) and returns a list of
 (card title, html fragment) cards, plots_interactive charts and tables, for a reports/<sweep>.py page. Tables also go to
 results/<sweep>/*.csv. Imports no experiment code, so every builder works on any past sweep at HEAD. A faceted figure
 is one card per facet.
@@ -11,7 +11,7 @@ from pathlib import Path
 import pandas
 
 import plots_interactive as pi
-from analysis import (BOUNDARY_CHANNELS, bench_rows, boundary_ap, config_label, fmt_duration, load_table, probe_runs,
+from analysis_utils import (BOUNDARY_CHANNELS, bench_rows, boundary_ap, config_label, fmt_duration, load_table, probe_runs,
                       probe_stats, probe_walltime_s, probed_dirs, profile_device_ms, read_jsonl, run_compute, run_dirs,
                       saved_params, save_table, scaling_law_budget, short_runs, size_label, sweep_name, tflop_per_step,
                       varying_params, view_sizes)

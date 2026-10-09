@@ -1,6 +1,6 @@
 """Experiment code (remote): LeJEPA 3D ViT training runs, benchmarks, inference (pca) and replays, and their LSF
 sweep (paramsall, savedirs under outdir/e00/). Depends on lib/, so it runs only from its experiment's commit.
-Analysis of the results lives in analysis.py (readers), analysis_plots.py (report cards) and reports/ (one page per experiment)."""
+Analysis of the results lives in analysis_utils.py (readers), analysis_plots.py (report cards) and reports/ (one page per experiment)."""
 
 from __future__ import annotations
 
@@ -106,7 +106,7 @@ def scaling_budgets() -> dict[str, float]:
     """Training FLOPs of each compute budget (c1..c4): BUDGET_HOURS_AT_M x m's estimated FLOPs per hour at SCALING_BATCH.
     A size's steps at a budget: budget / (sample_flops(name) * batch); e00/scaling-law set max_hours to 2x
     step_seconds' estimate of those steps, as a safety cap. Only for grid design: analysis reads back each run's real
-    EFLOP (analysis.run_compute), so a wrong estimate over/under-shoots the nominal budget rather than corrupting a fit."""
+    EFLOP (analysis_utils.run_compute), so a wrong estimate over/under-shoots the nominal budget rather than corrupting a fit."""
     flops_per_hour_m = 3600 / step_seconds("m", SCALING_BATCH) * sample_flops("m") * SCALING_BATCH
     return {b: h * flops_per_hour_m for b, h in BUDGET_HOURS_AT_M.items()}
 

@@ -13,7 +13,7 @@ from pathlib import Path
 import pandas
 
 import plots_interactive as pi
-from analysis import boundary_ap, probe_stats, read_jsonl, run_compute, run_dirs, saved_params
+from analysis_utils import boundary_ap, probe_stats, read_jsonl, run_compute, run_dirs, saved_params
 from analysis_plots import LINEAR_RANDOM
 from reports import page
 

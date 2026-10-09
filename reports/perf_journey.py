@@ -6,7 +6,7 @@ hand-written. Usage: uv run --extra analysis python -m reports.perf_journey
 import json
 from pathlib import Path
 
-from analysis import read_jsonl
+from analysis_utils import read_jsonl
 
 
 def perf_journey():

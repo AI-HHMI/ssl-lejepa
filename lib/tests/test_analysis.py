@@ -1,4 +1,4 @@
-"""Tests for analysis (readers) and analysis_plots (report cards): tables and charts are built from each run's own
+"""Tests for analysis_utils (readers) and analysis_plots (report cards): tables and charts are built from each run's own
 saved artifacts."""
 
 import json
@@ -7,8 +7,8 @@ import re
 import pandas
 import pytest
 
-import analysis
 import analysis_plots
+import analysis_utils
 
 AP_CHANNELS = ["(1, 0, 0)", "(0, 1, 0)", "(0, 0, 1)", "(10, 0, 0)", "(0, 10, 0)", "(0, 0, 10)"]
 
@@ -34,7 +34,7 @@ def test_load_table_uses_saved_params(tmp_path, monkeypatch):
         write(d, "performance.json", {"tbl": "throughput", "params": {"width": width}})
         write(d, "metrics.json", *({"idx_step": s, "loss": 1.0 / (s + 1)} for s in [0, 10]))
     (tmp_path / "outdir/e00/sweep/notes").mkdir()  # not a run dir
-    res = analysis.load_table("e00/sweep", "metrics.json")
+    res = analysis_utils.load_table("e00/sweep", "metrics.json")
     assert list(res.run) == ["d2", "d2", "d10", "d10"]  # numeric run order
     assert list(res.width) == [512, 512, 768, 768]  # saved params, not paramsall()
     assert "n_layers" not in res  # only what runs saved; no current Params defaults (analysis doesn't import lib/)
@@ -53,7 +53,7 @@ def test_bench_reports_crashes_with_short_config(tmp_path, monkeypatch):
     (ok / "job_run_1.log").write_text("...\nSuccessfully completed.\n")
     for d in [crashed, legacy]:
         (d / "job_run_2.log").write_text("CUDA error: an illegal memory access was encountered\nExited with exit code 1.\n")
-    res = pandas.DataFrame(analysis.bench_rows("e00/b")[0])
+    res = pandas.DataFrame(analysis_utils.bench_rows("e00/b")[0])
     assert list(res.columns) == ["run", "config", "status", "steps", "EFLOP", "walltime", "finite", "loss0", "loss_end", "ktok/s/gpu", "mfu %", "mem GB"]
     assert res.steps[0] == 11 and abs(res.EFLOP[0] - 500 * 0.4 * 11 / 1e6) < 1e-3  # last logged idx_step 10 -> 11 steps
     assert list(res.config) == ["B300 w512 b84 cudagraphs+eager-pe", "B300 w512 b64 cudagraphs+eager-pe", "? (no saved params)"]
@@ -71,11 +71,11 @@ def test_ng_link_lists_zarr_label_layers(tmp_path, monkeypatch):
     vol = tmp_path / "ds/crop-001.zarr"
     (vol / "labels").mkdir(parents=True)
     (vol / "labels/zarr.json").write_text(json.dumps({"attributes": {"ome": {"labels": ["seg-a", "mito-b"]}}}))
-    monkeypatch.setattr(analysis.lmd, "get", lambda name: SimpleNamespace(path=str(vol), image_key="raw", zarr_version="zarr3",
+    monkeypatch.setattr(analysis_utils.lmd, "get", lambda name: SimpleNamespace(path=str(vol), image_key="raw", zarr_version="zarr3",
                                                                           voxelsize=[8.0, 8.0, 8.0], axes=["x", "y", "z"]))
-    url = analysis.ng_link("ds/crop-001")
+    url = analysis_utils.ng_link("ds/crop-001")
     assert "seg-a" in url and "mito-b" in url and "groups_miaai_miaai" in url  # cluster path, not the local mount
-    state = analysis.parse_neuroglancer_url(analysis.ng_link("ds/crop-001", {"test": [[40, 50], [0, 10], [4, 6]]}))
+    state = analysis_utils.parse_neuroglancer_url(analysis_utils.ng_link("ds/crop-001", {"test": [[40, 50], [0, 10], [4, 6]]}))
     box = state["layers"][-1]["annotations"][0]
     assert box["pointA"] == [40, 0, 4] and box["pointB"] == [50, 10, 6] and state["position"] == [45, 5, 5]
     assert state["dimensions"]["x"] == [8e-9, "m"]
@@ -160,7 +160,7 @@ def test_profile_device_ms(tmp_path):
     (tmp_path / "profile.out").write_text(
         "Device: cuda:0; recorded steps (zero-based): 61..70\nOPERATORS SORTED BY SELF CPU TIME\n" + table(row("aten::mm", "5.000s"))
         + "\n\nOPERATORS SORTED BY SELF DEVICE TIME\n" + table(row("flash_bwd", "1.500s"), row("gelu", "300.000ms"), row("flash_bwd", "20us")))
-    total, rows = analysis.profile_device_ms(tmp_path / "profile.out")
+    total, rows = analysis_utils.profile_device_ms(tmp_path / "profile.out")
     assert total == pytest.approx(200.0)  # 2 s over 10 steps
     assert rows == pytest.approx({"flash_bwd": 150.002, "gelu": 30.0})  # device table only; truncated names merged
 
@@ -170,8 +170,8 @@ def test_analysis_imports_no_experiment_code():
     # (README: "How this repo works"). lib.util's entrypoint CLI is the one allowed dependency.
     import ast
     from pathlib import Path
-    root = Path(analysis.__file__ or "").parent
-    for path in [root / "analysis.py", root / "analysis_plots.py", *sorted(root.glob("reports/*.py"))]:
+    root = Path(analysis_utils.__file__ or "").parent
+    for path in [root / "analysis_utils.py", root / "analysis_plots.py", *sorted(root.glob("reports/*.py"))]:
         tree = ast.parse(path.read_text())
         names = [a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names]
         names += [n.module or "" for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)]

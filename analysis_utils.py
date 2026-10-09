@@ -3,7 +3,7 @@ from pulled artifacts in outdir/ only, a mirror of the cluster's append-only run
 check_runs). Imports no experiment code (experiment, lib/ models: nothing that builds a Lejepa), only lib.util's
 entrypoint CLI: artifacts describe themselves (saved params), so every function works on any past sweep at HEAD.
 Shared by analysis_plots.py (report cards) and reports/<sweep>.py (one page per experiment).
-CLI for the tools: uv run --extra analysis python analysis.py check_runs
+CLI for the tools: uv run --extra analysis python analysis_utils.py check_runs
 """
 
 import json

@@ -6,7 +6,7 @@ size, columns = compute budget; each pca2.png is EM | PCA | PCA minus tile mean 
 from pathlib import Path
 
 import plots_interactive as pi
-from analysis import run_dirs, saved_params, scaling_law_budget
+from analysis_utils import run_dirs, saved_params, scaling_law_budget
 from analysis_plots import scaling_law_tile_code_vs_probe
 from reports import page
 

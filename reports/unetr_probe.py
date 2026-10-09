@@ -7,7 +7,7 @@ import statistics
 from pathlib import Path
 
 import plots_interactive as pi
-from analysis import boundary_ap, probe_source, probe_stats, probe_walltime_s, probed_dirs, run_compute, run_dirs
+from analysis_utils import boundary_ap, probe_source, probe_stats, probe_walltime_s, probed_dirs, run_compute, run_dirs
 from analysis_plots import LINEAR_RANDOM, mia_evals_table, probe_curves, probe_vs_compute
 from reports import page
 

@@ -6,3 +6,4 @@ outdir/
 results/
 # Machine-local cache of expensive-to-compute values (experiment.lejepa_n_params).
 .cache/
+Claude.md
