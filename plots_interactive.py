@@ -11,6 +11,7 @@ import base64
 import html
 import itertools
 import json
+import math
 import mimetypes
 import os
 from pathlib import Path
@@ -39,9 +40,11 @@ JS = r"""
 // view) and sorting and the image viewer stop. It starts as the page was written (runtime(interactive)).
 var ON = __ON__;
 function config() { return {responsive: true, scrollZoom: ON, displaylogo: false, staticPlot: !ON}; }
-document.querySelectorAll("div.iplot").forEach(function(div) {
-  var d = JSON.parse(document.getElementById(div.id + "-data").textContent);
-  Plotly.newPlot(div, d.data, d.layout, config());
+document.querySelectorAll("div.iplot").forEach(function(div) {  // one bad figure must not blank the others
+  try {
+    var d = JSON.parse(document.getElementById(div.id + "-data").textContent);
+    Plotly.newPlot(div, d.data, d.layout, config());
+  } catch (e) { div.textContent = "chart failed to draw: " + e; }
 });
 (function() {
   var box = document.querySelector("#interactive input");
@@ -179,6 +182,18 @@ def runtime(interactive: bool) -> str:
             f"<script src='{PLOTLY}'></script><script>{JS.replace('__ON__', json.dumps(interactive))}</script>")
 
 
+def finite(obj):
+    """obj with every NaN or +-inf float as None: JSON has no NaN (json.dumps writes it anyway, and the browser's
+    JSON.parse then rejects the whole figure); Plotly draws None as a gap, e.g. a diverged run's loss."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [finite(v) for v in obj]
+    return obj
+
+
 def tooltip(row: dict) -> str:
     return "<br>".join(f"{k}: {v:.4g}" if isinstance(v, float) else f"{k}: {v}" for k, v in row.items())
 
@@ -198,7 +213,7 @@ def figure(data: list, layout: dict, logx: bool = False, logy: bool = False) -> 
             layout[f"{ax}axis"]["fixedrange"] = True
             continue
         toggles.append(f"<label data-axis='{ax}'><input type='checkbox'{' checked' if t == 'log' else ''}>log {ax}</label>")
-    payload = json.dumps({"data": data, "layout": layout}).replace("</", "<\\/")  # a string can't close the script
+    payload = json.dumps(finite({"data": data, "layout": layout}), allow_nan=False).replace("</", "<\\/")  # a string can't close the script
     return (f"<div class='axes' data-plot='{pid}'>{''.join(toggles)}</div><div class='iplot' id='{pid}' {MARK}></div>"
             f"<script type='application/json' id='{pid}-data'>{payload}</script>")
 

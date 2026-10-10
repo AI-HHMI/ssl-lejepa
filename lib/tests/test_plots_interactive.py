@@ -23,6 +23,16 @@ def test_scatter_has_tooltips_baselines_and_axis_buttons():
     assert fig["layout"]["xaxis"]["type"] == "log" and "<input type='checkbox' checked>log x" in frag and "<input type='checkbox'>log y" in frag
 
 
+def test_nan_and_inf_become_gaps_so_the_figure_still_parses():
+    # json.dumps writes NaN, which JSON.parse rejects: a diverged run's loss used to blank a whole report's charts
+    frag = pi.lines({"diverged": ([0, 1, 2, 3], [2.0, float("nan"), float("inf"), 1.0])}, "step", "loss")
+    assert "NaN" not in frag and "Infinity" not in frag
+    payload = re.search(r"<script type='application/json' id='iplot\d+-data'>(.*?)</script>", frag)
+    assert payload
+    fig = json.loads(payload[1], parse_constant=lambda c: pytest.fail(f"{c} in the figure JSON"))  # strict, like JSON.parse
+    assert fig["data"][0]["y"] == [2.0, None, None, 1.0]
+
+
 def test_bar_keeps_the_given_order_top_to_bottom():
     frag = pi.bar([("b", 2.0, "g1"), ("a", 1.0, "g2"), ("c", 3.0, "g1")], "x")
     (fig,) = islands(frag)
@@ -45,6 +55,13 @@ def test_images_embed_every_layer_and_mark_missing_cells(tmp_path):
     assert "<td>–</td>" in frag and "2 layers" in frag
     with pytest.raises(AssertionError, match="no image"):
         pi.images({"xs": {"c1": [tmp_path / "missing.png"]}})
+
+
+def test_wide_puts_each_card_on_a_row_of_its_own():
+    chart = pi.lines({"a": ([0, 1], [1.0, 2.0])}, "x", "y")
+    assert page.card("t", chart).startswith("<div class='card'>")  # charts sit side by side by default
+    ((title, content),) = page.wide([("t", chart)])
+    assert title == "t" and page.card(title, content).startswith("<div class='card wide'>")
 
 
 def test_runtime_only_on_interactive_pages(tmp_path, monkeypatch):

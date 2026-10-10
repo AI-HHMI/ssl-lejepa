@@ -8,7 +8,8 @@ SWEEP = "e00/cudagraph-fix"
 
 
 def main():
-    page.write(SWEEP, __doc__, [], [("Benchmark", bench(SWEEP, "e00/b300-compile"))])
+    # Full width: runs from two sweeps make long labels (sweep/dN + config) and legends.
+    page.write(SWEEP, __doc__, [], [("Benchmark", page.wide(bench(SWEEP, "e00/b300-compile")))])
 
 
 if __name__ == "__main__":

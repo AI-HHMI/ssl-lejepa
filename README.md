@@ -1,26 +1,33 @@
 # Setup
 
-Install on the Janelia cluster, re-run an old experiment, then do analysis.
+Clone the repo then sync and activate the virtual env.
 
 ```sh
-# Clone and build the .venv that every job runs from.
-ssh login1.int.janelia.org
-cd ~/my_projects/
+# [Any machine local or cluster.]
 git clone git@github.com:AI-HHMI/ssl-lejepa.git
 cd ssl-lejepa/
-uv sync --all-extras
+uv sync --all-extras # reports require extras
 source .venv/bin/activate
+```
 
-# Run an old experiment
+Pull all results into outdir/ and serve the overview.
+
+```sh
+# [On a Local machine with browser for viewing.]
+sh pull.sh
+sh serve.sh
+# Improve and rerender an experiment report, e.g.
+python reports/viewsizes_v2.py
+```
+
+Repro an experiment e.g.
+```sh
+# [On the Janelia cluster.]
 # Check out an old experiment commit, i.e. one with `exp: e00/<experiment-name>` in the description.
 git checkout 16ca5785 ## e00/viewsizes-v2/
-python experiment.py runmany
+python experiment.py runmany ## sometimes it's "runall" or "submitall"
 git checkout main
-# This will spawn multiple LSF/bsub jobs.
-# Experiments write to outdir/ .
-# Wait and watch the jobs.
-bjobs -w
-# analysis reads from outdir/ and writes to results/
-python reports/viewsizes_v2.py  ## -> results/e00/viewsizes-v2/report.html
 
+# Watch the spawned jobs.
+bjobs -w
 ```

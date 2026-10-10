@@ -26,6 +26,18 @@ h1,h2{scroll-margin-top:16px} nav.toc{display:none}
   nav.toc a:hover{color:#222;border-left-color:#bbb} nav.toc a.on{color:#0072B2;border-left-color:#0072B2;font-weight:600}
 }
 """
+# Ours: ul.entries, a list of links to pages (reports/index.py): date on the left, title, then a few lines of intro.
+CSS += """
+ul.entries{list-style:none;margin:6px 0 0;padding:0}
+ul.entries li{display:grid;grid-template-columns:96px 1fr;column-gap:16px;padding:10px 14px;margin:0 0 8px;
+  border-left:3px solid #0072B2;border-radius:0 6px 6px 0;background:#fafafa;transition:background .15s}
+ul.entries li:hover{background:#eef5fb}
+ul.entries time{grid-row:span 2;color:#888;font:12px ui-monospace,monospace;padding-top:3px;line-height:1.5}
+ul.entries time code{color:#aaa;font-size:11px}
+ul.entries a{font-weight:600;color:#0072B2;text-decoration:none} ul.entries a:hover{text-decoration:underline}
+ul.entries p{margin:3px 0 0;color:#555;font-size:13.5px;line-height:1.45;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+"""
 TOC_JS = """
 const links = [...document.querySelectorAll('nav.toc a')];
 const targets = links.map(a => document.querySelector(a.getAttribute('href')));
@@ -40,8 +52,13 @@ mark();
 
 
 def card(title: str, content: str) -> str:
-    wide = " wide" if content.startswith("<table") else ""  # tables get a row of their own
+    wide = " wide" if content.startswith(("<table", "<ul", "<div class='wide'>")) else ""  # tables, lists, wide(): a row of their own
     return f"<div class='card{wide}'><h3>{title}</h3>{content}</div>"
+
+
+def wide(cards: list) -> list:
+    """cards, each on a row of its own instead of side by side (e.g. charts with long labels or legends)."""
+    return [(title, f"<div class='wide'>{content}</div>") for title, content in cards]
 
 
 def anchor(title: str) -> str:
@@ -58,8 +75,16 @@ def write(sweep: str, intro: str | None, tiles: list, sections: list, interactiv
     tiles: (number, label); sections: (title, [(card title, html fragment)]). interactive: whether a page with
     plots_interactive fragments opens interactive or static (its corner toggle switches either way)."""
     assert intro, f"{sweep}: a report's docstring is its page's intro: say what the experiment asks"
-    out, title = out_path(sweep), f"{sweep} report"
-    toc =[("overview", "Overview")] + [(anchor(t), t) for t, _ in sections]
+    out = out_path(sweep)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html(f"{sweep} report", intro, tiles, sections, interactive))
+    print(f"wrote {out}")
+    return out
+
+
+def html(title: str, intro: str, tiles: list, sections: list, interactive: bool = True) -> str:
+    """A whole page: title and intro, tiles, then sections of cards, with the contents bar on the side (write())."""
+    toc = [("overview", "Overview")] + [(anchor(t), t) for t, _ in sections]
     nav = "<nav class='toc'><b>Contents</b>" + "".join(f"<a href='#{a}'>{t}</a>" for a, t in toc) + "</nav>"
     main_html = (
         f"<main><h1 id='overview'>{title}</h1><p>{intro}</p><div class='tiles'>"
@@ -69,10 +94,5 @@ def write(sweep: str, intro: str | None, tiles: list, sections: list, interactiv
     )
     runtime = plots_interactive.runtime(interactive) if plots_interactive.MARK in main_html else ""
     body = f"<div class='layout'>{nav}{main_html}</div><script>{TOC_JS}</script>{runtime}"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(
-        "<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-        f"<title>{title}</title><style>{CSS}</style></head><body>{body}</body></html>"
-    )
-    print(f"wrote {out}")
-    return out
+    return ("<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+            f"<title>{title}</title><style>{CSS}</style></head><body>{body}</body></html>")

@@ -18,5 +18,5 @@ oc-rsync -azi --no-group --delete \
   --prune-empty-dirs \
   --rsync-path=oc-rsync \
   -e "ssh -o ConnectTimeout=15" \
-  'login1.int.janelia.org:~/proj/ssl-lejepa/outdir/' outdir/ \
+  'login1.int.janelia.org:/groups/scicompsoft/home/broaddusc/proj/ssl-lejepa/outdir/' outdir/ \
   | { grep -v '^[.c]d' || true; }

@@ -4,6 +4,8 @@ outdir/
 # Local analysis output (figures, tables, summaries), written by reports/; not committed.
 # results/perf_journey.html stays tracked: it's the hand-written page perf_journey() fills in.
 results/
+# The served site (serve.sh, reports/index.py): an index, and links to results/ and outdir/.
+site/
 # Machine-local cache of expensive-to-compute values (experiment.lejepa_n_params).
 .cache/
 Claude.md
