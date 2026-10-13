@@ -65,6 +65,7 @@ N_PARAMS_CACHE = Path(".cache/lejepa_n_params.json")  # machine-local (gitignore
 SIZES = {"xs": (4, 256), "s": (6, 384), "m": (12, 512), "l": (16, 768), "xl": (24, 1024)}  # (n_layers, width); m = Params' default
 SCALING_BATCH = 64  # per GPU, fixed across sizes (== gpu_b300's validated default at m); xl OOMs at it on one B300
 ANCHOR_STEP_S_M_B84 = 0.32  # cudagraph-fix/d3: 1425 ktok/s at b84, flash + eager-pe cudagraphs (m: n_layers=12, width=512)
+SCALING_VIEWS = ((2, 12 ** 3), (4, 8 ** 3))  # (count, tokens) of scaling-law's views: 2 globals of 12^3, 4 locals of 8^3 (patch 8)
 BUDGET_HOURS_AT_M = {"c1": 1, "c2": 2, "c3": 4, "c4": 8}  # m's wall-clock at each budget; other sizes get more/fewer steps
 
 def on_queue(p: Params, queue: str) -> Params:
@@ -90,17 +91,17 @@ def lejepa_n_params(n_layers: int, width: int) -> tuple[int, int]:
         N_PARAMS_CACHE.write_text(json.dumps(cache))
     return cache[key][0], cache[key][1]
 
-def sample_flops(name: str) -> float:
+def sample_flops(name: str, views=SCALING_VIEWS) -> float:
     """Model training FLOPs per sample of SIZES[name] (exact: lib.models.lejepa.Lejepa.forward's own out.n_flops
-    accounting), at the scaling-law view sizes' fixed token counts (2 globals of 12^3, 4 locals of 8^3 tokens; patch 8)."""
+    accounting), at these (count, tokens) views: by default the scaling-law view sizes' fixed token counts."""
     n_layers, width = SIZES[name]
     n_params, n_proj = lejepa_n_params(n_layers, width)
-    return sum(k * (n * (6 * n_params + 12 * n_layers * width * n) + 6 * n_proj) for k, n in [(2, 12 ** 3), (4, 8 ** 3)])
+    return sum(k * (n * (6 * n_params + 12 * n_layers * width * n) + 6 * n_proj) for k, n in views)
 
-def step_seconds(name: str, batch: int) -> float:
+def step_seconds(name: str, batch: int, views=SCALING_VIEWS) -> float:
     """Estimated seconds per training step of SIZES[name] at this per-GPU batch: ANCHOR_STEP_S_M_B84 scaled by FLOPs per
     step relative to m at batch 84. An a-priori estimate (it under-predicted small sizes' cost in mia-muvit's e07)."""
-    return ANCHOR_STEP_S_M_B84 * (batch * sample_flops(name)) / (84 * sample_flops("m"))
+    return ANCHOR_STEP_S_M_B84 * (batch * sample_flops(name, views)) / (84 * sample_flops("m"))
 
 def scaling_budgets() -> dict[str, float]:
     """Training FLOPs of each compute budget (c1..c4): BUDGET_HOURS_AT_M x m's estimated FLOPs per hour at SCALING_BATCH.
@@ -158,43 +159,48 @@ class Params:
     benchmark_steps: int = 50
     profile_steps: int = 10  # Set to zero to disable trace collection.
 
-# This experiment's id (README: experiment ids): its runs are outdir/<EXPERIMENT>/d<i>/. viewsizes-pca ran before
-# numbering (from the commit below), so it keeps its name, which submitall's check_experiment refuses: resubmit it from
-# that commit. The next experiment is e00/e01-<slug>.
-EXPERIMENT = "e00/viewsizes-pca"
+# This experiment's id (README: experiment ids): its runs are outdir/<EXPERIMENT>/d<i>/.
+EXPERIMENT = "e00/e01-viewsizes-2d"
 
-# This experiment's one entrypoint: submitall() submits every paramsall() run with it (README: one experiment, one
-# entrypoint). A follow-up step on the same runs (probe after training, a redone pca) is a new experiment commit.
+# This experiment's one entrypoint: submitall() submits every trunk with it (README: one experiment, one entrypoint).
+# The anneals of each trunk's milestones need no submit: the trunk submits them as it saves each (spawn_branches).
 def submit(n):
-    pcalsf(n)
+    runlsf(n)
 
 def paramsall():
-    params = []
-    # PCA maps (savedir/pca2.png, pca.json) of the 34 viewsizes-v2 encoders: 17 (input, global, local) configs x
-    # 2 repeats, all m (12x512), 8 h on one B300 each, each already linear-probed (viewsizes-v2/d*/probe.json). In
-    # scaling-law-pca, tokens collapsed onto their 96^3 view's code as models grew. View geometry sets what the views
-    # share, so it should move that too: smaller locals or globals relative to the input force context-level features
-    # (more tile code), larger overlap lets local texture count as invariant (less). Does between-tile variance track
-    # view size, and the probe's boundary AP, across configs and beyond the repeat-to-repeat noise?
-    # d{i} reads viewsizes-v2/d{i} through init_from (its params predate decoder/unetr_*, so pca in its own savedir
-    # fails load_checkpoint's saved-params assertion). The crop is 3 x 4 x 4 of each run's own global view (pca_maps),
-    # so up to 576 x 768 x 768 at g=192: still inside EB's held-out val slab (z 3000-4000) from z0 = 3400.
-    base = (128, 96, 64)
-    configs = [base]  # viewsizes-v2's order
-    configs += [(p, 96, 64) for p in [104, 160, 192, 256]]  # input patch: room for globals to move
-    configs += [(128, g, 64) for g in [64, 80, 112, 128]]  # global view size
-    configs += [(128, 96, l) for l in [32, 48, 80, 96]]  # local view size
-    configs += [(96, 64, 32), (160, 128, 80), (192, 144, 96), (256, 192, 128)]  # all scaled together
-    for i, (inp, g, l) in enumerate(configs * 2):  # the two repeats: viewsizes-v2/d0-d16, d17-d33
-        p = Params()
-        p.savedir = f"outdir/{EXPERIMENT}/d{i}/"
-        p.init_from = f"outdir/e00/viewsizes-v2/d{i}/"
-        p.views = "displace"
-        p.patch_size = (inp, inp, inp)
-        p.global_size = (g, g, g)
-        p.local_size = (l, l, l)
-        params.append(p)
-    return params
+    # View sizes on a 2D grid, input patch x global view, with local view = global view: viewsizes-v2's best config was
+    # local = global (d12: input 128, global 96, local 96; short AP 0.180 and 0.173 over its two repeats, vs 0.137 and 0.126
+    # for its base 128/96/64), with smaller locals worse. Does that hold across input and global size? The input must exceed
+    # the global (equal, and every view is the same crop, so invariance is trivial), so the grid is the cells above the
+    # diagonal: 4 + 3 + 2 + 1 trunks. Everything else is viewsizes-v2's stack at m (12x512), one B300 each.
+    # BATCH is fixed across cells (SIGReg's pull depends on it): viewsizes-v2/d16 (256, 192, 128) fit b44 on a B300 at ~44k
+    # tokens per sample (2 x 24^3 + 4 x 16^3); the largest cell here is 6 x 20^3 = 48k, so 32 leaves ~20% headroom (an
+    # estimate; the g=160 trunk's performance.json has the real memory). max_hours is scaling-law's 2x safety cap on
+    # step_seconds' estimate, not the stop: the trunk runs STEPS steps, so its milestones (every 4k) are all reached.
+    BATCH, STEPS = 32, 40_000
+    trunks = []
+    for g in [64, 96, 128, 160]:
+        for inp in [96, 128, 160, 192]:
+            if inp <= g:
+                continue
+            p = Params()
+            p.savedir = f"outdir/{EXPERIMENT}/d{len(trunks)}/"
+            p.data = "hemibrain_wide"
+            p.views = "displace"
+            p.patch_size = (inp, inp, inp)
+            p.global_size = (g, g, g)
+            p.local_size = (g, g, g)
+            p.batch_size = BATCH
+            p.steps_per_epoch = STEPS
+            p.max_hours = 2 * STEPS * step_seconds("m", BATCH, ((2, (g // 8) ** 3), (4, (g // 8) ** 3))) / 3600
+            p.weight_decay = 0.05
+            p.adam_beta2 = 0.95
+            p.cudagraphs = True
+            p.batch_views = True
+            p.n_workers = 11  # 12 cores per GPU
+            p.queue = "gpu_b300"
+            trunks.append(p)
+    return with_branches(trunks)
 
 def milestone_steps(trunk: Params) -> list[int]:
     """The steps whose checkpoints train() keeps in checkpoints/milestones/: every 10% of steps_per_epoch (the last is the
@@ -208,7 +214,8 @@ def anneal_params(i: int, trunk: Params, step: int) -> Params:
     assert step in milestone_steps(trunk), f"step {step} is not a milestone of {trunk.savedir}: {milestone_steps(trunk)}"
     assert step // 10 > 0, f"step {step} leaves no anneal steps"
     return replace(trunk, savedir=f"outdir/{EXPERIMENT}/d{i}/", steps_per_epoch=step // 10, max_hours=0.2 * trunk.max_hours,
-                   anneal_from=str(Path(trunk.savedir) / "checkpoints/milestones" / f"step_{step:07d}.pt"), decoder="linear")
+                   anneal_from=str(Path(trunk.savedir) / "checkpoints/milestones" / f"step_{step:07d}.pt"), decoder="linear",
+                   benchmark_steps=0, profile_steps=0)  # the trunk's throughput and trace say it all
 
 def with_branches(trunks: list[Params]) -> list[Params]:
     """paramsall() for a trunk sweep: the trunks, then one anneal per milestone of each. A trunk submits its milestone's

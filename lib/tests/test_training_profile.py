@@ -171,6 +171,7 @@ def test_trunk_spawns_each_milestones_anneal_as_it_saves_it(tmp_path, monkeypatc
     params = experiment.with_branches([src])
     assert len(params) == 11 and [p.steps_per_epoch for p in params[1:]] == [s // 10 for s in range(130, 1301, 130)]
     assert all(p.savedir == f"outdir/e00/e01-test/d{j}/" for j, p in enumerate(params))
+    assert all(p.benchmark_steps == p.profile_steps == 0 for p in params[1:])  # an anneal is not benchmarked or profiled
     patch_experiment(monkeypatch, tmp_path, src)
     monkeypatch.setattr(experiment, "paramsall", lambda: params)
     Path(src.savedir).mkdir(parents=True)
@@ -204,6 +205,21 @@ def test_trunk_spawns_each_milestones_anneal_as_it_saves_it(tmp_path, monkeypatc
     done = torch.load(sorted((Path(par.savedir) / "checkpoints").glob("step_*.pt"))[-1], weights_only=False)
     assert not (Path(par.savedir) / "checkpoints/milestones").exists()  # an anneal spawns nothing
     assert done["step"] == 117 and done["opt"]["state"][0]["step"] == 1170 + 117  # Adam's step count carried over
+
+
+def test_paramsall_is_the_viewsizes_grid_and_each_trunks_ten_anneals(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    params = experiment.paramsall()
+    trunks, anneals = params[:10], params[10:]
+    assert [p.anneal_from for p in trunks] == [""] * 10 and all(p.anneal_from for p in anneals) and len(anneals) == 100
+    assert sorted((p.patch_size[0], p.global_size[0]) for p in trunks) == sorted((i, g) for g in [64, 96, 128, 160] for i in [96, 128, 160, 192] if i > g)
+    assert all(p.local_size == p.global_size and p.batch_size == 32 and p.steps_per_epoch == 40_000 for p in trunks)
+    for t, branches in zip(trunks, [anneals[k:k + 10] for k in range(0, 100, 10)]):  # each trunk's anneals, one per milestone, the 10th too
+        assert [Path(b.anneal_from).name for b in branches] == [f"step_{s:07d}.pt" for s in range(4000, 40_001, 4000)]
+        assert all(Path(b.anneal_from).parent == Path(t.savedir) / "checkpoints/milestones" for b in branches)
+        assert all((b.global_size, b.patch_size, b.decoder) == (t.global_size, t.patch_size, "linear") for b in branches)
+    assert [p.savedir for p in params] == [f"outdir/{experiment.EXPERIMENT}/d{j}/" for j in range(110)]
+    experiment.check_experiment()
 
 
 def test_spawnall_submits_only_the_missed_anneals(tmp_path, monkeypatch):
