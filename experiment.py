@@ -4,7 +4,7 @@ Analysis of the results lives in analysis_utils.py (readers), analysis_plots.py 
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict, fields
+from dataclasses import dataclass, asdict, fields, replace
 import hashlib
 import os, sys
 import json
@@ -116,11 +116,12 @@ class Params:
     data: TrainData = "hemibrain_eb"  # training volumes, see lib.data.TRAIN_BOXES
     patch_size: Tup3Int = (104, 104, 104)  # hemibrain EB is 8 nm isotropic
     batch_size: int = 84
-    steps_per_epoch: int = 71  # warmup + benchmark + 1 profiler warmup + profile steps: stop right after profiling
+    steps_per_epoch: int = 71  # warmup + benchmark + 1 profiler warmup + profile steps: stop right after profiling.
+    # Training runs set it to the expected step count: milestone checkpoints are every 10% of it.
     max_hours: float = 0.0  # >0: stop after this many hours (steps_per_epoch is then an upper bound); sets LSF walltime
     n_layers: int = 12
     width: int = 512  # encoder width; heads = width // 64
-    lr: float = 1e-4  # peak lr (run(): warmup then cosine decay over steps_per_epoch)
+    lr: float = 1e-4  # run(): linear warmup, then held at this lr (no decay; see anneal_from)
     views: Views = "basic"  # 'basic' (random scales) or 'displace' (fixed sizes below, locals inside globals)
     global_size: Tup3Int = (88, 88, 88)  # displace only
     local_size: Tup3Int = (56, 56, 56)  # displace only
@@ -141,6 +142,9 @@ class Params:
     grad_compress: bool = False  # DDP bf16_compress_hook: all-reduce gradients in bf16 (half the bytes)
     queue: str = "gpu_h200"  # LSF queue
     n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); batch_size and n_workers are per GPU
+
+    anneal_from: str = ""  # a checkpoint .pt (anneal_params): train() continues it for steps_per_epoch steps, Adam moments kept,
+                           # lr cosine-decaying from the checkpoint's lr to 1% of it; run() then evals the result (pca, probe)
 
     # evals
     init_from: str = ""  # weights pca/probe evaluate: "" this run's checkpoint; a run dir, its latest one; "random" untrained
@@ -190,6 +194,29 @@ def paramsall():
         p.global_size = (g, g, g)
         p.local_size = (l, l, l)
         params.append(p)
+    return params
+
+def milestone_steps(trunk: Params) -> list[int]:
+    """The steps whose checkpoints train() keeps in checkpoints/milestones/: every 10% of steps_per_epoch (the last is the
+    final checkpoint of a trunk that ran to completion; one stopped early by max_hours never reaches the later ones)."""
+    return sorted({round(k * trunk.steps_per_epoch / 10) for k in range(1, 11)})
+
+def anneal_params(i: int, trunk: Params, step: int) -> Params:
+    """Params of the anneal of `trunk`'s milestone at `step`: continued for 10% of its steps on a cosine decay from its lr
+    to 1% of it (Params.anneal_from), then run()'s pca maps and linear probe, in outdir/<EXPERIMENT>/d<i>/. Everything
+    else (model, views, data, optimizer) is the trunk's own. The checkpoint need not exist yet: its path is deterministic."""
+    assert step in milestone_steps(trunk), f"step {step} is not a milestone of {trunk.savedir}: {milestone_steps(trunk)}"
+    assert step // 10 > 0, f"step {step} leaves no anneal steps"
+    return replace(trunk, savedir=f"outdir/{EXPERIMENT}/d{i}/", steps_per_epoch=step // 10, max_hours=0.2 * trunk.max_hours,
+                   anneal_from=str(Path(trunk.savedir) / "checkpoints/milestones" / f"step_{step:07d}.pt"), decoder="linear")
+
+def with_branches(trunks: list[Params]) -> list[Params]:
+    """paramsall() for a trunk sweep: the trunks, then one anneal per milestone of each. A trunk submits its milestone's
+    anneal itself, the moment it saves it (spawn_branches); submitall() submits only the trunks."""
+    params = list(trunks)
+    for t in trunks:
+        for step in milestone_steps(t):
+            params.append(anneal_params(len(params), t, step))
     return params
 
 def printparams():
@@ -339,6 +366,9 @@ def train(n:int):
     savedir = Path(par.savedir)
 
     model = Lejepa(lejepa_config(par))
+    ckpt = torch.load(par.anneal_from, map_location="cpu", weights_only=False) if par.anneal_from else None
+    if ckpt is not None:
+        model.load_state_dict(ckpt["model"])  # strict: architecture drift fails loudly
     if rank0: pprint(model)
 
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
@@ -352,18 +382,30 @@ def train(n:int):
         if par.grad_compress:
             from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
             model.register_comm_hook(None, default_hooks.bf16_compress_hook)
-    LR_WARMUP, LR_FLOOR = 1000, 0.01  # linear warmup steps; cosine ends at LR_FLOOR * par.lr
+    LR_WARMUP, LR_FLOOR = 1000, 0.01  # trunk: linear warmup steps; anneal: its cosine ends at LR_FLOOR * the checkpoint's lr
     GRAD_CLIP = 1.0  # max global grad norm
     CHECKPOINT_EVERY, CHECKPOINT_KEEP = 2000, 1  # steps (~15 min at 8 GPUs); newest checkpoints kept
+    # Also kept for good, in checkpoints/milestones/, each submitting its anneal (spawn_branches) the moment it is saved.
+    # None for an anneal, whose own checkpoint is the one eval.
+    MILESTONES = set() if par.anneal_from else set(milestone_steps(par))
     # AdamW with weight_decay=0 is exactly Adam. Decay only weight matrices, not biases or norm gains.
     decay = [p for p in model.parameters() if p.ndim >= 2]
     no_decay = [p for p in model.parameters() if p.ndim < 2]
     opt = torch.optim.AdamW([{"params": decay, "weight_decay": par.weight_decay},
-                             {"params": no_decay, "weight_decay": 0.0}], lr=par.lr, betas=(0.9, par.adam_beta2))
-    # Warmup then cosine decay over steps_per_epoch, by step count so every rank uses the same lr.
-    # For max_hours runs set steps_per_epoch to the expected step count so the schedule completes.
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / LR_WARMUP) * (
-        LR_FLOOR + (1 - LR_FLOOR) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / par.steps_per_epoch)))))
+                             {"params": no_decay, "weight_decay": 0.0}],
+                            lr=ckpt["opt"]["param_groups"][0]["lr"] if ckpt else par.lr,
+                            betas=(0.9, par.adam_beta2))
+    if ckpt is not None:  # the Adam moments and step count only: the fresh param groups keep the checkpoint's lr as the schedule's start
+        ckpt["opt"]["param_groups"] = opt.state_dict()["param_groups"]
+        opt.load_state_dict(ckpt["opt"])
+    # By step count, so every rank uses the same lr. A trunk run warms up, then holds par.lr until it stops: it never
+    # decays, so its milestone checkpoints are branch points (anneal_params). An anneal has no warmup (the loaded moments
+    # are warm) and cosine-decays from the checkpoint's lr to LR_FLOOR of it over steps_per_epoch.
+    if ckpt is None:
+        lr_scale = lambda s: min(1.0, (s + 1) / LR_WARMUP)
+    else:
+        lr_scale = lambda s: LR_FLOOR + (1 - LR_FLOOR) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / par.steps_per_epoch)))
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_scale)
     # Steps whose gradient is non-finite are skipped, not applied (see the optimizer phase below).
     MAX_SKIPPED, BAD_BATCHES_KEPT = 100, 2  # stop after this many skipped steps; replayable dumps written
     n_skipped = 0
@@ -382,6 +424,11 @@ def train(n:int):
         torch.save({"step": step, "params": asdict(par), "model_config": lejepa.cfg.to_kwargs(), "model": state,
                     "opt": opt.state_dict(), "sched": sched.state_dict()}, tmp)
         tmp.replace(path)  # never leave a half-written checkpoint
+        milestone = ckdir / "milestones" / path.name
+        if step in MILESTONES and not milestone.exists():  # (the last step is saved twice: in the loop, and after it)
+            milestone.parent.mkdir(exist_ok=True)
+            os.link(path, milestone)  # a hard link outlives the prune below
+            spawn_branches(milestone)
         for old in sorted(ckdir.glob("step_*.pt"))[:-CHECKPOINT_KEEP]:
             old.unlink()
         print(f"Saved {path}", flush=True)
@@ -464,7 +511,7 @@ def train(n:int):
                     if stop[2].item():
                         print(f"{n_skipped} steps skipped for non-finite gradients by step {idx_step + 1}; stopping", flush=True)
                         break
-                if idx_step % CHECKPOINT_EVERY == CHECKPOINT_EVERY - 1:
+                if idx_step % CHECKPOINT_EVERY == CHECKPOINT_EVERY - 1 or idx_step + 1 in MILESTONES:
                     save_checkpoint(idx_step + 1)
     except torch.OutOfMemoryError as err:
         # Record the OOM as a result (the table shows which configs don't fit), then fail the job as usual.
@@ -886,7 +933,9 @@ def bsub(par: Params, job: str, minutes: int, n_gpus: int, cmd: str, queue: str 
     """
     import subprocess
     name = "-".join(Path(par.savedir).parts[1:]) + f"-{job}"  # e.g. e00-nanhunt-d9-run, so bjobs shows which is which
-    code = snapshot(SNAPSHOT_PATHS, Path(".tmpcode") / "-".join(Path(par.savedir).parts[1:-1]))
+    here = Path(__file__).resolve().parent
+    # A job submitting a job (spawn_branches) hands on the snapshot it runs itself, not the shared checkout's current state.
+    code = here if ".tmpcode" in here.parts else snapshot(SNAPSHOT_PATHS, Path(".tmpcode") / "-".join(Path(par.savedir).parts[1:-1]))
     gpu = f'-gpu "num={n_gpus}:mode=exclusive_process"' if n_gpus else ""
     full = f""" bsub -J {name} \
         -W {minutes // 60}:{minutes % 60:02d} \
@@ -902,13 +951,35 @@ def bsub(par: Params, job: str, minutes: int, n_gpus: int, cmd: str, queue: str 
 
 def runlsf(n:int):
     """Train paramsall()[n] on LSF, in a fresh savedir (old contents -> outdir/.trash/)."""
+    assert_committed()
+    submit_run(n)
+
+def submit_run(n:int):
+    """runlsf without the commit check, for a job that submits one (spawn_branches): its own code is already committed."""
     par:Params = paramsall()[n]
     assert not par.init_from, f"{par.savedir}: init_from={par.init_from!r} is an eval-only run (training ignores it)"
     assert par.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={par.n_workers} leaves no core for the training process"
-    assert_committed()
     trash(par.savedir)
     minutes = int(par.max_hours * 60) + 60 if par.max_hours else 15  # slack: startup, final checkpoint, pca + probe
     bsub(par, "run", minutes, par.n_gpus, f"torchrun --standalone --nproc_per_node={par.n_gpus} {{code}}/experiment.py run {n}")
+
+def spawn_branches(milestone: Path):
+    """Submit the paramsall() entries (with_branches) that anneal `milestone`, which the trunk just saved. The trunk is
+    hours in, so a submit that fails must not kill it: it prints ERR, and spawnall() redoes what was missed."""
+    for j, p in enumerate(paramsall()):
+        if p.anneal_from == str(milestone):
+            try:
+                submit_run(j)
+            except Exception as err:
+                print(f"ERR: could not submit the anneal of {milestone} (d{j}): {err!r}", flush=True)
+
+def spawnall():
+    """Recovery for spawn_branches: submit every anneal whose milestone exists but which has no savedir yet, i.e. was
+    never submitted (its trunk's submit failed, or the trunk died right after saving it)."""
+    assert_committed()
+    for j, p in enumerate(paramsall()):
+        if p.anneal_from and Path(p.anneal_from).is_file() and not Path(p.savedir).exists():
+            submit_run(j)
 
 def pcalsf(n:int):
     """Redo pca(n) on LSF, e.g. after changing pca_maps in this experiment's change (run() already does it once)."""
@@ -962,7 +1033,8 @@ def check_experiment():
     assert not taken, f"{EXPERIMENT}: id {eid} is taken by {series}/{taken[0]}"
     params = paramsall()
     assert all(p.savedir.startswith(f"outdir/{EXPERIMENT}/") for p in params), f"every savedir must be under outdir/{EXPERIMENT}/"
-    deps = sorted({Path(p.init_from).parts[2] for p in params if p.init_from not in ("", "random")})  # outdir/<series>/<sweep>/dN
+    sources = [p.init_from or p.anneal_from for p in params]
+    deps = sorted({Path(s).parts[2] for s in sources if s not in ("", "random")} - {name})  # outdir/<series>/<sweep>/dN; not our own trunks
     parent = eid.rsplit("-", 1)[0] if "-" in eid else None
     if parent:
         parents = [s for s in sweeps if experiment_id(s) == parent]
@@ -974,8 +1046,9 @@ def check_experiment():
 
 def submitall():
     check_experiment()
-    for i in range(len(paramsall())):
-        submit(i)
+    for i, p in enumerate(paramsall()):
+        if not p.anneal_from:  # an anneal is submitted by its trunk as it saves the milestone (spawn_branches; spawnall redoes it)
+            submit(i)
 
 
 def mpix_per_week():

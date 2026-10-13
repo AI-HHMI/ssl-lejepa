@@ -2,6 +2,7 @@
 
 import json
 import re
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -160,6 +161,78 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
     assert replay["as trained"][0] == pytest.approx(losses[3], rel=1e-5)  # compile=False: both paths are eager
 
 
+def test_trunk_spawns_each_milestones_anneal_as_it_saves_it(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")
+    src = experiment.Params(
+        savedir="outdir/e00/e01-test/d0/", patch_size=(8, 8, 8), batch_size=2, steps_per_epoch=1300, max_hours=1.0,  # past LR_WARMUP
+        warmup_steps=1, benchmark_steps=2, profile_steps=0, n_workers=1, defer_image_ops=False, compile=False,
+    )
+    params = experiment.with_branches([src])
+    assert len(params) == 11 and [p.steps_per_epoch for p in params[1:]] == [s // 10 for s in range(130, 1301, 130)]
+    assert all(p.savedir == f"outdir/e00/e01-test/d{j}/" for j, p in enumerate(params))
+    patch_experiment(monkeypatch, tmp_path, src)
+    monkeypatch.setattr(experiment, "paramsall", lambda: params)
+    Path(src.savedir).mkdir(parents=True)
+    submitted = []
+
+    def bsub(par, job, minutes, n_gpus, cmd, **kw):
+        submitted.append((par.savedir, cmd, Path(par.anneal_from).is_file()))
+        if len(submitted) == 1:
+            raise RuntimeError("bsub: queue is closed")  # a failed submit must not kill the trunk
+
+    monkeypatch.setattr(experiment, "bsub", bsub)
+    experiment.train(0)
+
+    ckdir = Path(src.savedir) / "checkpoints"
+    assert [p.name for p in ckdir.glob("step_*.pt")] == ["step_0001300.pt"]  # rolling: the newest only
+    assert [p.name for p in sorted((ckdir / "milestones").glob("*.pt"))] == [f"step_{s:07d}.pt" for s in range(130, 1301, 130)]
+    assert [(d, c) for d, c, _ in submitted] == [(f"outdir/e00/e01-test/d{j}/", f"torchrun --standalone --nproc_per_node=1 {{code}}/experiment.py run {j}")
+                                                 for j in range(1, 11)]  # one anneal per milestone, in the order saved
+    assert all(saved for _, _, saved in submitted)  # each submitted after its checkpoint was written
+    trunk = [json.loads(line) for line in (Path(src.savedir) / "metrics.json").read_text().splitlines()]
+    assert all(r["lr"] == pytest.approx(src.lr * min(1, (r["idx_step"] + 2) / 1000)) for r in trunk)  # warmup, then constant, no decay
+    assert trunk[-1]["lr"] == src.lr
+
+    par = params[9]  # the anneal of milestone 1170
+    patch_experiment(monkeypatch, tmp_path, par)
+    experiment.train(0)
+    start = torch.load(par.anneal_from, weights_only=False)
+    metrics = [json.loads(line) for line in (Path(par.savedir) / "metrics.json").read_text().splitlines()]
+    lr0 = start["opt"]["param_groups"][0]["lr"]
+    assert lr0 == src.lr and metrics[0]["lr"] <= lr0 and metrics[-1]["lr"] == pytest.approx(0.01 * lr0)  # trunk's lr down to 1%
+    done = torch.load(sorted((Path(par.savedir) / "checkpoints").glob("step_*.pt"))[-1], weights_only=False)
+    assert not (Path(par.savedir) / "checkpoints/milestones").exists()  # an anneal spawns nothing
+    assert done["step"] == 117 and done["opt"]["state"][0]["step"] == 1170 + 117  # Adam's step count carried over
+
+
+def test_spawnall_submits_only_the_missed_anneals(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")
+    params = experiment.with_branches([experiment.Params(savedir="outdir/e00/e01-test/d0/", steps_per_epoch=1000)])
+    submitted = []
+    monkeypatch.setattr(experiment, "paramsall", lambda: params)
+    monkeypatch.setattr(experiment, "assert_committed", lambda: None)
+    monkeypatch.setattr(experiment, "submit_run", lambda j: submitted.append(j))
+    for j in (1, 2, 3):  # milestones saved
+        Path(params[j].anneal_from).parent.mkdir(parents=True, exist_ok=True)
+        Path(params[j].anneal_from).touch()
+    Path(params[2].savedir).mkdir(parents=True)  # d2 was submitted
+    experiment.spawnall()
+    assert submitted == [1, 3]
+
+
+def test_submitall_leaves_the_anneals_to_their_trunks(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")
+    params = experiment.with_branches([experiment.Params(savedir="outdir/e00/e01-test/d0/", steps_per_epoch=1000)])
+    submitted = []
+    monkeypatch.setattr(experiment, "paramsall", lambda: params)
+    monkeypatch.setattr(experiment, "submit", lambda n: submitted.append(n))
+    experiment.submitall()  # its anneals read their own sweep's trunk: not a dependency on another experiment
+    assert submitted == [0]
+
+
 @pytest.mark.parametrize("max_hours,evals", [(0.0, []), (1.0, ["pca", "probe"])])
 def test_run_trains_then_evals_training_runs_only(monkeypatch, max_hours, evals):
     calls = []
@@ -174,6 +247,7 @@ def test_run_trains_then_evals_training_runs_only(monkeypatch, max_hours, evals)
 def test_runlsf_refuses_probe_only_runs(tmp_path, monkeypatch):
     # init_from runs are eval-only (pca, probe); training would silently ignore init_from and start from scratch.
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(experiment, "assert_committed", lambda: None)
     monkeypatch.setattr(experiment, "paramsall", lambda: [experiment.Params(savedir="outdir/e00/x/d0", init_from="random")])
     with pytest.raises(AssertionError, match="eval-only"):
         experiment.runlsf(0)
