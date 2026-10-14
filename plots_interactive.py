@@ -242,11 +242,12 @@ def splom(groups: dict, dims: list) -> str:
 
 
 def lines(series: dict, xlabel: str, ylabel: str, logx: bool = False, logy: bool = False) -> str:
-    """series: label -> (xs, ys), one line each. The tooltip lists every line's value at the hovered x."""
+    """series: label -> (xs, ys), one line each. The tooltip shows only the nearest point: a tooltip listing every line
+    at the hovered x hid most of the plot."""
     data = [{"type": "scatter", "mode": "lines+markers", "marker": {"size": 5}, "name": label, "x": list(xs), "y": list(ys), "line": {"color": c, "width": 1.8},
-             "hovertemplate": "%{y:.4g}"}
+             "hovertemplate": f"{html.escape(str(label))}<br>{html.escape(xlabel)}: %{{x}}<br>{html.escape(ylabel)}: %{{y:.4g}}<extra></extra>"}
             for (label, (xs, ys)), c in zip(series.items(), itertools.cycle(COLORS))]
-    return figure(data, {"hovermode": "x unified", "xaxis": {"title": xlabel}, "yaxis": {"title": ylabel}}, logx=logx, logy=logy)
+    return figure(data, {"xaxis": {"title": xlabel}, "yaxis": {"title": ylabel}}, logx=logx, logy=logy)
 
 
 def heatmap(z: dict, xs: list, ys: list, xlabel: str, ylabel: str, zrange: tuple) -> str:
