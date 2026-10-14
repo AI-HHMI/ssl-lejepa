@@ -9,8 +9,12 @@ import torch
 import zarr
 
 import experiment
-from lib.models import Lejepa, LejepaConfig
+from lib.encoders import EncoderConfig
+from lib.models import Lejepa, LejepaConfig, ProjectorConfig
 from lib.probe import AFFINITY_OFFSETS_XYZ, affinities, average_precision, fit_probe, to_tokens, to_voxels
+
+TINY = LejepaConfig(encoder=EncoderConfig(depth=1, embed_dim=16, num_heads=2, patch_size=(4, 4, 4)),
+                    projector=ProjectorConfig(dim=8, hidden=16))
 
 
 def test_affinities_mark_the_split_between_two_objects():
@@ -67,7 +71,7 @@ def test_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch):
     monkeypatch.setattr(experiment, "HEMIBRAIN_EB_LABELS", "labels/cells")
     monkeypatch.setattr(experiment.lmd, "get", lambda name: SimpleNamespace(path=str(store)))
     monkeypatch.setattr(experiment, "code_provenance", lambda: {"commit_id": "test"})
-    model = Lejepa(LejepaConfig(n_layers=1, width=16, num_heads=2, patch_size=(4, 4, 4), proj_hidden=16, proj_dim=8))
+    model = Lejepa(TINY)
     monkeypatch.setattr(experiment, "load_checkpoint", lambda p: (model.eval(), 7))
     experiment.probe(0)
 
@@ -105,7 +109,7 @@ def test_unetr_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch):
     monkeypatch.setattr(experiment, "HEMIBRAIN_EB_LABELS", "labels/cells")
     monkeypatch.setattr(experiment.lmd, "get", lambda name: SimpleNamespace(path=str(store)))
     monkeypatch.setattr(experiment, "code_provenance", lambda: {"commit_id": "test"})
-    model = Lejepa(LejepaConfig(n_layers=2, width=16, num_heads=2, patch_size=(2, 2, 2), proj_hidden=16, proj_dim=8))
+    model = Lejepa(TINY, encoder=EncoderConfig(depth=2, embed_dim=16, num_heads=2, patch_size=(2, 2, 2)))
     monkeypatch.setattr(experiment, "load_checkpoint", lambda p: (model.eval(), 7))
     experiment.probe(0)
 
@@ -124,8 +128,7 @@ def test_unetr_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch):
 
 
 def test_load_checkpoint_init_from(tmp_path, monkeypatch):
-    monkeypatch.setattr(experiment, "lejepa_config", lambda par: LejepaConfig(n_layers=1, width=16, num_heads=2, patch_size=(4, 4, 4),
-                                                                              proj_hidden=16, proj_dim=8))
+    monkeypatch.setattr(experiment, "lejepa_config", lambda par: TINY)
     a, step = experiment.load_checkpoint(experiment.Params(init_from="random", n_layers=1, width=16))
     b, _ = experiment.load_checkpoint(experiment.Params(init_from="random", n_layers=1, width=16))
     assert step == 0 and all(torch.equal(x, y) for x, y in zip(a.state_dict().values(), b.state_dict().values()))  # seeded
@@ -193,8 +196,9 @@ def test_lejepa_n_params_builds_the_model_once_per_size(tmp_path, monkeypatch):
     built = []
 
     def fake_lejepa(config):
-        built.append((config.n_layers, config.width))
-        return SimpleNamespace(_n_encoder_params=config.n_layers * config.width, _n_projector_params=7)
+        e = config.encoder
+        built.append((e.depth, e.embed_dim))
+        return SimpleNamespace(_n_encoder_params=e.depth * e.embed_dim, _n_projector_params=7)
 
     monkeypatch.setattr(experiment, "N_PARAMS_CACHE", tmp_path / ".cache/n_params.json")
     monkeypatch.setattr(experiment, "Lejepa", fake_lejepa)

@@ -64,7 +64,7 @@ class Unetr(nn.Module):
         p = patch[0]
         num_stages = p.bit_length() - 1  # log2, for a power of 2
         assert 2 ** num_stages == p, f"patch_size must be a power of 2, got {p}"
-        skip_layers = config.skip_layers or default_skip_layers(encoder.depth, num_stages)
+        skip_layers = config.skip_layers or default_skip_layers(encoder.config.depth, num_stages)
         assert len(skip_layers) == num_stages, f"need {num_stages} skip_layers for patch_size={p}, got {len(skip_layers)}"
         assert list(skip_layers) == sorted(set(skip_layers)), f"skip_layers must be sorted and distinct: {skip_layers}"
 
@@ -73,7 +73,7 @@ class Unetr(nn.Module):
         self.skip_layers = tuple(skip_layers)
         self.num_stages = num_stages
 
-        dim = encoder.embed_dim
+        dim = encoder.config.embed_dim
         self.bottleneck = ConvBlock3d(dim, config.hidden_dim)
         self.skip_projs = nn.ModuleList(ConvBlock3d(dim, config.hidden_dim) for _ in range(num_stages))
         self.upsample = nn.ModuleList(nn.ConvTranspose3d(config.hidden_dim, config.hidden_dim, kernel_size=2, stride=2)

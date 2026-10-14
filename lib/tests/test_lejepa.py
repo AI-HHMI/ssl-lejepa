@@ -5,21 +5,24 @@ import json
 import pytest
 import torch
 
-from lib.encoders import ViT3DEncoder, get_3d_sincos_pos_embed
-from lib.losses import SIGReg, lejepa_loss
-from lib.models import Lejepa, LejepaConfig
-from lib.views import ViewMaker
+from lib.encoders import EncoderConfig, ViT3DEncoder, get_3d_sincos_pos_embed
+from lib.losses import SIGReg, SIGRegConfig, lejepa_loss
+from lib.models import Lejepa, LejepaConfig, ProjectorConfig
+from lib.views import ViewConfig, ViewMaker
+
+TINY = LejepaConfig(encoder=EncoderConfig(depth=1, embed_dim=32, num_heads=2, patch_size=(4, 4, 4)),
+                    projector=ProjectorConfig(dim=8, hidden=32))
 
 
-def test_lejepa_config():
-    cfg = LejepaConfig(n_layers=12, width=512, views="basic")
-    assert cfg.n_layers == 12
-    assert cfg.num_layers == 12
-    assert cfg.width == 512
-    assert cfg.dim == 512
-    assert cfg.embed_dim == 512
-    assert cfg.views == "basic"
-    assert cfg.num_heads == 8
+def test_each_part_keeps_its_config_whole():
+    cfg = LejepaConfig(encoder=EncoderConfig(depth=2, embed_dim=64, num_heads=2), view=ViewConfig(n_local=0),
+                       sigreg=SIGRegConfig(num_slices=16), projector=None)
+    model = Lejepa(cfg)
+    assert model.encoder.config == cfg.encoder and model.sigreg.config == cfg.sigreg and model.view_maker is not None
+    assert model.view_maker.config == cfg.view and model.projector is None
+    # Old checkpoints load: the parts keep their module names, so state-dict keys are unchanged.
+    assert {k.split(".")[0] for k in Lejepa(TINY).state_dict()} == {"encoder", "projector", "sigreg"}
+    assert Lejepa(TINY, view=ViewConfig(views="none")).view_maker is None
 
 
 def test_pos_embed_3d():
@@ -96,8 +99,7 @@ def test_view_maker():
 
 
 def test_model_forward_and_backward():
-    cfg = LejepaConfig(n_layers=2, width=64, num_heads=2, patch_size=(8, 8, 8), views="basic")
-    model = Lejepa(cfg)
+    model = Lejepa(encoder=EncoderConfig(depth=2, embed_dim=64, num_heads=2, patch_size=(8, 8, 8)))
 
     x = torch.randn(2, 1, 32, 32, 32)
     res = model(x)
@@ -144,19 +146,13 @@ def test_view_maker_displace_locals_inside_globals():
 
 
 def test_batch_views_matches_per_view():
-    per_view = Lejepa(LejepaConfig(n_layers=1, width=32, num_heads=2, patch_size=(4, 4, 4), proj_hidden=32, proj_dim=8))
-    batched = Lejepa(LejepaConfig(n_layers=1, width=32, num_heads=2, patch_size=(4, 4, 4), proj_hidden=32, proj_dim=8, batch_views=True))
+    per_view = Lejepa(TINY)
+    batched = Lejepa(TINY, batch_views=True)
     batched.load_state_dict(per_view.state_dict())
     per_view.eval()  # BatchNorm running stats: identical math either way
     batched.eval()
     views = [torch.randn(3, 1, 8, 8, 8), torch.randn(3, 1, 4, 8, 8), torch.randn(3, 1, 8, 8, 8)]
     torch.testing.assert_close(per_view.encode_views(views), batched.encode_views(views))
-
-def test_config_round_trip():
-    cfg = LejepaConfig(n_layers=3, width=64, views="displace", global_size=(32, 32, 32), local_size=(16, 16, 16), lamb=0.1)
-    again = LejepaConfig(**cfg.to_kwargs())
-    assert again.to_kwargs() == cfg.to_kwargs()
-    Lejepa(again).load_state_dict(Lejepa(cfg).state_dict())  # same architecture
 
 
 def test_snapshot_copies_once(tmp_path, monkeypatch):

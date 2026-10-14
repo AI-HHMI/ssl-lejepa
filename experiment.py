@@ -20,8 +20,9 @@ from itertools import product
 from lib.data import HEMIBRAIN_EB, HEMIBRAIN_EB_LABELS, HEMIBRAIN_EB_PROBE_ANNOTATED, HEMIBRAIN_EB_PROBE_BOXES, TRAIN_BOXES
 from lib.benchmark import Benchmark
 from lib.losses import LejepaOutput
+from lib.encoders import EncoderConfig
 from lib.models import Lejepa, LejepaConfig
-from lib.views import ViewMaker
+from lib.views import ViewConfig, ViewMaker
 from lib.util import *
 from lib.types import *
 
@@ -84,8 +85,8 @@ def lejepa_n_params(n_layers: int, width: int) -> tuple[int, int]:
     key = f"{code}/{n_layers}x{width}"
     cache = json.loads(N_PARAMS_CACHE.read_text()) if N_PARAMS_CACHE.is_file() else {}
     if key not in cache:
-        model = Lejepa(LejepaConfig(n_layers=n_layers, width=width, views="displace",
-                                    global_size=(96, 96, 96), local_size=(64, 64, 64), batch_views=True, lamb=0.1))
+        model = Lejepa(lejepa_config(replace(Params(), n_layers=n_layers, width=width, views="displace",
+                                             global_size=(96, 96, 96), local_size=(64, 64, 64), batch_views=True)))
         cache[key] = [model._n_encoder_params, model._n_projector_params]
         N_PARAMS_CACHE.parent.mkdir(exist_ok=True)
         N_PARAMS_CACHE.write_text(json.dumps(cache))
@@ -252,11 +253,8 @@ def collate_images(samples):
 
 def lejepa_config(par: Params):
     return LejepaConfig(
-        n_layers = par.n_layers,
-        width = par.width,
-        views = par.views,
-        global_size = par.global_size,
-        local_size = par.local_size,
+        encoder = EncoderConfig(depth=par.n_layers, embed_dim=par.width, num_heads=par.width // 64),
+        view = ViewConfig(views=par.views, global_size=par.global_size, local_size=par.local_size),
         batch_views = par.batch_views,
         lamb = 0.1,
     )
@@ -291,10 +289,8 @@ def save_view_pngs(par: Params, dataset, n_samples: int = 3):
     center-z slices at native voxel size, left to right (input | globals | locals) -> savedir/views_{i}.png."""
     from PIL import Image
     cfg = lejepa_config(par)
-    p = cfg.patch_size
-    patch = (p, p, p) if isinstance(p, int) else p
-    maker = ViewMaker(n_global=cfg.n_global, n_local=cfg.n_local, global_scale=cfg.global_scale, local_scale=cfg.local_scale,
-                      flip=cfg.flip, patch_size=patch, views=cfg.views, global_size=cfg.global_size, local_size=cfg.local_size)
+    p = cfg.encoder.patch_size
+    maker = ViewMaker(cfg.view, patch_size=(p, p, p) if isinstance(p, int) else p)
     samples = [dataset[i] for i in range(n_samples)]
     x = finish_images(collate_deferred(samples))["img"] if par.defer_image_ops else collate_images(samples)  # Batch C Z Y X
     globals_, locals_ = maker(x)
@@ -435,7 +431,7 @@ def train(n:int):
         ckdir = savedir / "checkpoints"
         ckdir.mkdir(exist_ok=True)
         tmp, path = ckdir / "tmp.pt", ckdir / f"step_{step:07d}.pt"
-        torch.save({"step": step, "params": asdict(par), "model_config": lejepa.cfg.to_kwargs(), "model": state,
+        torch.save({"step": step, "params": asdict(par), "model_config": asdict(lejepa.config), "model": state,
                     "opt": opt.state_dict(), "sched": sched.state_dict()}, tmp)
         tmp.replace(path)  # never leave a half-written checkpoint
         milestone = ckdir / "milestones" / path.name
@@ -482,7 +478,7 @@ def train(n:int):
                         print(f"Non-finite grad norm at step {idx_step}; skipped ({n_skipped} so far)", flush=True)
                         if rank0 and n_skipped <= BAD_BATCHES_KEPT:
                             # Weights are still the pre-step ones; inputs are uint8 on disk, so this is lossless.
-                            torch.save({"step": idx_step, "params": asdict(par), "model_config": lejepa.cfg.to_kwargs(),
+                            torch.save({"step": idx_step, "params": asdict(par), "model_config": asdict(lejepa.config),
                                         "model": lejepa.state_dict(), "x_uint8": (x.clamp(0, 1) * 255).round().byte().cpu(),
                                         "rng_cpu": rng_cpu, "rng_cuda": rng_cuda}, savedir / f"bad_batch_{idx_step:07d}.pt")
                     opt.zero_grad(set_to_none=True)
@@ -584,7 +580,7 @@ def replay_bad_batch(path: str):
     x = dump["x_uint8"].to(device).float() / 255  # Batch C Z Y X, exactly the training input
 
     def step(label: str, compiled: bool, backend: SDPBackend | None = None) -> tuple[float, int]:
-        model = Lejepa(LejepaConfig(**dump["model_config"]))
+        model = Lejepa(lejepa_config(par))  # this commit's own experiment (asserted above), so its own architecture
         model.load_state_dict(dump["model"])  # the pre-step weights
         model.to(device).train()
         if compiled:
@@ -677,7 +673,7 @@ def pca_maps(encoder, par: Params, savedir: Path, step: int):
     tile, patch = par.global_size, encoder.patch_embed.patch_size
     assert all(s % t == 0 for s, t in zip(shape, tile)), f"crop {shape} must tile by {tile}"
     grid = [s // p for s, p in zip(shape, patch)]
-    feats = torch.empty(*grid, encoder.embed_dim)  # Z Y X D, tokens (after the final LayerNorm)
+    feats = torch.empty(*grid, encoder.config.embed_dim)  # Z Y X D, tokens (after the final LayerNorm)
     norms = torch.empty(*grid)  # Z Y X, token norms before the final LayerNorm
     with torch.no_grad(), torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
         for z, y, x in product(*(range(0, s, t) for s, t in zip(shape, tile))):
@@ -701,13 +697,13 @@ def pca_maps(encoder, par: Params, savedir: Path, step: int):
     # Tile-centered tokens: subtract each tile's mean token, removing the per-view code and keeping within-view structure.
     g = [t_ // p for t_, p in zip(tile, patch)]  # tokens per tile side
     nt = [n // gi for n, gi in zip(grid, g)]  # tiles per axis
-    tiled = feats.reshape(nt[0], g[0], nt[1], g[1], nt[2], g[2], encoder.embed_dim)
-    centered = (tiled - tiled.mean(dim=(1, 3, 5), keepdim=True)).reshape(*grid, encoder.embed_dim)
-    rgb, erank, var = pca_rgb(feats.reshape(-1, encoder.embed_dim), grid)
-    rgb_c, erank_c, var_c = pca_rgb(centered.reshape(-1, encoder.embed_dim), grid)
+    tiled = feats.reshape(nt[0], g[0], nt[1], g[1], nt[2], g[2], encoder.config.embed_dim)
+    centered = (tiled - tiled.mean(dim=(1, 3, 5), keepdim=True)).reshape(*grid, encoder.config.embed_dim)
+    rgb, erank, var = pca_rgb(feats.reshape(-1, encoder.config.embed_dim), grid)
+    rgb_c, erank_c, var_c = pca_rgb(centered.reshape(-1, encoder.config.embed_dim), grid)
     rgb_t = np.empty((*grid, 3), np.uint8)  # PCA fitted separately within each tile
     for i, j, k in product(*map(range, nt)):
-        rgb_t[i * g[0]:(i + 1) * g[0], j * g[1]:(j + 1) * g[1], k * g[2]:(k + 1) * g[2]] = pca_rgb(tiled[i, :, j, :, k, :].reshape(-1, encoder.embed_dim), g)[0]
+        rgb_t[i * g[0]:(i + 1) * g[0], j * g[1]:(j + 1) * g[1], k * g[2]:(k + 1) * g[2]] = pca_rgb(tiled[i, :, j, :, k, :].reshape(-1, encoder.config.embed_dim), g)[0]
     between_tile = 1 - float(centered.var(dim=(0, 1, 2)).sum() / feats.var(dim=(0, 1, 2)).sum())
 
     # Pre-LayerNorm token norms: "register"-like tokens that store global information show up as sparse
@@ -770,7 +766,7 @@ def tile_features(encoder, img, tile):
     p = encoder.patch_embed.patch_size
     assert all(s % t == 0 for s, t in zip(img.shape, tile)), f"{tuple(img.shape)} must tile by {tile}"
     g = [t // q for t, q in zip(tile, p)]  # tokens per tile side
-    feats = torch.empty(*(s // q for s, q in zip(img.shape, p)), encoder.embed_dim, dtype=torch.bfloat16, device=img.device)
+    feats = torch.empty(*(s // q for s, q in zip(img.shape, p)), encoder.config.embed_dim, dtype=torch.bfloat16, device=img.device)
     with torch.no_grad(), torch.autocast(img.device.type, dtype=torch.bfloat16, enabled=img.device.type == "cuda"):
         for z, y, x in product(*(range(0, s, t) for s, t in zip(img.shape, tile))):
             t = encoder.forward_features(img[None, None, z:z + tile[0], y:y + tile[1], x:x + tile[2]])

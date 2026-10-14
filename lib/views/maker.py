@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 import torch
 from torch import Tensor
@@ -12,14 +12,15 @@ from lib.types import Tup3Int, Views
 
 @dataclass
 class ViewConfig:
-    """Configuration for multi-crop view creation."""
-    views: Views = "basic"
+    """Configuration for multi-crop view creation (see ViewMaker)."""
+    views: Views = "basic"  # 'none': Lejepa makes no views
     n_global: int = 2
     n_local: int = 4
-    global_scale: Tuple[float, float] = (0.5, 1.0)
-    local_scale: Tuple[float, float] = (0.15, 0.5)
+    global_scale: Tuple[float, float] = (0.5, 1.0)  # basic
+    local_scale: Tuple[float, float] = (0.15, 0.5)  # basic
+    global_size: Tup3Int = (40, 128, 128)  # displace
+    local_size: Tup3Int = (32, 96, 96)  # displace
     flip: bool = True
-    token_dropout: float = 0.0
 
 
 class ViewMaker:
@@ -31,37 +32,19 @@ class ViewMaker:
     Both modes flip each crop per sample and per axis with probability 0.5. No resizing.
     """
 
-    def __init__(
-        self,
-        n_global: int = 2,
-        n_local: int = 4,
-        global_scale: Tuple[float, float] = (0.5, 1.0),
-        local_scale: Tuple[float, float] = (0.15, 0.5),
-        flip: bool = True,
-        generator: Optional[torch.Generator] = None,
-        patch_size: Tup3Int = (1, 1, 1),
-        views: Views = "basic",
-        global_size: Tup3Int = (40, 128, 128),
-        local_size: Tup3Int = (32, 96, 96),
-    ):
-        assert views in ("basic", "displace"), f"unknown views {views!r}"
-        self.n_global = n_global
-        self.n_local = n_local
-        self.global_scale = global_scale
-        self.local_scale = local_scale
-        self.flip = flip
+    def __init__(self, config: ViewConfig | None = None, patch_size: Tup3Int = (1, 1, 1),
+                 generator: Optional[torch.Generator] = None, **kwargs):
+        self.config = c = replace(config or ViewConfig(), **kwargs)
+        assert c.views in ("basic", "displace"), f"unknown views {c.views!r}"
         self.generator = generator
         self.patch_size = patch_size  # crop sizes are rounded to multiples of this
-        self.views = views
-        self.global_size = global_size
-        self.local_size = local_size
-        if views == "displace":
-            for name, size in [("global_size", self.global_size), ("local_size", self.local_size)]:
+        if c.views == "displace":
+            for name, size in [("global_size", c.global_size), ("local_size", c.local_size)]:
                 assert all(s % p == 0 for s, p in zip(size, patch_size)), f"{name} {size} must be a multiple of patch size {patch_size}"
-            assert all(l <= g for l, g in zip(self.local_size, self.global_size)), (
-                f"local_size {self.local_size} must fit inside global_size {self.global_size}"
+            assert all(l <= g for l, g in zip(c.local_size, c.global_size)), (
+                f"local_size {c.local_size} must fit inside global_size {c.global_size}"
             )
-            assert n_global > 0 or n_local == 0, "displace needs a global to anchor each local"
+            assert c.n_global > 0 or c.n_local == 0, "displace needs a global to anchor each local"
 
     def _rand_uniform(self, low: float, high: float) -> float:
         return low + (high - low) * torch.rand((), generator=self.generator).item()
@@ -91,7 +74,7 @@ class ViewMaker:
         idx = []
         for axis, cs in enumerate(crop_shape):
             offset = torch.arange(cs).expand(B, cs)  # Batch cs
-            if self.flip:
+            if self.config.flip:
                 flip = torch.rand((B, 1), generator=self.generator) < 0.5
                 offset = torch.where(flip, cs - 1 - offset, offset)
             idx.append((origin[:, axis:axis + 1] + offset).to(x.device, non_blocking=True))
@@ -113,19 +96,20 @@ class ViewMaker:
         return self._gather(x, self._origins(spatial_shape, crop_shape, x.shape[0]), crop_shape)
 
     def _displace_views(self, x: Tensor) -> Tuple[list[Tensor], list[Tensor]]:
+        c = self.config
         B = x.shape[0]
         spatial_shape = tuple(x.shape[2:])
-        assert all(g <= s for g, s in zip(self.global_size, spatial_shape)), (
-            f"global_size {self.global_size} larger than input {spatial_shape}"
+        assert all(g <= s for g, s in zip(c.global_size, spatial_shape)), (
+            f"global_size {c.global_size} larger than input {spatial_shape}"
         )
-        g_origins = torch.stack([self._origins(spatial_shape, self.global_size, B) for _ in range(self.n_global)])  # Global Batch 3
-        globals_ = [self._gather(x, o, self.global_size) for o in g_origins]
+        g_origins = torch.stack([self._origins(spatial_shape, c.global_size, B) for _ in range(c.n_global)])  # Global Batch 3
+        globals_ = [self._gather(x, o, c.global_size) for o in g_origins]
         locals_ = []
-        for _ in range(self.n_local):
-            anchor = torch.randint(0, self.n_global, (B,), generator=self.generator)  # Batch
-            displacement = self._origins(self.global_size, self.local_size, B)  # Batch 3, keeps the local inside its global
+        for _ in range(c.n_local):
+            anchor = torch.randint(0, c.n_global, (B,), generator=self.generator)  # Batch
+            displacement = self._origins(c.global_size, c.local_size, B)  # Batch 3, keeps the local inside its global
             origin = g_origins[anchor, torch.arange(B)] + displacement
-            locals_.append(self._gather(x, origin, self.local_size))
+            locals_.append(self._gather(x, origin, c.local_size))
         return globals_, locals_
 
     def __call__(self, x: Tensor) -> Tuple[list[Tensor], list[Tensor]]:
@@ -137,8 +121,9 @@ class ViewMaker:
         assert all(s % p == 0 for s, p in zip(x.shape[2:], self.patch_size)), (
             f"input spatial shape {tuple(x.shape[2:])} must be a multiple of patch size {self.patch_size}"
         )
-        if self.views == "displace":
+        c = self.config
+        if c.views == "displace":
             return self._displace_views(x)
-        globals_ = [self._basic_view(x, self.global_scale) for _ in range(self.n_global)]
-        locals_ = [self._basic_view(x, self.local_scale) for _ in range(self.n_local)]
+        globals_ = [self._basic_view(x, c.global_scale) for _ in range(c.n_global)]
+        locals_ = [self._basic_view(x, c.local_scale) for _ in range(c.n_local)]
         return globals_, locals_

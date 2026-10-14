@@ -10,7 +10,10 @@ import torch
 
 import experiment
 from lib.losses import LejepaOutput
-from lib.models import Lejepa, LejepaConfig
+from lib.encoders import EncoderConfig
+from lib.losses import SIGRegConfig
+from lib.models import Lejepa, LejepaConfig, ProjectorConfig
+from lib.views import ViewConfig
 
 
 class SyntheticDataset:
@@ -59,14 +62,14 @@ def patch_experiment(monkeypatch, tmp_path, params):
         "commit_id": "test-commit", "subject": "test", "dirty": False, "diff_hash": "test-diff",
     })
 
-    def small_model_config(**kwargs):
+    def small_model_config(par):
         return LejepaConfig(
-            n_layers=1, width=16, num_heads=2, patch_size=(4, 4, 4),
-            proj_hidden=16, proj_dim=8, num_slices=4, sigreg_knots=3,
-            n_global=2, n_local=1,
+            encoder=EncoderConfig(depth=1, embed_dim=16, num_heads=2, patch_size=(4, 4, 4)),
+            projector=ProjectorConfig(dim=8, hidden=16), sigreg=SIGRegConfig(num_slices=4, knots=3),
+            view=ViewConfig(n_global=2, n_local=1),
         )
 
-    monkeypatch.setattr(experiment, "LejepaConfig", small_model_config)
+    monkeypatch.setattr(experiment, "lejepa_config", small_model_config)
 
 
 @pytest.mark.parametrize(

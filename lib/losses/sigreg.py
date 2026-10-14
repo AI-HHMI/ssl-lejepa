@@ -6,11 +6,20 @@ invariance + SIGReg joint loss (Balestriero & LeCun, 2025).
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
 import torch.nn as nn
 from torch import Tensor
+
+
+@dataclass
+class SIGRegConfig:
+    """SIGReg hyperparameters."""
+    num_slices: int = 256  # random 1D projections per forward pass
+    knots: int = 17  # quadrature knots on [0, t_max]; odd
+    t_max: float = 3.0  # upper limit of integration
 
 
 class SIGReg(nn.Module):
@@ -19,24 +28,17 @@ class SIGReg(nn.Module):
     Projects feature representations onto random 1D unit slices and evaluates
     the empirical characteristic function against the standard normal N(0, 1) CF
     via numerical quadrature.
-
-    Args:
-        num_slices: Number of random 1D projections per forward pass.
-        knots: Number of quadrature knots on [0, t_max]. Must be odd.
-        t_max: Upper limit of integration.
     """
 
     t: Tensor
     phi: Tensor
     weights: Tensor
 
-    def __init__(self, num_slices: int = 256, knots: int = 17, t_max: float = 3.0):
+    def __init__(self, config: SIGRegConfig | None = None, **kwargs):
         super().__init__()
-        if knots % 2 == 0:
-            raise ValueError(f"knots must be odd for trapezoidal quadrature, got {knots}")
-        self.num_slices = num_slices
-        self.knots = knots
-        self.t_max = t_max
+        self.config = c = replace(config or SIGRegConfig(), **kwargs)
+        knots, t_max = c.knots, c.t_max
+        assert knots % 2 == 1, f"knots must be odd for trapezoidal quadrature, got {knots}"
 
         t = torch.linspace(0.0, t_max, knots, dtype=torch.float32)
         dt = t_max / (knots - 1)
@@ -62,7 +64,7 @@ class SIGReg(nn.Module):
         dtype = proj.dtype
 
         # Random unit-norm projection directions A: (D, num_slices)
-        A = torch.randn(proj.size(-1), self.num_slices, device=device, dtype=dtype)
+        A = torch.randn(proj.size(-1), self.config.num_slices, device=device, dtype=dtype)
         A = A / A.norm(p=2, dim=0, keepdim=True).clamp_min(1e-8)
 
         t = self.t.to(device=device, dtype=dtype)
@@ -77,7 +79,7 @@ class SIGReg(nn.Module):
         return statistic.mean()
 
     def extra_repr(self) -> str:
-        return f"num_slices={self.num_slices}, knots={self.knots}, t_max={self.t_max}"
+        return repr(self.config)
 
 
 class LejepaOutput(dict):

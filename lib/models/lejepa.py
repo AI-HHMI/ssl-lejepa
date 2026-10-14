@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, replace
 from math import prod
 from typing import Any, Optional, Tuple, Union
 
@@ -10,10 +10,9 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from lib.encoders import ViT3DEncoder
-from lib.losses import LejepaOutput, SIGReg, lejepa_loss
-from lib.types import Tup3Int, Views
-from lib.views import ViewMaker
+from lib.encoders import EncoderConfig, ViT3DEncoder
+from lib.losses import LejepaOutput, SIGReg, SIGRegConfig, lejepa_loss
+from lib.views import ViewConfig, ViewMaker
 
 
 def _norm1d(norm: str, dim: int) -> nn.Module:
@@ -35,28 +34,31 @@ class SafeBatchNorm1d(nn.BatchNorm1d):
         return super().forward(input)
 
 
+@dataclass
+class ProjectorConfig:
+    """ProjectorMLP hyperparameters (its input dim is the encoder's embed_dim)."""
+    dim: int = 128  # output dim: the metric space SIGReg and invariance act in
+    hidden: int = 2048
+    n_hidden: int = 2
+    norm: str = "bn"  # 'bn', 'ln' or 'none'
+
+
 class ProjectorMLP(nn.Module):
     """Projection head mapping encoder embeddings to the metric space."""
 
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dim: int,
-        out_dim: int,
-        n_hidden: int = 2,
-        norm: str = "bn",
-    ):
+    def __init__(self, in_dim: int, config: ProjectorConfig):
         super().__init__()
+        self.config = config
         layers: list[nn.Module] = []
         d = in_dim
-        for _ in range(n_hidden):
+        for _ in range(config.n_hidden):
             layers.extend([
-                nn.Linear(d, hidden_dim),
-                _norm1d(norm, hidden_dim),
+                nn.Linear(d, config.hidden),
+                _norm1d(config.norm, config.hidden),
                 nn.GELU(),
             ])
-            d = hidden_dim
-        layers.append(nn.Linear(d, out_dim))
+            d = config.hidden
+        layers.append(nn.Linear(d, config.dim))
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -65,205 +67,13 @@ class ProjectorMLP(nn.Module):
 
 @dataclass
 class LejepaConfig:
-    """Hyperparameters for LeJEPA architecture, views, and SIGReg objective.
-
-    Supports convenient aliases such as `num_layers` / `n_layers`, `dim` / `width`,
-    and gracefully accepts extra keyword arguments.
-    """
-
-    # Backbone Architecture
-    n_layers: int = 12
-    width: int = 512
-    num_heads: int = 8
-    mlp_ratio: float = 4.0
-    patch_size: Union[int, Tup3Int] = (8, 8, 8)
-    in_channels: int = 1
-    dropout: float = 0.0
-    attention_dropout: float = 0.0
-    qkv_bias: bool = True
-
-    # Projector
-    use_projector: bool = True
-    proj_dim: int = 128
-    proj_hidden: int = 2048
-    proj_n_hidden: int = 2
-    proj_norm: str = "bn"
-
-    # Multi-Crop Views
-    views: Views = "basic"  # see ViewMaker
-    n_global: int = 2
-    n_local: int = 4
-    global_scale: Tuple[float, float] = (0.5, 1.0)  # basic
-    local_scale: Tuple[float, float] = (0.15, 0.5)  # basic
-    global_size: Tup3Int = (40, 128, 128)  # displace
-    local_size: Tup3Int = (32, 96, 96)  # displace
-    flip: bool = True
-    token_dropout: float = 0.0
+    """Hyperparameters for LeJEPA: each part's own config, whole, plus how they combine."""
+    encoder: EncoderConfig = field(default_factory=EncoderConfig)
+    projector: ProjectorConfig | None = field(default_factory=ProjectorConfig)  # None: views embed as the encoder's output
+    view: ViewConfig = field(default_factory=ViewConfig)
+    sigreg: SIGRegConfig = field(default_factory=SIGRegConfig)
     batch_views: bool = False  # one encoder call per group of same-shape views (projector BN then pools the group)
-
-    # Objective / Loss
-    lamb: float = 0.02
-    num_slices: int = 256
-    sigreg_knots: int = 17
-    sigreg_tmax: float = 3.0
-
-    # Extra options bag
-    extra: dict[str, Any] = field(default_factory=dict)
-
-    def __init__(
-        self,
-        n_layers: int = 12,
-        width: int = 512,
-        num_heads: Optional[int] = None,
-        mlp_ratio: float = 4.0,
-        patch_size: Union[int, Tup3Int] = (8, 8, 8),
-        in_channels: int = 1,
-        dropout: float = 0.0,
-        attention_dropout: float = 0.0,
-        qkv_bias: bool = True,
-        use_projector: bool = True,
-        proj_dim: int = 128,
-        proj_hidden: int = 2048,
-        proj_n_hidden: int = 2,
-        proj_norm: str = "bn",
-        views: Views = "basic",
-        n_global: int = 2,
-        n_local: int = 4,
-        global_scale: Tuple[float, float] = (0.5, 1.0),
-        local_scale: Tuple[float, float] = (0.15, 0.5),
-        global_size: Tup3Int = (40, 128, 128),
-        local_size: Tup3Int = (32, 96, 96),
-        flip: bool = True,
-        token_dropout: float = 0.0,
-        batch_views: bool = False,
-        lamb: float = 0.02,
-        num_slices: int = 256,
-        sigreg_knots: int = 17,
-        sigreg_tmax: float = 3.0,
-        **kwargs: Any,
-    ):
-        # Resolve aliases
-        if "num_layers" in kwargs:
-            n_layers = kwargs.pop("num_layers")
-        if "depth" in kwargs:
-            n_layers = kwargs.pop("depth")
-        if "dim" in kwargs:
-            width = kwargs.pop("dim")
-        if "embed_dim" in kwargs:
-            width = kwargs.pop("embed_dim")
-        if "hidden_dim" in kwargs:
-            width = kwargs.pop("hidden_dim")
-        if "heads" in kwargs:
-            num_heads = kwargs.pop("heads")
-        if num_heads is None:
-            num_heads = max(1, width // 64)
-        if "n_global_views" in kwargs:
-            n_global = kwargs.pop("n_global_views")
-        if "n_local_views" in kwargs:
-            n_local = kwargs.pop("n_local_views")
-        if "lambda_sigreg" in kwargs:
-            lamb = kwargs.pop("lambda_sigreg")
-        if "weight" in kwargs:
-            lamb = kwargs.pop("weight")
-
-        self.n_layers = n_layers
-        self.width = width
-        self.num_heads = num_heads
-        self.mlp_ratio = mlp_ratio
-        self.patch_size = patch_size
-        self.in_channels = in_channels
-        self.dropout = dropout
-        self.attention_dropout = attention_dropout
-        self.qkv_bias = qkv_bias
-        self.use_projector = use_projector
-        self.proj_dim = proj_dim
-        self.proj_hidden = proj_hidden
-        self.proj_n_hidden = proj_n_hidden
-        self.proj_norm = proj_norm
-        self.views = views
-        self.n_global = n_global
-        self.n_local = n_local
-        self.global_scale = global_scale
-        self.local_scale = local_scale
-        self.global_size = global_size
-        self.local_size = local_size
-        self.flip = flip
-        self.token_dropout = token_dropout
-        self.batch_views = batch_views
-        self.lamb = lamb
-        self.num_slices = num_slices
-        self.sigreg_knots = sigreg_knots
-        self.sigreg_tmax = sigreg_tmax
-        self.extra = kwargs
-
-        # Sync kwargs onto self.__dict__ for direct access
-        for k, v in kwargs.items():
-            setattr(self, k, v)
-
-    @property
-    def num_layers(self) -> int:
-        return self.n_layers
-
-    @num_layers.setter
-    def num_layers(self, val: int) -> None:
-        self.n_layers = val
-
-    @property
-    def dim(self) -> int:
-        return self.width
-
-    @dim.setter
-    def dim(self, val: int) -> None:
-        self.width = val
-
-    @property
-    def embed_dim(self) -> int:
-        return self.width
-
-    @embed_dim.setter
-    def embed_dim(self, val: int) -> None:
-        self.width = val
-
-    @property
-    def heads(self) -> int:
-        return self.num_heads
-
-    @heads.setter
-    def heads(self, val: int) -> None:
-        self.num_heads = val
-
-    @property
-    def n_global_views(self) -> int:
-        return self.n_global
-
-    @n_global_views.setter
-    def n_global_views(self, val: int) -> None:
-        self.n_global = val
-
-    @property
-    def n_local_views(self) -> int:
-        return self.n_local
-
-    @n_local_views.setter
-    def n_local_views(self, val: int) -> None:
-        self.n_local = val
-
-    def to_kwargs(self) -> dict[str, Any]:
-        """Constructor kwargs that rebuild this config exactly: LejepaConfig(**cfg.to_kwargs())."""
-        return {f.name: getattr(self, f.name) for f in fields(self) if f.name != "extra"} | self.extra
-
-    def __repr__(self) -> str:
-        parts = [
-            f"n_layers={self.n_layers}",
-            f"width={self.width}",
-            f"num_heads={self.num_heads}",
-            f"patch_size={self.patch_size}",
-            f"views={self.views!r}",
-            f"lamb={self.lamb}",
-        ]
-        if self.use_projector:
-            parts.append(f"proj_dim={self.proj_dim}")
-        return f"LejepaConfig({', '.join(parts)})"
+    lamb: float = 0.02  # loss = inv + lamb * sigreg
 
 
 class Lejepa(nn.Module):
@@ -273,63 +83,13 @@ class Lejepa(nn.Module):
     view augmentations, and the SIGReg + invariance objective.
     """
 
-    def __init__(self, config: Optional[LejepaConfig] = None, **kwargs: Any):
+    def __init__(self, config: LejepaConfig | None = None, **kwargs: Any):
         super().__init__()
-        if config is None:
-            self.cfg = LejepaConfig(**kwargs)
-        elif isinstance(config, LejepaConfig):
-            self.cfg = config
-        else:
-            raise TypeError(f"config must be an instance of LejepaConfig or None, got {type(config)}")
-
-        # 3D ViT Encoder
-        self.encoder = ViT3DEncoder(
-            in_channels=self.cfg.in_channels,
-            patch_size=self.cfg.patch_size,
-            embed_dim=self.cfg.width,
-            depth=self.cfg.n_layers,
-            num_heads=self.cfg.num_heads,
-            mlp_ratio=self.cfg.mlp_ratio,
-            dropout=self.cfg.dropout,
-            attention_dropout=self.cfg.attention_dropout,
-            qkv_bias=self.cfg.qkv_bias,
-            token_dropout=self.cfg.token_dropout,
-        )
-
-        # Projection head
-        if self.cfg.use_projector:
-            self.projector = ProjectorMLP(
-                in_dim=self.cfg.width,
-                hidden_dim=self.cfg.proj_hidden,
-                out_dim=self.cfg.proj_dim,
-                n_hidden=self.cfg.proj_n_hidden,
-                norm=self.cfg.proj_norm,
-            )
-        else:
-            self.projector = None
-
-        # SIGReg module
-        self.sigreg = SIGReg(
-            num_slices=self.cfg.num_slices,
-            knots=self.cfg.sigreg_knots,
-            t_max=self.cfg.sigreg_tmax,
-        )
-
-        # View maker
-        if self.cfg.views != "none":
-            self.view_maker = ViewMaker(
-                n_global=self.cfg.n_global,
-                n_local=self.cfg.n_local,
-                global_scale=self.cfg.global_scale,
-                local_scale=self.cfg.local_scale,
-                flip=self.cfg.flip,
-                patch_size=self.encoder.patch_embed.patch_size,
-                views=self.cfg.views,
-                global_size=self.cfg.global_size,
-                local_size=self.cfg.local_size,
-            )
-        else:
-            self.view_maker = None
+        self.config = c = replace(config or LejepaConfig(), **kwargs)
+        self.encoder = ViT3DEncoder(c.encoder)
+        self.projector = ProjectorMLP(c.encoder.embed_dim, c.projector) if c.projector else None
+        self.sigreg = SIGReg(c.sigreg)
+        self.view_maker = ViewMaker(c.view, patch_size=self.encoder.patch_embed.patch_size) if c.view.views != "none" else None
 
         # For FLOP accounting in forward.
         self._n_encoder_params = sum(p.numel() for p in self.encoder.parameters())
@@ -345,9 +105,9 @@ class Lejepa(nn.Module):
     def encode_views(self, views: list[Tensor]) -> Tensor:
         """Encode and project each view (each Batch C Z Y X) -> View Batch D.
 
-        With cfg.batch_views, same-shape views are concatenated along Batch into one encoder call.
+        With config.batch_views, same-shape views are concatenated along Batch into one encoder call.
         """
-        if not self.cfg.batch_views:
+        if not self.config.batch_views:
             return torch.stack([self.encode_maybe_project(v) for v in views])
         groups: dict[tuple[int, ...], list[int]] = {}
         for i, v in enumerate(views):
@@ -389,7 +149,7 @@ class Lejepa(nn.Module):
             pass
 
         # If views are disabled or inference mode requested, return embeddings directly
-        if not return_loss or self.cfg.views == "none" or self.view_maker is None:
+        if not return_loss or self.view_maker is None:
             return self.encode_maybe_project(vol)
 
         # Generate views if not pre-provided
@@ -414,7 +174,7 @@ class Lejepa(nn.Module):
                 globals=proj_globals.float(),
                 views=proj_all.float(),
                 sigreg=self.sigreg,
-                lamb=self.cfg.lamb,
+                lamb=self.config.lamb,
             )
         # Encoder tokens this step, summed over views and batch (python int, no device sync).
         patch_vol = prod(self.encoder.patch_embed.patch_size)
@@ -422,8 +182,9 @@ class Lejepa(nn.Module):
         # Model training FLOPs this step (backward ~ 2x forward): per token, 6 x encoder params for the weights
         # plus 12 x depth x width x N for attention over its N-token view; per sample, 6 x projector params.
         # Ignores flash-attention recompute and elementwise ops, as MFU conventionally does.
+        enc = self.config.encoder
         out.n_flops = sum(
-            v.shape[0] * (n * (6 * self._n_encoder_params + 12 * self.cfg.n_layers * self.cfg.width * n) + 6 * self._n_projector_params)
+            v.shape[0] * (n * (6 * self._n_encoder_params + 12 * enc.depth * enc.embed_dim * n) + 6 * self._n_projector_params)
             for v in [*g_views, *l_views]
             for n in [prod(v.shape[2:]) // patch_vol]
         )

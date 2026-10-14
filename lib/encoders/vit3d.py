@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass, replace
 from typing import Optional, Tuple, Union
 
 import torch
@@ -187,47 +188,34 @@ class TransformerBlock(nn.Module):
         return x
 
 
+@dataclass
+class EncoderConfig:
+    """ViT3DEncoder hyperparameters."""
+    in_channels: int = 1
+    patch_size: Union[int, Tup3Int] = (8, 8, 8)
+    embed_dim: int = 512
+    depth: int = 12
+    num_heads: int = 8  # experiment.lejepa_config sets embed_dim // 64
+    mlp_ratio: float = 4.0
+    dropout: float = 0.0
+    attention_dropout: float = 0.0
+    qkv_bias: bool = True
+    token_dropout: float = 0.0
+
+
 class ViT3DEncoder(nn.Module):
     """3D Vision Transformer Encoder."""
 
-    def __init__(
-        self,
-        in_channels: int = 1,
-        patch_size: Union[int, Tup3Int] = (8, 8, 8),
-        embed_dim: int = 512,
-        depth: int = 12,
-        num_heads: int = 8,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.0,
-        attention_dropout: float = 0.0,
-        qkv_bias: bool = True,
-        token_dropout: float = 0.0,
-    ):
+    def __init__(self, config: EncoderConfig | None = None, **kwargs):
         super().__init__()
-        self.in_channels = in_channels
-        self.embed_dim = embed_dim
-        self.depth = depth
-        self.token_dropout = token_dropout
-
-        self.patch_embed = PatchEmbed3d(
-            patch_size=patch_size,
-            in_channels=in_channels,
-            embed_dim=embed_dim,
-        )
-
+        self.config = c = replace(config or EncoderConfig(), **kwargs)
+        self.patch_embed = PatchEmbed3d(patch_size=c.patch_size, in_channels=c.in_channels, embed_dim=c.embed_dim)
         self.blocks = nn.ModuleList([
-            TransformerBlock(
-                dim=embed_dim,
-                num_heads=num_heads,
-                mlp_ratio=mlp_ratio,
-                dropout=dropout,
-                attention_dropout=attention_dropout,
-                qkv_bias=qkv_bias,
-            )
-            for _ in range(depth)
+            TransformerBlock(dim=c.embed_dim, num_heads=c.num_heads, mlp_ratio=c.mlp_ratio, dropout=c.dropout,
+                             attention_dropout=c.attention_dropout, qkv_bias=c.qkv_bias)
+            for _ in range(c.depth)
         ])
-
-        self.norm = nn.LayerNorm(embed_dim)
+        self.norm = nn.LayerNorm(c.embed_dim)
 
     def forward_features(self, x: Tensor) -> Tensor:
         """Extract patch token representations.
@@ -248,7 +236,7 @@ class ViT3DEncoder(nn.Module):
         """
         tokens, grid_size = self.patch_embed(x)
         pos_embed = get_3d_sincos_pos_embed(
-            self.embed_dim,
+            self.config.embed_dim,
             grid_size,
             device=x.device,
             dtype=tokens.dtype,
@@ -256,9 +244,9 @@ class ViT3DEncoder(nn.Module):
         x = tokens + pos_embed
 
         # Token dropout (random patch token drop during training)
-        if self.training and self.token_dropout > 0.0:
+        if self.training and self.config.token_dropout > 0.0:
             B, N, C = x.shape
-            keep = max(1, int(N * (1.0 - self.token_dropout)))
+            keep = max(1, int(N * (1.0 - self.config.token_dropout)))
             indices = torch.stack([
                 torch.randperm(N, device=x.device)[:keep]
                 for _ in range(B)
@@ -278,9 +266,10 @@ class ViT3DEncoder(nn.Module):
         x: Batch C Z Y X. layer_idxs: 0-based block indices, each < depth.
         Returns (final Batch N D, [one Batch N D per layer_idxs, in that order], (Gz Gy Gx)).
         """
-        assert all(0 <= i < self.depth for i in layer_idxs), f"layer_idxs {layer_idxs} out of range for depth {self.depth}"
+        depth = self.config.depth
+        assert all(0 <= i < depth for i in layer_idxs), f"layer_idxs {layer_idxs} out of range for depth {depth}"
         tokens, grid_size = self.patch_embed(x)
-        pos_embed = get_3d_sincos_pos_embed(self.embed_dim, grid_size, device=x.device, dtype=tokens.dtype)
+        pos_embed = get_3d_sincos_pos_embed(self.config.embed_dim, grid_size, device=x.device, dtype=tokens.dtype)
         x = tokens + pos_embed
         saved: dict[int, Tensor] = {}
         for i, block in enumerate(self.blocks):

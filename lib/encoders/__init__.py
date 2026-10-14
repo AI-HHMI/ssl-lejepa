@@ -2,6 +2,7 @@
 
 from lib.encoders.vit3d import (
     Attention,
+    EncoderConfig,
     PatchEmbed3d,
     TransformerBlock,
     ViT3DEncoder,
@@ -10,6 +11,7 @@ from lib.encoders.vit3d import (
 
 __all__ = [
     "Attention",
+    "EncoderConfig",
     "PatchEmbed3d",
     "TransformerBlock",
     "ViT3DEncoder",
