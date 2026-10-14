@@ -33,6 +33,14 @@ def test_nan_and_inf_become_gaps_so_the_figure_still_parses():
     assert fig["data"][0]["y"] == [2.0, None, None, 1.0]
 
 
+def test_splom_has_one_trace_per_group_and_no_log_toggles():
+    rows = [{"run": "d0", "inv": 0.1, "sigreg": float("nan"), "ap": 0.2}]
+    frag = pi.splom({"g64": rows, "g96": rows}, ["inv", "sigreg", "ap"])
+    (fig,) = islands(frag)
+    assert [t["name"] for t in fig["data"]] == ["g64", "g96"] and fig["data"][0]["dimensions"][1] == {"label": "sigreg", "values": [None]}
+    assert "data-axis" not in frag  # the x/y toggles would only reach the first panel
+
+
 def test_bar_keeps_the_given_order_top_to_bottom():
     frag = pi.bar([("b", 2.0, "g1"), ("a", 1.0, "g2"), ("c", 3.0, "g1")], "x")
     (fig,) = islands(frag)

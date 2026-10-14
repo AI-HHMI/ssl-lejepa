@@ -335,7 +335,7 @@ class Lejepa(nn.Module):
         self._n_encoder_params = sum(p.numel() for p in self.encoder.parameters())
         self._n_projector_params = sum(p.numel() for p in self.projector.parameters()) if self.projector is not None else 0
 
-    def encode_and_project(self, x: Tensor) -> Tensor:
+    def encode_maybe_project(self, x: Tensor) -> Tensor:
         """Encode input volume and project to metric space."""
         emb = self.encoder(x)
         if self.projector:
@@ -348,13 +348,13 @@ class Lejepa(nn.Module):
         With cfg.batch_views, same-shape views are concatenated along Batch into one encoder call.
         """
         if not self.cfg.batch_views:
-            return torch.stack([self.encode_and_project(v) for v in views])
+            return torch.stack([self.encode_maybe_project(v) for v in views])
         groups: dict[tuple[int, ...], list[int]] = {}
         for i, v in enumerate(views):
             groups.setdefault(tuple(v.shape), []).append(i)
         out: list[Tensor] = [views[0]] * len(views)  # placeholders, all overwritten below
         for idx in groups.values():
-            z = self.encode_and_project(torch.cat([views[i] for i in idx]))  # (len(idx)·Batch) D
+            z = self.encode_maybe_project(torch.cat([views[i] for i in idx]))  # (len(idx)·Batch) D
             for i, zi in zip(idx, z.chunk(len(idx))):
                 out[i] = zi
         return torch.stack(out)
@@ -390,7 +390,7 @@ class Lejepa(nn.Module):
 
         # If views are disabled or inference mode requested, return embeddings directly
         if not return_loss or self.cfg.views == "none" or self.view_maker is None:
-            return self.encode_and_project(vol)
+            return self.encode_maybe_project(vol)
 
         # Generate views if not pre-provided
         if views is not None:

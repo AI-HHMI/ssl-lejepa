@@ -207,7 +207,7 @@ def figure(data: list, layout: dict, logx: bool = False, logy: bool = False) -> 
     layout["yaxis"] = {"type": "log" if logy else "linear", "gridcolor": "#eee", **layout.get("yaxis", {})}
     pid = f"iplot{next(_ids)}"
     toggles = []
-    for ax in "xy":
+    for ax in "" if any(d["type"] == "splom" for d in data) else "xy":  # a splom's axes are one per dimension
         t = layout[f"{ax}axis"]["type"]
         if t == "category":
             layout[f"{ax}axis"]["fixedrange"] = True
@@ -231,12 +231,32 @@ def scatter(groups: dict, x: str, y: str, hlines: dict | None = None, logx: bool
     return figure(data, {"shapes": shapes, "xaxis": {"title": x}, "yaxis": {"title": y}}, logx=logx, logy=logy)
 
 
+def splom(groups: dict, dims: list) -> str:
+    """A scatter matrix of every pair of dims (lower triangle). groups: label -> rows, dicts holding every dim; all of a
+    row's fields show in its point's tooltip. Box-select in one panel highlights the same points in all."""
+    data = [{"type": "splom", "name": label, "dimensions": [{"label": d, "values": [r[d] for r in rows]} for d in dims],
+             "text": [tooltip(r) for r in rows], "hovertemplate": "%{text}<extra></extra>",
+             "diagonal": {"visible": False}, "showupperhalf": False, "marker": {"color": c, "size": 6, "opacity": 0.75}}
+            for (label, rows), c in zip(groups.items(), itertools.cycle(COLORS))]
+    return figure(data, {"height": 170 * (len(dims) - 1) + 80, "dragmode": "select"})
+
+
 def lines(series: dict, xlabel: str, ylabel: str, logx: bool = False, logy: bool = False) -> str:
     """series: label -> (xs, ys), one line each. The tooltip lists every line's value at the hovered x."""
     data = [{"type": "scatter", "mode": "lines+markers", "marker": {"size": 5}, "name": label, "x": list(xs), "y": list(ys), "line": {"color": c, "width": 1.8},
              "hovertemplate": "%{y:.4g}"}
             for (label, (xs, ys)), c in zip(series.items(), itertools.cycle(COLORS))]
     return figure(data, {"hovermode": "x unified", "xaxis": {"title": xlabel}, "yaxis": {"title": ylabel}}, logx=logx, logy=logy)
+
+
+def heatmap(z: dict, xs: list, ys: list, xlabel: str, ylabel: str, zrange: tuple) -> str:
+    """z: (x, y) -> value, drawn as colour (and printed in the cell) on a grid of categories xs (left to right) and ys
+    (bottom to top); a cell z lacks is blank. zrange: the colour scale's (min, max), shared by the figures to compare."""
+    rows = [[z.get((x, y)) for x in xs] for y in ys]
+    data = [{"type": "heatmap", "x": [str(x) for x in xs], "y": [str(y) for y in ys], "z": rows, "zmin": zrange[0], "zmax": zrange[1],
+             "colorscale": "Viridis", "xgap": 2, "ygap": 2, "texttemplate": "%{z:.3f}",
+             "hovertemplate": f"{html.escape(xlabel)} %{{x}}, {html.escape(ylabel)} %{{y}}: %{{z:.4g}}<extra></extra>"}]
+    return figure(data, {"height": 300, "xaxis": {"type": "category", "title": xlabel}, "yaxis": {"type": "category", "title": ylabel}})
 
 
 def bar(rows: list, xlabel: str, stack: bool = False) -> str:
