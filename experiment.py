@@ -167,6 +167,11 @@ EXPERIMENT = "e00/e01-viewsizes-2d"
 def submit(n):
     runlsf(n)
 
+# submitall() submits only these trunks (None: every trunk). The first submitall ran d0-d9: d0-d2 and d4-d6 finished and d7,
+# d8 are still running; d3 hit max_hours at step 34090 (a cap too low: see paramsall) so its last two anneals never spawned, and
+# d9 ran out of memory at batch 32. A relaunched trunk restarts at step 0, so all its anneals respawn (the old ones are trashed).
+RELAUNCH: list[int] | None = [3, 9]
+
 def paramsall():
     # View sizes on a 2D grid, input patch x global view, with local view = global view: viewsizes-v2's best config was
     # local = global (d12: input 128, global 96, local 96; short AP 0.180 and 0.173 over its two repeats, vs 0.137 and 0.126
@@ -175,8 +180,10 @@ def paramsall():
     # diagonal: 4 + 3 + 2 + 1 trunks. Everything else is viewsizes-v2's stack at m (12x512), one B300 each.
     # BATCH is fixed across cells (SIGReg's pull depends on it): viewsizes-v2/d16 (256, 192, 128) fit b44 on a B300 at ~44k
     # tokens per sample (2 x 24^3 + 4 x 16^3); the largest cell here is 6 x 20^3 = 48k, so 32 leaves ~20% headroom (an
-    # estimate; the g=160 trunk's performance.json has the real memory). max_hours is scaling-law's 2x safety cap on
-    # step_seconds' estimate, not the stop: the trunk runs STEPS steps, so its milestones (every 4k) are all reached.
+    # estimate): 192/160 OOM'd at 32 (267 GiB in use), so it runs at 16, the one cell off BATCH. max_hours is scaling-law's
+    # 2x safety cap on step_seconds' estimate, not the stop: the trunk runs STEPS steps, so its milestones (every 4k) are all
+    # reached. The estimate ignores the input patch's read cost, which dominates at g=64 (192/64 needed 1.35 h for an estimated
+    # 0.62 h; g>=96 ran within 1.15x), so the cap has a 2 h floor.
     BATCH, STEPS = 32, 40_000
     trunks = []
     for g in [64, 96, 128, 160]:
@@ -190,9 +197,9 @@ def paramsall():
             p.patch_size = (inp, inp, inp)
             p.global_size = (g, g, g)
             p.local_size = (g, g, g)
-            p.batch_size = BATCH
+            p.batch_size = 16 if g == 160 else BATCH
             p.steps_per_epoch = STEPS
-            p.max_hours = 2 * STEPS * step_seconds("m", BATCH, ((2, (g // 8) ** 3), (4, (g // 8) ** 3))) / 3600
+            p.max_hours = max(2.0, 2 * STEPS * step_seconds("m", p.batch_size, ((2, (g // 8) ** 3), (4, (g // 8) ** 3))) / 3600)
             p.weight_decay = 0.05
             p.adam_beta2 = 0.95
             p.cudagraphs = True
@@ -1054,7 +1061,9 @@ def check_experiment():
 def submitall():
     check_experiment()
     for i, p in enumerate(paramsall()):
-        if not p.anneal_from:  # an anneal is submitted by its trunk as it saves the milestone (spawn_branches; spawnall redoes it)
+        b1 = not p.anneal_from  # an anneal is submitted by its trunk as it saves the milestone (spawn_branches; spawnall redoes it)
+        b2 = RELAUNCH is None or i in RELAUNCH
+        if b1 and b2:
             submit(i)
 
 

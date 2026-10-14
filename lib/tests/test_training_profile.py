@@ -207,13 +207,30 @@ def test_trunk_spawns_each_milestones_anneal_as_it_saves_it(tmp_path, monkeypatc
     assert done["step"] == 117 and done["opt"]["state"][0]["step"] == 1170 + 117  # Adam's step count carried over
 
 
+@pytest.fixture(autouse=True)
+def submit_every_trunk(monkeypatch):
+    monkeypatch.setattr(experiment, "RELAUNCH", None)
+
+
+def test_submitall_relaunches_only_the_listed_trunks(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    submitted = []
+    monkeypatch.setattr(experiment, "RELAUNCH", [3, 9])
+    monkeypatch.setattr(experiment, "submit", lambda n: submitted.append(n))
+    experiment.submitall()
+    assert submitted == [3, 9]
+    p = experiment.paramsall()
+    assert [(p[i].batch_size, p[i].max_hours > 2) for i in (3, 9)] == [(32, False), (16, True)]  # 192/64 gets the floor, 192/160 b16
+    assert [round(p[i].max_hours, 2) for i in (4, 5, 6, 7, 8)] == [5.63, 5.63, 5.63, 19.89, 19.89]  # the finished and still-running trunks' caps
+
+
 def test_paramsall_is_the_viewsizes_grid_and_each_trunks_ten_anneals(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     params = experiment.paramsall()
     trunks, anneals = params[:10], params[10:]
     assert [p.anneal_from for p in trunks] == [""] * 10 and all(p.anneal_from for p in anneals) and len(anneals) == 100
     assert sorted((p.patch_size[0], p.global_size[0]) for p in trunks) == sorted((i, g) for g in [64, 96, 128, 160] for i in [96, 128, 160, 192] if i > g)
-    assert all(p.local_size == p.global_size and p.batch_size == 32 and p.steps_per_epoch == 40_000 for p in trunks)
+    assert all(p.local_size == p.global_size and p.batch_size == (16 if p.global_size[0] == 160 else 32) and p.steps_per_epoch == 40_000 for p in trunks)
     for t, branches in zip(trunks, [anneals[k:k + 10] for k in range(0, 100, 10)]):  # each trunk's anneals, one per milestone, the 10th too
         assert [Path(b.anneal_from).name for b in branches] == [f"step_{s:07d}.pt" for s in range(4000, 40_001, 4000)]
         assert all(Path(b.anneal_from).parent == Path(t.savedir) / "checkpoints/milestones" for b in branches)
