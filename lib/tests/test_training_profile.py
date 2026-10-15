@@ -2,6 +2,7 @@
 
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -164,6 +165,7 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
 
 def test_trunk_spawns_each_milestones_anneal_as_it_saves_it(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(experiment, "ANNEAL", True)
     monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")
     src = experiment.Params(
         savedir="outdir/e00/e01-test/d0/", patch_size=(8, 8, 8), batch_size=2, steps_per_epoch=1300, max_hours=1.0,  # past LR_WARMUP
@@ -208,6 +210,40 @@ def test_trunk_spawns_each_milestones_anneal_as_it_saves_it(tmp_path, monkeypatc
     assert done["step"] == 117 and done["opt"]["state"][0]["step"] == 1170 + 117  # Adam's step count carried over
 
 
+def test_trunk_spawns_each_milestones_eval_when_not_annealing(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")
+    monkeypatch.setattr(experiment, "ANNEAL", False)
+    src = experiment.Params(
+        savedir="outdir/e00/e01-test/d0/", patch_size=(8, 8, 8), batch_size=2, steps_per_epoch=1300, max_hours=1.0,
+        warmup_steps=1, benchmark_steps=2, profile_steps=0, n_workers=1, defer_image_ops=False, compile=False,
+    )
+    params = experiment.with_branches([src])
+    assert len(params) == 11 and all(p.steps_per_epoch == 1300 and not p.anneal_from and p.init_from.endswith(".pt") for p in params[1:])
+    patch_experiment(monkeypatch, tmp_path, src)
+    monkeypatch.setattr(experiment, "paramsall", lambda: params)
+    Path(src.savedir).mkdir(parents=True)
+    submitted = []
+    monkeypatch.setattr(experiment, "bsub", lambda par, job, minutes, n_gpus, cmd, **kw: submitted.append((par.savedir, job, n_gpus, Path(par.init_from).is_file())))
+    experiment.train(0)
+
+    assert [(d, job) for d, job, _, _ in submitted] == [(f"outdir/e00/e01-test/d{j}/", job) for j in range(1, 11) for job in ("pca", "probe")]
+    assert all(gpus == 1 and saved for _, _, gpus, saved in submitted)  # one GPU each, after the checkpoint was written
+    assert not any(Path(p.savedir, "metrics.json").exists() for p in params[1:])  # nothing trained: the trunk's weights, as saved
+
+
+def test_load_checkpoint_reads_a_milestone_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    par = experiment.Params(patch_size=(8, 8, 8), views="displace", global_size=(8, 8, 8))
+    monkeypatch.setattr(experiment, "lejepa_config", lambda par: LejepaConfig(
+        encoder=EncoderConfig(depth=1, embed_dim=16, num_heads=2, patch_size=(4, 4, 4)), projector=ProjectorConfig(dim=8, hidden=16)))
+    model = Lejepa(experiment.lejepa_config(par))
+    path = tmp_path / "step_0000130.pt"
+    torch.save({"step": 130, "model": model.state_dict()}, path)
+    loaded, step = experiment.load_checkpoint(replace(par, init_from=str(path)))
+    assert step == 130 and torch.equal(loaded.encoder.blocks[0].attn.qkv.weight.cpu(), model.encoder.blocks[0].attn.qkv.weight)
+
+
 @pytest.fixture(autouse=True)
 def submit_every_trunk(monkeypatch):
     monkeypatch.setattr(experiment, "RELAUNCH", None)
@@ -220,8 +256,6 @@ def test_submitall_relaunches_only_the_listed_trunks(tmp_path, monkeypatch):
     monkeypatch.setattr(experiment, "submit", lambda n: submitted.append(n))
     experiment.submitall()
     assert submitted == [3, 9]
-    p = experiment.paramsall()
-    assert [(p[i].batch_size, p[i].max_hours > 2) for i in (3, 9)] == [(32, False), (16, True)]  # 192/64 gets the floor, 192/160 b16
 
 
 def test_lejepa_config_takes_the_mask_block_and_lamb_from_params():
@@ -229,45 +263,49 @@ def test_lejepa_config_takes_the_mask_block_and_lamb_from_params():
     assert config.mask.block == 0.45 and config.lamb == 0.02
 
 
-def test_paramsall_is_the_viewsizes_grid_and_each_trunks_ten_anneals(tmp_path, monkeypatch):
+@pytest.mark.parametrize("anneal", [False, True])
+def test_paramsall_is_the_trunks_then_each_ones_ten_branches(tmp_path, monkeypatch, anneal):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(experiment, "ANNEAL", anneal)
     params = experiment.paramsall()
-    trunks, anneals = params[:10], params[10:]
-    assert [p.anneal_from for p in trunks] == [""] * 10 and all(p.anneal_from for p in anneals) and len(anneals) == 100
-    assert sorted((p.patch_size[0], p.global_size[0]) for p in trunks) == sorted((i, g) for g in [64, 96, 128, 160] for i in [96, 128, 160, 192] if i > g)
-    assert all(p.local_size == p.global_size and p.batch_size == (16 if p.global_size[0] == 160 else 32) and p.steps_per_epoch == 40_000 for p in trunks)
-    for t, branches in zip(trunks, [anneals[k:k + 10] for k in range(0, 100, 10)]):  # each trunk's anneals, one per milestone, the 10th too
-        assert [Path(b.anneal_from).name for b in branches] == [f"step_{s:07d}.pt" for s in range(4000, 40_001, 4000)]
-        assert all(Path(b.anneal_from).parent == Path(t.savedir) / "checkpoints/milestones" for b in branches)
-        assert all((b.global_size, b.patch_size, b.decoder) == (t.global_size, t.patch_size, "linear") for b in branches)
-    assert [p.savedir for p in params] == [f"outdir/{experiment.EXPERIMENT}/d{j}/" for j in range(110)]
+    trunks = [p for p in params if not experiment.milestone_of(p)]
+    branches = params[len(trunks):]
+    assert params[:len(trunks)] == trunks and len(branches) == 10 * len(trunks) and all(experiment.milestone_of(p) for p in branches)
+    assert all(bool(b.anneal_from) == anneal and bool(b.init_from) != anneal for b in branches)  # the toggle picks the kind
+    for t, mine in zip(trunks, [branches[k:k + 10] for k in range(0, len(branches), 10)]):  # each trunk's branches, one per milestone, the 10th too
+        sources = [Path(experiment.milestone_of(b)) for b in mine]
+        assert [s.name for s in sources] == [f"step_{s:07d}.pt" for s in experiment.milestone_steps(t)] and len(sources) == 10
+        assert all(s.parent == Path(t.savedir) / "checkpoints/milestones" for s in sources)
+        assert all((b.global_size, b.patch_size, b.mask_block, b.lamb, b.decoder) == (t.global_size, t.patch_size, t.mask_block, t.lamb, "linear") for b in mine)
+        assert [b.steps_per_epoch for b in mine] == ([s // 10 for s in experiment.milestone_steps(t)] if anneal else [t.steps_per_epoch] * 10)
+    assert [p.savedir for p in params] == [f"outdir/{experiment.EXPERIMENT}/d{j}/" for j in range(len(params))]
     experiment.check_experiment()
 
 
-def test_spawnall_submits_only_the_missed_anneals(tmp_path, monkeypatch):
+def test_spawnall_submits_only_the_missed_branches(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")
     params = experiment.with_branches([experiment.Params(savedir="outdir/e00/e01-test/d0/", steps_per_epoch=1000)])
     submitted = []
     monkeypatch.setattr(experiment, "paramsall", lambda: params)
     monkeypatch.setattr(experiment, "assert_committed", lambda: None)
-    monkeypatch.setattr(experiment, "submit_run", lambda j: submitted.append(j))
+    monkeypatch.setattr(experiment, "submit_branch", lambda j: submitted.append(j))
     for j in (1, 2, 3):  # milestones saved
-        Path(params[j].anneal_from).parent.mkdir(parents=True, exist_ok=True)
-        Path(params[j].anneal_from).touch()
+        Path(experiment.milestone_of(params[j])).parent.mkdir(parents=True, exist_ok=True)
+        Path(experiment.milestone_of(params[j])).touch()
     Path(params[2].savedir).mkdir(parents=True)  # d2 was submitted
     experiment.spawnall()
     assert submitted == [1, 3]
 
 
-def test_submitall_leaves_the_anneals_to_their_trunks(tmp_path, monkeypatch):
+def test_submitall_leaves_the_branches_to_their_trunks(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")
     params = experiment.with_branches([experiment.Params(savedir="outdir/e00/e01-test/d0/", steps_per_epoch=1000)])
     submitted = []
     monkeypatch.setattr(experiment, "paramsall", lambda: params)
     monkeypatch.setattr(experiment, "submit", lambda n: submitted.append(n))
-    experiment.submitall()  # its anneals read their own sweep's trunk: not a dependency on another experiment
+    experiment.submitall()  # its branches read their own sweep's trunk: not a dependency on another experiment
     assert submitted == [0]
 
 
@@ -280,6 +318,26 @@ def test_run_trains_then_evals_training_runs_only(monkeypatch, max_hours, evals)
     monkeypatch.delenv("RANK", raising=False)
     experiment.run(0)
     assert calls == ["train", *evals]  # evals after train() has torn down the process group, benchmarks skip them
+
+
+@pytest.mark.parametrize("anneal", [False, True])
+def test_a_trunk_skips_its_own_eval(tmp_path, monkeypatch, anneal):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")
+    monkeypatch.setattr(experiment, "ANNEAL", anneal)
+    params = experiment.with_branches([experiment.Params(savedir="outdir/e00/e01-test/d0/", steps_per_epoch=1000, max_hours=1.0)])
+    monkeypatch.setattr(experiment, "paramsall", lambda: params)
+    monkeypatch.delenv("RANK", raising=False)
+    calls = []
+    for fn in ["train", "pca", "probe"]:
+        monkeypatch.setattr(experiment, fn, lambda n, fn=fn: calls.append(fn))
+    assert experiment.has_branches(params[0]) and not experiment.has_branches(params[1])
+    experiment.run(0)
+    assert calls == ["train"]  # its branches evaluate its milestones
+    if anneal:  # an anneal is a run of its own, and evaluates itself
+        calls.clear()
+        experiment.run(1)
+        assert calls == ["train", "pca", "probe"]
 
 
 def test_runlsf_refuses_probe_only_runs(tmp_path, monkeypatch):

@@ -152,7 +152,7 @@ class Params:
                            # lr cosine-decaying from the checkpoint's lr to 1% of it; run() then evals the result (pca, probe)
 
     # evals
-    init_from: str = ""  # weights pca/probe evaluate: "" this run's checkpoint; a run dir, its latest one; "random" untrained
+    init_from: str = ""  # weights pca/probe evaluate: "" this run's checkpoint; a run dir, its latest one; a checkpoint .pt; "random" untrained
     decoder: Decoder = "linear"  # probe(): "linear" (per-token Linear, lib.probe.fit_probe) or "unetr" (lib.decoders.unetr)
     unetr_hidden_dim: int = 64  # decoder="unetr": its decoder channel width (lib.decoders.unetr.UnetrConfig)
     unetr_steps: int = 3000  # decoder="unetr": fit_unetr training steps (fit_probe's STEPS, for comparison)
@@ -175,6 +175,11 @@ def submit(n):
 # d8 are still running; d3 hit max_hours at step 34090 (a cap too low: see paramsall) so its last two anneals never spawned, and
 # d9 ran out of memory at batch 32. A relaunched trunk restarts at step 0, so all its anneals respawn (the old ones are trashed).
 RELAUNCH: list[int] | None = [3, 9]
+
+# What each trunk milestone gets (with_branches), all on one GPU: True, an anneal (anneal_params: a training job of 10% of the
+# milestone's steps, hours at the largest milestones, and run() evaluates the result), or False, an eval of the milestone as
+# saved (eval_params: pca and probe, two short jobs of minutes: e01's took 7-32 s and 2.5 min once warm). The only toggle.
+ANNEAL = True
 
 def paramsall():
     # View sizes on a 2D grid, input patch x global view, with local view = global view: viewsizes-v2's best config was
@@ -227,13 +232,28 @@ def anneal_params(i: int, trunk: Params, step: int) -> Params:
                    anneal_from=str(Path(trunk.savedir) / "checkpoints/milestones" / f"step_{step:07d}.pt"), decoder="linear",
                    benchmark_steps=0, profile_steps=0)  # the trunk's throughput and trace say it all
 
+def eval_params(i: int, trunk: Params, step: int) -> Params:
+    """Params of the eval of `trunk`'s milestone at `step`: pca maps and the linear probe (pca, probe) of that checkpoint as
+    saved, not annealed, in outdir/<EXPERIMENT>/d<i>/. Everything else is the trunk's own. The checkpoint need not exist yet."""
+    assert step in milestone_steps(trunk), f"step {step} is not a milestone of {trunk.savedir}: {milestone_steps(trunk)}"
+    return replace(trunk, savedir=f"outdir/{EXPERIMENT}/d{i}/", decoder="linear", benchmark_steps=0, profile_steps=0,
+                   init_from=str(Path(trunk.savedir) / "checkpoints/milestones" / f"step_{step:07d}.pt"))
+
+def milestone_of(p: Params) -> str:
+    """The milestone checkpoint of this experiment's own trunk that a branch (with_branches) starts from, the one it anneals or
+    evaluates; "" for a trunk, and for an eval-only run of another experiment's weights (init_from outside outdir/<EXPERIMENT>/)."""
+    source = p.anneal_from or p.init_from
+    return source if source.startswith(f"outdir/{EXPERIMENT}/") else ""
+
 def with_branches(trunks: list[Params]) -> list[Params]:
-    """paramsall() for a trunk sweep: the trunks, then one anneal per milestone of each. A trunk submits its milestone's
-    anneal itself, the moment it saves it (spawn_branches); submitall() submits only the trunks."""
+    """paramsall() for a trunk sweep: the trunks, then one branch per milestone of each: an anneal if ANNEAL, else an eval.
+    A trunk submits its milestone's branch itself, the moment it saves it (spawn_branches); submitall() submits only the
+    trunks."""
+    branch = anneal_params if ANNEAL else eval_params
     params = list(trunks)
     for t in trunks:
         for step in milestone_steps(t):
-            params.append(anneal_params(len(params), t, step))
+            params.append(branch(len(params), t, step))
     return params
 
 def printparams():
@@ -539,15 +559,22 @@ def train(n:int):
     if world_size > 1:
         dist.destroy_process_group()
 
+def has_branches(par: Params) -> bool:
+    """Whether paramsall() has an entry (with_branches) that starts from one of par's milestones: par is a trunk."""
+    milestones = str(Path(par.savedir) / "checkpoints/milestones")
+    return any(milestone_of(p).startswith(milestones) for p in paramsall())
+
 def run(n:int):
     """The LSF job: train paramsall()[n], then rank 0 evaluates its last finite checkpoint (pca, probe).
 
     Evals run after train() has destroyed the process group, so the other ranks exit instead of waiting at a
-    collective for minutes; they only run for training runs (max_hours > 0), not throughput benchmarks.
+    collective for minutes; they only run for training runs (max_hours > 0), not throughput benchmarks, and not for a
+    trunk: its branches evaluate its milestones (so a trunk that max_hours stops between two is not evaluated at its end).
     """
     train(n)
+    par = paramsall()[n]
     b1 = int(os.environ.get("RANK", 0)) == 0
-    b2 = bool(paramsall()[n].max_hours)
+    b2 = bool(par.max_hours) and not has_branches(par)
     if b1 and b2:
         pca(n)
         probe(n)
@@ -634,7 +661,7 @@ def load_checkpoint(par: Params):
         torch.manual_seed(0)
         return Lejepa(lejepa_config(par)).to(device).eval(), 0
     src = Path(par.init_from or par.savedir)
-    paths = sorted((src / "checkpoints").glob("step_*.pt")) or sorted(src.glob("checkpoint.pt"))
+    paths = [src] if src.suffix == ".pt" else sorted((src / "checkpoints").glob("step_*.pt")) or sorted(src.glob("checkpoint.pt"))
     assert paths, f"no checkpoints in {src}"
     ckpt = torch.load(paths[-1], map_location="cpu", weights_only=False)
     if not par.init_from:
@@ -975,23 +1002,36 @@ def submit_run(n:int):
     minutes = int(par.max_hours * 60) + 60 if par.max_hours else 15  # slack: startup, final checkpoint, pca + probe
     bsub(par, "run", minutes, par.n_gpus, f"torchrun --standalone --nproc_per_node={par.n_gpus} {{code}}/experiment.py run {n}")
 
+def submit_eval(n:int):
+    """pca(n) and probe(n) as two LSF jobs, in a fresh savedir (old contents -> outdir/.trash/), for an eval branch (its weights
+    are par.init_from). No commit check: a trunk's job submits it (spawn_branches), and its own code is already committed."""
+    par:Params = paramsall()[n]
+    assert par.init_from, f"{par.savedir}: no init_from: nothing for an eval to read"
+    trash(par.savedir)
+    bsub(par, "pca", 30, 1, f"python {{code}}/experiment.py pca {n}")
+    bsub(par, "probe", 60, 1, f"python {{code}}/experiment.py probe {n}")
+
+def submit_branch(n:int):
+    """Submit paramsall()[n], a branch (with_branches): an anneal is a training run (which evals itself after), an eval is two jobs."""
+    (submit_run if paramsall()[n].anneal_from else submit_eval)(n)
+
 def spawn_branches(milestone: Path):
-    """Submit the paramsall() entries (with_branches) that anneal `milestone`, which the trunk just saved. The trunk is
+    """Submit the paramsall() entries (with_branches) that start from `milestone`, which the trunk just saved. The trunk is
     hours in, so a submit that fails must not kill it: it prints ERR, and spawnall() redoes what was missed."""
     for j, p in enumerate(paramsall()):
-        if p.anneal_from == str(milestone):
+        if milestone_of(p) == str(milestone):
             try:
-                submit_run(j)
+                submit_branch(j)
             except Exception as err:
-                print(f"ERR: could not submit the anneal of {milestone} (d{j}): {err!r}", flush=True)
+                print(f"ERR: could not submit the branch of {milestone} (d{j}): {err!r}", flush=True)
 
 def spawnall():
-    """Recovery for spawn_branches: submit every anneal whose milestone exists but which has no savedir yet, i.e. was
-    never submitted (its trunk's submit failed, or the trunk died right after saving it)."""
+    """Recovery for spawn_branches: submit every branch whose milestone exists but which has no savedir yet, i.e. was never
+    submitted (its trunk's submit failed, or the trunk died right after saving it)."""
     assert_committed()
     for j, p in enumerate(paramsall()):
-        if p.anneal_from and Path(p.anneal_from).is_file() and not Path(p.savedir).exists():
-            submit_run(j)
+        if milestone_of(p) and Path(milestone_of(p)).is_file() and not Path(p.savedir).exists():
+            submit_branch(j)
 
 def pcalsf(n:int):
     """Redo pca(n) on LSF, e.g. after changing pca_maps in this experiment's change (run() already does it once)."""
@@ -1059,7 +1099,7 @@ def check_experiment():
 def submitall():
     check_experiment()
     for i, p in enumerate(paramsall()):
-        b1 = not p.anneal_from  # an anneal is submitted by its trunk as it saves the milestone (spawn_branches; spawnall redoes it)
+        b1 = not milestone_of(p)  # a branch is submitted by its trunk as it saves the milestone (spawn_branches; spawnall redoes it)
         b2 = RELAUNCH is None or i in RELAUNCH
         if b1 and b2:
             submit(i)
