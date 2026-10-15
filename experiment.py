@@ -21,7 +21,7 @@ from lib.data import HEMIBRAIN_EB, HEMIBRAIN_EB_LABELS, HEMIBRAIN_EB_PROBE_ANNOT
 from lib.benchmark import Benchmark
 from lib.losses import LejepaOutput
 from lib.encoders import EncoderConfig
-from lib.models import Lejepa, LejepaConfig, train_flops
+from lib.models import Lejepa, LejepaConfig, MaskConfig, train_flops
 from lib.views import ViewConfig, ViewMaker
 from lib.util import *
 from lib.types import *
@@ -68,7 +68,6 @@ SCALING_BATCH = 64  # per GPU, fixed across sizes (== gpu_b300's validated defau
 ANCHOR_STEP_S_M_B84 = 0.32  # cudagraph-fix/d3: 1425 ktok/s at b84, flash + eager-pe cudagraphs (m: n_layers=12, width=512).
 # Measured on the multi-view objective (2 global + 4 local views, about 5.5k token-passes per sample); the masked-token objective
 # costs about the same by FLOPs (sample_flops) but has no measurement of its own yet.
-SIGREG_PULL = 3.2  # lamb x SIGReg samples: lejepa_config's lamb 0.1 at 32 per-view samples
 SCALING_GRID = (12, 12, 12)  # token grid of the view cost estimates assume (a 96^3 view at patch 8)
 BUDGET_HOURS_AT_M = {"c1": 1, "c2": 2, "c3": 4, "c4": 8}  # m's wall-clock at each budget; other sizes get more/fewer steps
 
@@ -128,6 +127,10 @@ class Params:
     views: Views = "basic"  # the one crop each sample trains on: 'basic' (a random scale) or 'displace' (global_size)
     global_size: Tup3Int = (88, 88, 88)  # displace only
     local_size: Tup3Int = (56, 56, 56)  # unused: no local views since the masked-token objective (analysis_utils reads it)
+    mask_block: float = 0.6  # the masked cube's side as a fraction of the view's token grid side (lib.models.MaskConfig.block)
+    # loss = prediction error + lamb x SIGReg. SIGReg's pull is lamb x its sample count (its statistic is N x an empirical-CF
+    # distance) and it sees each view's N tokens: the old lamb 0.1 over 32 batch samples (a pull of 3.2) is 0.002 at 12^3 tokens.
+    lamb: float = 0.002
 
     # optimizations
     f32mode: F32Mode = "high"
@@ -254,9 +257,8 @@ def lejepa_config(par: Params):
     return LejepaConfig(
         encoder = EncoderConfig(depth=par.n_layers, embed_dim=par.width, num_heads=par.width // 64),
         view = ViewConfig(views=par.views, global_size=par.global_size),
-        # SIGReg's pull is lamb x its sample count (its statistic is N x an empirical-CF distance), and it now sees each view's
-        # tokens, not a batch of 32: lamb = PULL / tokens keeps the old lamb 0.1 x 32 samples. Untuned for this objective.
-        lamb = SIGREG_PULL / math.prod(g // p for g, p in zip(par.global_size, EncoderConfig().patch_size)),
+        mask = MaskConfig(block=par.mask_block),
+        lamb = par.lamb,
     )
 
 def compile_model(model: Lejepa, par: Params):

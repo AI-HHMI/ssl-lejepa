@@ -224,6 +224,11 @@ def test_submitall_relaunches_only_the_listed_trunks(tmp_path, monkeypatch):
     assert [(p[i].batch_size, p[i].max_hours > 2) for i in (3, 9)] == [(32, False), (16, True)]  # 192/64 gets the floor, 192/160 b16
 
 
+def test_lejepa_config_takes_the_mask_block_and_lamb_from_params():
+    config = experiment.lejepa_config(experiment.Params(mask_block=0.45, lamb=0.02))
+    assert config.mask.block == 0.45 and config.lamb == 0.02
+
+
 def test_paramsall_is_the_viewsizes_grid_and_each_trunks_ten_anneals(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     params = experiment.paramsall()
