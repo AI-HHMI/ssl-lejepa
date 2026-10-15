@@ -92,7 +92,7 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
         return model
 
     monkeypatch.setattr(experiment, "Lejepa", small_model)
-    experiment.run(params)
+    experiment.train(params)
 
     assert consumed == list(range(n_steps * params.batch_size))
     metrics = [json.loads(line) for line in (tmp_path / "metrics.json").read_text().splitlines()]
@@ -147,7 +147,7 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
             return out
 
     monkeypatch.setattr(experiment, "Lejepa", PoisonedStep)
-    experiment.run(params)
+    experiment.train(params)
 
     metrics = [json.loads(line) for line in (run / "metrics.json").read_text().splitlines()]
     assert metrics[-1]["idx_step"] == 5 and metrics[-1]["skipped"] == 1  # training continued past the bad step
@@ -357,14 +357,30 @@ def test_reconcile_submits_only_whats_missing(tmp_path, monkeypatch):
     assert started == [experiment.branch(trunk, 100), experiment.branch(trunk, 300), other]
 
 
-@pytest.mark.parametrize("max_hours,evals", [(0.0, []), (1.0, ["pca", "probe"])])
-def test_run_trains_then_evals_training_runs_only(monkeypatch, max_hours, evals):
+@pytest.mark.parametrize("max_hours", [0.0, 1.0])
+def test_run_trains_then_evals(tmp_path, monkeypatch, max_hours):
+    monkeypatch.chdir(tmp_path)
     calls = []
     for fn in ["train", "pca", "probe"]:
         monkeypatch.setattr(experiment, fn, lambda job, fn=fn: calls.append(fn))
     monkeypatch.delenv("RANK", raising=False)
     experiment.run(experiment.Train(max_hours=max_hours))
-    assert calls == ["train", *evals]  # evals after train() has torn down the process group, benchmarks skip them
+    assert calls == ["train", "pca", "probe"]  # evals after train() has torn down the process group; a benchmark is its own entrypoint
+
+
+def test_benchmark_times_and_profiles_the_training_step_only(tmp_path, monkeypatch):
+    params = experiment.Train(
+        savedir=str(tmp_path), patch_size=(8, 8, 8), batch_size=2, steps_per_epoch=1000, max_hours=1.0,
+        warmup_steps=1, benchmark_steps=2, profile_steps=2, n_workers=1, defer_image_ops=False,
+    )
+    patch_experiment(monkeypatch, tmp_path, params)
+    experiment.benchmark(params)
+    performance = json.loads((tmp_path / "performance.json").read_text())
+    assert performance["steps"] == 2 and performance["samples_per_second"] > 0
+    assert (tmp_path / "profile.json").is_file() and (tmp_path / "trace_summary.json").is_file()
+    assert not (tmp_path / "metrics.json").exists() and not (tmp_path / "checkpoints").exists()  # not a training run
+    runs = [json.loads(l) for l in (tmp_path / "runs.json").read_text().splitlines()]
+    assert [r["fn"] for r in runs] == ["benchmark"] and runs[0]["params"]["steps_per_epoch"] == 1 + 2 + 1 + 2  # its windows only
 
 
 def test_milestones_are_every_n_steps_or_every_tenth():

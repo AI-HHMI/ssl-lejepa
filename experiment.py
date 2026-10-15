@@ -67,6 +67,12 @@ SCORE_CONFIG = "mia_evals/gary_comparison_neuron_instance/mws.toml"  # ours: tru
 # score() runs mia-evals from this sister checkout, with its own .venv (`uv sync` there) and its own commit, which
 # mia-evals records in each score's provenance (mia_evals_commit). Not a dependency of this repo.
 MIA_EVALS = Path.home() / "proj/mia-evals"
+# Training (train): the lr schedule (a trunk's linear warmup steps; an anneal's cosine ends at LR_FLOOR x the checkpoint's lr),
+# the max global grad norm, checkpoints (every CHECKPOINT_EVERY steps, ~15 min at 8 GPUs; the newest CHECKPOINT_KEEP kept), and
+# steps whose gradient is non-finite (skipped, not applied: the run stops after MAX_SKIPPED; the first BAD_BATCHES_KEPT dumped).
+LR_WARMUP, LR_FLOOR, GRAD_CLIP = 1000, 0.01, 1.0
+CHECKPOINT_EVERY, CHECKPOINT_KEEP = 2000, 1
+MAX_SKIPPED, BAD_BATCHES_KEPT = 100, 2
 N_PARAMS_CACHE = Path(".cache/lejepa_n_params.json")  # machine-local (gitignored): see lejepa_n_params
 # Model sizes and compute budgets of e00/scaling-law's IsoFLOP grid (scaling_budgets), for designing size x budget sweeps.
 SIZES = {"xs": (4, 256), "s": (6, 384), "m": (12, 512), "l": (16, 768), "xl": (24, 1024)}  # (n_layers, width); m = Train' default
@@ -177,6 +183,21 @@ class Eval:
     unetr_steps: int = 3000  # decoder="unetr": fit_unetr training steps (fit_probe's STEPS, for comparison)
     unetr_freeze_encoder: bool = True  # decoder="unetr": keep the encoder frozen while fitting it (fair vs. the linear probe)
     score: bool = False  # probe() also writes the affinity artifacts `score` reads (probe/{fit,test}, GBs each; score deletes them after)
+
+@dataclass(slots=True)
+class Rank:
+    """This process's place in a training job's DDP run (setup: torchrun's environment); a plain process is rank 0 of 1."""
+    rank: int
+    world: int
+    local: int  # the GPU on this node
+
+    @property
+    def rank0(self) -> bool:
+        return self.rank == 0
+
+    def device(self):
+        import torch
+        return torch.device(f"cuda:{self.local}" if torch.cuda.is_available() else "cpu")
 
 # This experiment's id (README: experiment ids): its roots are outdir/<EXPERIMENT>/d<i>/, a trunk's branches in its own dir.
 EXPERIMENT = "e00/e04-sigreg-both"
@@ -377,17 +398,8 @@ def dataloader(par: Train):
         save_view_pngs(par, dl)
     return batches
 
-def train(job: Train | str):
-    """Train the spec job, or the one in the train.json it names (load), on every DDP rank; ends with no process group left.
-    run() adds the evals."""
-    start_time = time.time()
-    # LSF jobs must run a code snapshot (bsub): the shared checkout's lib/ may be another sweep's by now.
-    b1 = "LSB_JOBID" in os.environ
-    b2 = ".tmpcode" not in Path(__file__).resolve().parts
-    assert not (b1 and b2), f"LSF job running {__file__} from the shared checkout; submit via submit() (code snapshot)"
-    par = load(job, Train)
-    if int(os.environ.get("RANK", 0)) == 0:  # first thing, so even a run that crashes early describes itself
-        record(par, "run")
+def setup(par: Train) -> Rank:
+    """Torch settings, this rank's CUDA device and the DDP process group for training par; this process's Rank. Every rank."""
     import torch
     import torch.distributed as dist
     torch.set_float32_matmul_precision(par.f32mode)
@@ -395,47 +407,35 @@ def train(job: Train | str):
     # don't (replay_bad_batch on e00/nanhunt_beta95/d9): the "divergences" of e00/viewsizes* and nanhunt*.
     # Runs before 2026-09-28 used it (torch's default pick on H200/B300).
     torch.backends.cuda.enable_cudnn_sdp(False)
-
     # Set by torchrun. Unset (plain `python`, tests) means a single process.
     # Don't seed torch identically across ranks: DataLoader workers derive miao's numpy seed from it.
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    rank = int(os.environ.get("RANK", 0))
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    assert world_size == par.n_gpus, f"launched {world_size} ranks but par.n_gpus={par.n_gpus}"
-    rank0 = rank == 0
+    r = Rank(rank=int(os.environ.get("RANK", 0)), world=int(os.environ.get("WORLD_SIZE", 1)), local=int(os.environ.get("LOCAL_RANK", 0)))
+    assert r.world == par.n_gpus, f"launched {r.world} ranks but par.n_gpus={par.n_gpus}"
     if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-    if world_size > 1:
+        torch.cuda.set_device(r.local)
+    if r.world > 1:
         dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo")
+    print(f"Rank {r.rank}/{r.world} is using torch device {r.device()} .")
+    return r
 
-    # each rank/process gets it's own dataloader with a distinct np.random generator?
-    batches = dataloader(par)
-
-    savedir = Path(par.savedir)
-
+def build(par: Train, r: Rank):
+    """(model to step: compiled, and DDP-wrapped across ranks; the bare Lejepa, for checkpoints and logging; AdamW; its lr
+    schedule) for training par: fresh, or from par.anneal_from's weights and Adam moments."""
+    import torch
     model = Lejepa(lejepa_config(par))
     ckpt = torch.load(par.anneal_from, map_location="cpu", weights_only=False) if par.anneal_from else None
     if ckpt is not None:
         model.load_state_dict(ckpt["model"])  # strict: architecture drift fails loudly
-    if rank0: pprint(model)
-
-    device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
-    print(f"Rank {rank}/{world_size} is using torch device {device} .")
-    model = model.to(device)
+    if r.rank0: pprint(model)
+    model = model.to(r.device())
     compile_model(model, par)
     lejepa = model  # unwrapped, for checkpoints
-    if world_size > 1:
+    if r.world > 1:
         # SIGReg and projector BatchNorm statistics stay per-rank (local batch) for now.
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank] if device.type == "cuda" else None)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[r.local] if r.device().type == "cuda" else None)
         if par.grad_compress:
             from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
             model.register_comm_hook(None, default_hooks.bf16_compress_hook)
-    LR_WARMUP, LR_FLOOR = 1000, 0.01  # trunk: linear warmup steps; anneal: its cosine ends at LR_FLOOR * the checkpoint's lr
-    GRAD_CLIP = 1.0  # max global grad norm
-    CHECKPOINT_EVERY, CHECKPOINT_KEEP = 2000, 1  # steps (~15 min at 8 GPUs); newest checkpoints kept
-    # Also kept for good, in checkpoints/milestones/, until their branch is done with them (reconcile submits it, release_milestone
-    # deletes the checkpoint). None for an anneal, whose own checkpoint is the one eval.
-    MILESTONES = set() if par.anneal_from else set(milestone_steps(par))
     # AdamW with weight_decay=0 is exactly Adam. Decay only weight matrices, not biases or norm gains.
     decay = [p for p in model.parameters() if p.ndim >= 2]
     no_decay = [p for p in model.parameters() if p.ndim < 2]
@@ -453,125 +453,185 @@ def train(job: Train | str):
         lr_scale = lambda s: min(1.0, (s + 1) / LR_WARMUP)
     else:
         lr_scale = lambda s: LR_FLOOR + (1 - LR_FLOOR) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / par.steps_per_epoch)))
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_scale)
-    # Steps whose gradient is non-finite are skipped, not applied (see the optimizer phase below).
-    MAX_SKIPPED, BAD_BATCHES_KEPT = 100, 2  # stop after this many skipped steps; replayable dumps written
-    n_skipped = 0
+    return model, lejepa, opt, torch.optim.lr_scheduler.LambdaLR(opt, lr_scale)
 
-    def save_checkpoint(step):
-        if not rank0:
-            return
-        state = lejepa.state_dict()
-        bad = [k for k, v in state.items() if v.is_floating_point() and not torch.isfinite(v).all()]
-        if bad:  # never let a diverged model overwrite good checkpoints
-            print(f"Not saving step {step}: {len(bad)} non-finite tensors, e.g. {bad[0]}", flush=True)
-            return
-        ckdir = savedir / "checkpoints"
-        ckdir.mkdir(exist_ok=True)
-        tmp, path = ckdir / "tmp.pt", ckdir / f"step_{step:07d}.pt"
-        torch.save({"step": step, "params": asdict(par), "model_config": asdict(lejepa.config), "model": state,
-                    "opt": opt.state_dict(), "sched": sched.state_dict()}, tmp)
-        tmp.replace(path)  # never leave a half-written checkpoint
-        kept = ckdir / "milestones" / path.name
-        if step in MILESTONES and not kept.exists():  # (the last step is saved twice: in the loop, and after it)
-            kept.parent.mkdir(exist_ok=True)
-            os.link(path, kept)  # a hard link outlives the prune below; complete when it appears, so reconcile may branch it
-        for old in sorted(ckdir.glob("step_*.pt"))[:-CHECKPOINT_KEEP]:
-            old.unlink()
-        print(f"Saved {path}", flush=True)
+def train_step(model, opt, sched, batches, par: Train, r: Rank, bench: Benchmark):
+    """One optimizer step on the next batch, each part in its profiler phase (bench). A step whose gradient is non-finite is
+    skipped, not applied: a single one would write NaN into every weight via opt.step() (the sudden divergences in
+    e00/viewsizes*); DDP ranks share the all-reduced norm, so they skip together, at one host sync per step.
+    (batch on the device: Batch C Z Y X; LejepaOutput; grad norm; whether skipped; RNG state before the forward, (CPU, CUDA):
+    views draw on the CPU generator and SIGReg slices on the GPU's, so a skipped step replays exactly from its dump.)"""
+    import torch
+    device = r.device()
+    if par.cudagraphs:
+        torch.compiler.cudagraph_mark_step_begin()  # previous step's graph outputs may be overwritten
+    # No annotation hooks or profiler are active during the throughput baseline.
+    with bench.phase("01_DATA_IO"):
+        x = next(batches)
+    with bench.phase("03_H2D_TRANSFER"):
+        # Deferred batches are dicts of per-sample uint8 crops; finish_images copies and normalizes them.
+        x = finish_images(x, device)["img"] if par.defer_image_ops else x.to(device, non_blocking=True)
+    rng = (torch.get_rng_state(), torch.cuda.get_rng_state(device) if device.type == "cuda" else None)
+    with bench.phase("04_FORWARD_AND_LOSS"), torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.amp):
+        out = model(x)
+    bench.count(out)
+    with bench.phase("05_BACKWARD"):
+        out.loss.backward()
+    with bench.phase("06_OPTIMIZER"):
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        skipped = not torch.isfinite(grad_norm).item()
+        if not skipped:
+            opt.step()
+        opt.zero_grad(set_to_none=True)
+        sched.step()
+    return x, out, grad_norm, skipped, rng
 
-    idx_step = -1
+def save_bad_batch(par: Train, lejepa, x, rng, step: int):
+    """A skipped step, replayable (replay_bad_batch): the weights, still the pre-step ones, the input (uint8: lossless) and
+    the RNG state before its forward -> savedir/bad_batch_<step>.pt."""
+    import torch
+    torch.save({"step": step, "params": asdict(par), "model_config": asdict(lejepa.config), "model": lejepa.state_dict(),
+                "x_uint8": (x.clamp(0, 1) * 255).round().byte().cpu(), "rng_cpu": rng[0], "rng_cuda": rng[1]},
+               Path(par.savedir) / f"bad_batch_{step:07d}.pt")
+
+def save_checkpoint(par: Train, lejepa, opt, sched, step: int):
+    """checkpoints/step_<step>.pt, keeping the newest CHECKPOINT_KEEP; a milestone step's also kept for good in
+    checkpoints/milestones/ (until its branch is done with it, release_milestone). Never non-finite weights."""
+    import torch
+    state = lejepa.state_dict()
+    bad = [k for k, v in state.items() if v.is_floating_point() and not torch.isfinite(v).all()]
+    if bad:  # never let a diverged model overwrite good checkpoints
+        print(f"Not saving step {step}: {len(bad)} non-finite tensors, e.g. {bad[0]}", flush=True)
+        return
+    ckdir = Path(par.savedir) / "checkpoints"
+    ckdir.mkdir(exist_ok=True)
+    tmp, path = ckdir / "tmp.pt", ckdir / f"step_{step:07d}.pt"
+    torch.save({"step": step, "params": asdict(par), "model_config": asdict(lejepa.config), "model": state,
+                "opt": opt.state_dict(), "sched": sched.state_dict()}, tmp)
+    tmp.replace(path)  # never leave a half-written checkpoint
+    kept = ckdir / "milestones" / path.name
+    b1 = not par.anneal_from and step in milestone_steps(par)  # an anneal has none: its own checkpoint is the one eval
+    b2 = not kept.exists()  # (the last step is saved twice: in the loop, and after it)
+    if b1 and b2:
+        kept.parent.mkdir(exist_ok=True)
+        os.link(path, kept)  # a hard link outlives the prune below; complete when it appears, so reconcile may branch it
+    for old in sorted(ckdir.glob("step_*.pt"))[:-CHECKPOINT_KEEP]:
+        old.unlink()
+    print(f"Saved {path}", flush=True)
+
+def log_metrics(f, par: Train, lejepa, x, out, grad_norm, sched, step: int, n_skipped: int, seconds: float):
+    """One metrics.json row (and a progress line) for this step."""
+    import torch
+    loss = out.loss.detach().item()
+    # Median pre-LayerNorm token norm on a global-view-sized corner of 4 samples: residual-stream
+    # growth tends to precede divergence (see e00/viewsizes). Eager and grad-free, so cheap.
+    g = par.global_size
+    with torch.no_grad(), torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=par.amp):
+        resid = lejepa.encoder.forward_residual(x[:4, :, :g[0], :g[1], :g[2]])
+    # loss = inv + lamb * sigreg, logged apart: sigreg is ~1.05 for exactly Gaussian projections
+    # (its floor), and its pull scales with the per-GPU batch, so the total alone mixes invariance
+    # with how Gaussian the projections are.
+    f.write(json.dumps({"tbl": "metrics", "idx_step": step, "time": seconds, "loss": loss,
+                        "inv": out.inv.detach().item(), "sigreg": out.sigreg.detach().item(),
+                        "grad_norm": grad_norm.item(), "lr": sched.get_last_lr()[0],
+                        "resid_norm": resid.float().norm(dim=-1).median().item(), "skipped": n_skipped}) + "\n")
+    f.flush()
+    print(f"finished step {step + 1}/{par.steps_per_epoch}, loss={loss:.4f}", flush=True)
+
+def stop_reason(par: Train, r: Rank, out, n_skipped: int, seconds: float, step: int) -> str:
+    """Why every rank stops after this step ("" to go on), agreed by one all-reduce: a non-finite loss (divergence), past
+    max_hours, or too many skipped (non-finite gradient) steps."""
+    import torch
+    import torch.distributed as dist
+    b1 = not torch.isfinite(out.loss.detach()).item()
+    b2 = bool(par.max_hours) and seconds > par.max_hours * 3600
+    b3 = n_skipped >= MAX_SKIPPED
+    stop = torch.tensor([float(b1), float(b2), float(b3)], device=r.device())
+    if r.world > 1:
+        dist.all_reduce(stop, op=dist.ReduceOp.MAX)
+    reasons = [f"Non-finite loss by step {step + 1}; stopping (checkpoints keep the last finite weights)",
+               f"Reached max_hours={par.max_hours} at step {step + 1}",
+               f"{n_skipped} steps skipped for non-finite gradients by step {step + 1}; stopping"]
+    return next((m for m, s in zip(reasons, stop.tolist()) if s), "")
+
+def record_oom(par: Train, r: Rank, step: int, err: Exception):
+    """An out-of-memory error as a result row in performance.json (the table shows which configs don't fit)."""
+    import torch
+    row = {"tbl": "oom", "time": time.time(), "params": asdict(par), "idx_step": step, "error": str(err).splitlines()[0][:300]}
+    if r.device().type == "cuda":
+        row |= {"gpu_name": torch.cuda.get_device_name(r.device()), "max_mem_gb": torch.cuda.max_memory_allocated(r.device()) / 1e9}
+    with open(Path(par.savedir) / "performance.json", "a") as f:
+        f.write(json.dumps(row) + "\n")
+
+def check_snapshot():
+    """LSF jobs must run a code snapshot (bsub): the shared checkout's lib/ may be another sweep's by now."""
+    b1 = "LSB_JOBID" in os.environ
+    b2 = ".tmpcode" not in Path(__file__).resolve().parts
+    assert not (b1 and b2), f"LSF job running {__file__} from the shared checkout; submit via submit() (code snapshot)"
+
+def train(job: Train | str):
+    """Train the spec job, or the one in the train.json it names (load), on every DDP rank; ends with no process group left.
+    run() adds the evals. Rank 0 writes metrics.json, checkpoints, and the throughput window and profile of Benchmark."""
+    import torch
+    import torch.distributed as dist
+    start_time = time.time()
+    check_snapshot()
+    par = load(job, Train)
+    if int(os.environ.get("RANK", 0)) == 0:  # first thing, so even a run that crashes early describes itself
+        record(par, "run")
+    r = setup(par)
+    batches = dataloader(par)  # each rank its own, with its own miao seed (see setup)
+    model, lejepa, opt, sched = build(par, r)
+    n_skipped, step = 0, -1
     try:
-        # Only rank 0 writes results and profiles.
-        with open(savedir / "metrics.json" if rank0 else os.devnull, "a") as metrics_file, Benchmark(par, device, world_size, rank0) as bench:
-            for idx_step in range(par.steps_per_epoch):
-                if par.cudagraphs:
-                    torch.compiler.cudagraph_mark_step_begin()  # previous step's graph outputs may be overwritten
-                bench.begin(idx_step)
-                # No annotation hooks or profiler are active during the throughput baseline.
-                with bench.phase("01_DATA_IO"):
-                    x = next(batches)
-                with bench.phase("03_H2D_TRANSFER"):
-                    # Deferred batches are dicts of per-sample uint8 crops; finish_images copies and normalizes them.
-                    x = finish_images(x, device)["img"] if par.defer_image_ops else x.to(device, non_blocking=True)
-                # RNG state before the forward (views draw on the CPU generator, SIGReg slices on the GPU's),
-                # so a skipped step's forward/backward can be replayed exactly from its bad_batch dump.
-                rng_cpu = torch.get_rng_state()
-                rng_cuda = torch.cuda.get_rng_state(device) if device.type == "cuda" else None
-                with bench.phase("04_FORWARD_AND_LOSS"), torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.amp):
-                    out = model(x)
-                bench.count(out)
-                with bench.phase("05_BACKWARD"):
-                    out.loss.backward()
-                with bench.phase("06_OPTIMIZER"):
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-                    # A single non-finite gradient would write NaN into every weight via opt.step() (the sudden
-                    # divergences in e00/viewsizes*). Skip such steps instead. DDP ranks share the all-reduced norm,
-                    # so they all skip together. Costs one host sync per step.
-                    if torch.isfinite(grad_norm).item():
-                        opt.step()
-                    else:
-                        n_skipped += 1
-                        print(f"Non-finite grad norm at step {idx_step}; skipped ({n_skipped} so far)", flush=True)
-                        if rank0 and n_skipped <= BAD_BATCHES_KEPT:
-                            # Weights are still the pre-step ones; inputs are uint8 on disk, so this is lossless.
-                            torch.save({"step": idx_step, "params": asdict(par), "model_config": asdict(lejepa.config),
-                                        "model": lejepa.state_dict(), "x_uint8": (x.clamp(0, 1) * 255).round().byte().cpu(),
-                                        "rng_cpu": rng_cpu, "rng_cuda": rng_cuda}, savedir / f"bad_batch_{idx_step:07d}.pt")
-                    opt.zero_grad(set_to_none=True)
-                    sched.step()
+        with open(Path(par.savedir) / "metrics.json" if r.rank0 else os.devnull, "a") as f, Benchmark(par, r.device(), r.world, r.rank0) as bench:
+            for step in range(par.steps_per_epoch):
+                bench.begin(step)
+                x, out, grad_norm, skipped, rng = train_step(model, opt, sched, batches, par, r, bench)
+                if skipped:
+                    n_skipped += 1
+                    print(f"Non-finite grad norm at step {step}; skipped ({n_skipped} so far)", flush=True)
+                    if r.rank0 and n_skipped <= BAD_BATCHES_KEPT:
+                        save_bad_batch(par, lejepa, x, rng, step)
                 with bench.phase("07_LOGGING"):
-                    if rank0 and (idx_step % 10 == 0 or idx_step + 1 == par.steps_per_epoch):
-                        loss = out.loss.detach().item()
-                        # Median pre-LayerNorm token norm on a global-view-sized corner of 4 samples: residual-stream
-                        # growth tends to precede divergence (see e00/viewsizes). Eager and grad-free, so cheap.
-                        g = par.global_size
-                        with torch.no_grad(), torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.amp):
-                            resid = lejepa.encoder.forward_residual(x[:4, :, :g[0], :g[1], :g[2]])
-                        # loss = inv + lamb * sigreg, logged apart: sigreg is ~1.05 for exactly Gaussian projections
-                        # (its floor), and its pull scales with the per-GPU batch, so the total alone mixes invariance
-                        # with how Gaussian the projections are.
-                        metrics_file.write(json.dumps({"tbl": "metrics", "idx_step": idx_step, "time": time.time() - start_time, "loss": loss,
-                                                       "inv": out.inv.detach().item(), "sigreg": out.sigreg.detach().item(),
-                                                       "grad_norm": grad_norm.item(), "lr": sched.get_last_lr()[0],
-                                                       "resid_norm": resid.float().norm(dim=-1).median().item(),
-                                                       "skipped": n_skipped}) + "\n")
-                        metrics_file.flush()
-                        print(f"finished step {idx_step + 1}/{par.steps_per_epoch}, loss={loss:.4f}", flush=True)
-
-                bench.end(idx_step)
-                # Every 100 steps, one all-reduce so every rank stops at the same step: on a non-finite loss
-                # (divergence), past max_hours, or after too many skipped (non-finite gradient) steps.
-                if idx_step % 100 == 99:
-                    b1 = not torch.isfinite(out.loss.detach()).item()
-                    b2 = bool(par.max_hours) and time.time() - start_time > par.max_hours * 3600
-                    b3 = n_skipped >= MAX_SKIPPED
-                    stop = torch.tensor([float(b1), float(b2), float(b3)], device=device)
-                    if world_size > 1:
-                        dist.all_reduce(stop, op=dist.ReduceOp.MAX)
-                    if stop[0].item():
-                        print(f"Non-finite loss by step {idx_step + 1}; stopping (checkpoints keep the last finite weights)", flush=True)
-                        break
-                    if stop[1].item():
-                        print(f"Reached max_hours={par.max_hours} at step {idx_step + 1}", flush=True)
-                        break
-                    if stop[2].item():
-                        print(f"{n_skipped} steps skipped for non-finite gradients by step {idx_step + 1}; stopping", flush=True)
-                        break
-                if idx_step % CHECKPOINT_EVERY == CHECKPOINT_EVERY - 1 or idx_step + 1 in MILESTONES:
-                    save_checkpoint(idx_step + 1)
+                    if r.rank0 and (step % 10 == 0 or step + 1 == par.steps_per_epoch):
+                        log_metrics(f, par, lejepa, x, out, grad_norm, sched, step, n_skipped, time.time() - start_time)
+                bench.end(step)
+                if step % 100 == 99 and (reason := stop_reason(par, r, out, n_skipped, time.time() - start_time, step)):
+                    print(reason, flush=True)
+                    break
+                b1 = step % CHECKPOINT_EVERY == CHECKPOINT_EVERY - 1
+                b2 = not par.anneal_from and step + 1 in milestone_steps(par)
+                if r.rank0 and (b1 or b2):
+                    save_checkpoint(par, lejepa, opt, sched, step + 1)
     except torch.OutOfMemoryError as err:
-        # Record the OOM as a result (the table shows which configs don't fit), then fail the job as usual.
-        if rank0:
-            row = {"tbl": "oom", "time": time.time(), "params": asdict(par), "idx_step": idx_step,
-                   "error": str(err).splitlines()[0][:300]}
-            if device.type == "cuda":
-                row |= {"gpu_name": torch.cuda.get_device_name(device), "max_mem_gb": torch.cuda.max_memory_allocated(device) / 1e9}
-            with open(savedir / "performance.json", "a") as f:
-                f.write(json.dumps(row) + "\n")
-        raise
-    save_checkpoint(idx_step + 1)
-    if world_size > 1:
+        if r.rank0:
+            record_oom(par, r, step, err)
+        raise  # then fail the job as usual
+    if r.rank0:
+        save_checkpoint(par, lejepa, opt, sched, step + 1)
+    if r.world > 1:
+        dist.destroy_process_group()
+
+def benchmark(job: Train | str):
+    """Throughput and a profiler trace of the spec job's training step (or the train.json's it names), with no training run:
+    warmup_steps untimed, benchmark_steps timed (performance.json), then profile_steps traced (profile.json, profile.out,
+    trace_summary.json); no metrics, checkpoints or evals. Same setup, data and step as train(). Every DDP rank."""
+    import torch.distributed as dist
+    check_snapshot()
+    par = load(job, Train)
+    par = replace(par, steps_per_epoch=par.warmup_steps + par.benchmark_steps + 1 + par.profile_steps)  # Benchmark's windows, no more
+    if int(os.environ.get("RANK", 0)) == 0:
+        record(par, "benchmark")
+    r = setup(par)
+    batches = dataloader(par)
+    model, _, opt, sched = build(par, r)
+    with Benchmark(par, r.device(), r.world, r.rank0) as bench:
+        for step in range(par.steps_per_epoch):
+            bench.begin(step)
+            train_step(model, opt, sched, batches, par, r, bench)
+            bench.end(step)
+    if r.world > 1:
         dist.destroy_process_group()
 
 def latest_step(par: Train) -> int:
@@ -583,16 +643,15 @@ def run(job: Train | str):
     probe of own_eval).
 
     Evals run after train() has destroyed the process group, so the other ranks exit instead of waiting at a
-    collective for minutes; they only run for training runs (max_hours > 0), not throughput benchmarks, and not for a
-    trunk (a run with milestones: not an anneal) that stopped on a milestone: that milestone's branch (reconcile) evaluates
-    that checkpoint. One that max_hours stopped between two does.
+    collective for minutes; not for a trunk (a run with milestones: not an anneal) that stopped on a milestone: that
+    milestone's branch (reconcile) evaluates that checkpoint. One that max_hours stopped between two does. (Throughput
+    benchmarks are their own entrypoint, benchmark, with no evals.)
     """
     par = load(job, Train)
     train(par)
     b1 = int(os.environ.get("RANK", 0)) == 0
-    b2 = bool(par.max_hours)
-    b3 = not par.anneal_from and latest_step(par) in milestone_steps(par)
-    if b1 and b2 and not b3:
+    b2 = not par.anneal_from and latest_step(par) in milestone_steps(par)
+    if b1 and not b2:
         pca(own_eval(par))
         probe(own_eval(par))
 
@@ -1021,17 +1080,18 @@ def bsub(savedir: str, job: str, minutes: int, n_gpus: int, queue: str, cmd: str
 
 def submit(fn: str, job: Train | Eval):
     """Run the entrypoint fn on the spec job as an LSF job: job written to its savedir (dump: train.json or eval.json), and
-    `experiment.py <fn> <that file>` submitted (bsub), which loads it. Resources by fn: run, a training job on job's queue
-    and GPUs (torchrun); pca and probe, one GPU on the trained run's queue; score, a CPU job on SCORE_QUEUE. No commit check:
-    callers from the shared checkout (submitall, lsf) assert_committed() first; a job submitting one is committed code."""
-    b1 = fn == "run" and isinstance(job, Train)
+    `experiment.py <fn> <that file>` submitted (bsub), which loads it. Resources by fn: run and benchmark, a training job on
+    job's queue and GPUs (torchrun); pca and probe, one GPU on the trained run's queue; score, a CPU job on SCORE_QUEUE. No
+    commit check: callers from the shared checkout (submitall, lsf) assert_committed() first; a job submitting one is committed code."""
+    b1 = fn in ("run", "benchmark") and isinstance(job, Train)
     b2 = fn in ("pca", "probe", "score") and isinstance(job, Eval)
-    assert b1 or b2, f"{job.savedir}: no LSF job {fn!r} for a {type(job).__name__} (run takes a Train; pca, probe and score an Eval)"
+    assert b1 or b2, f"{job.savedir}: no LSF job {fn!r} for a {type(job).__name__} (run and benchmark take a Train; pca, probe and score an Eval)"
     assert not isinstance(job, Train) or job.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={job.n_workers} leaves no core for the training process"
     spec = dump(job)
     if isinstance(job, Train):
-        minutes = int(job.max_hours * 60) + 60 if job.max_hours else 15  # slack: startup, final checkpoint, pca + probe
-        bsub(job.savedir, fn, minutes, job.n_gpus, job.queue, f"torchrun --standalone --nproc_per_node={job.n_gpus} {{code}}/experiment.py run {spec}")
+        # Slack: startup, final checkpoint, pca + probe. A run without max_hours (a fixed step count) or a benchmark: 15 min.
+        minutes = int(job.max_hours * 60) + 60 if job.max_hours and fn == "run" else 15
+        bsub(job.savedir, fn, minutes, job.n_gpus, job.queue, f"torchrun --standalone --nproc_per_node={job.n_gpus} {{code}}/experiment.py {fn} {spec}")
     elif fn == "score":
         bsub(job.savedir, fn, SCORE_MINUTES, 0, SCORE_QUEUE, f"python {{code}}/experiment.py score {spec}", slots=SCORE_SLOTS)
     else:
