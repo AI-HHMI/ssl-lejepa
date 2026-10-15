@@ -121,6 +121,7 @@ class Params:
     steps_per_epoch: int = 71  # warmup + benchmark + 1 profiler warmup + profile steps: stop right after profiling.
     # Training runs set it to the expected step count: milestone checkpoints are every 10% of it.
     max_hours: float = 0.0  # >0: stop after this many hours (steps_per_epoch is then an upper bound); sets LSF walltime
+    milestone_every: int = 0  # steps between a trunk's milestone checkpoints (milestone_steps); 0: every 10% of steps_per_epoch
     n_layers: int = 12
     width: int = 512  # encoder width; heads = width // 64
     lr: float = 1e-4  # run(): linear warmup, then held at this lr (no decay; see anneal_from)
@@ -214,8 +215,11 @@ def paramsall():
     return with_branches(trunks)
 
 def milestone_steps(trunk: Params) -> list[int]:
-    """The steps whose checkpoints train() keeps in checkpoints/milestones/: every 10% of steps_per_epoch (the last is the
-    final checkpoint of a trunk that ran to completion; one stopped early by max_hours never reaches the later ones)."""
+    """The steps whose checkpoints train() keeps in checkpoints/milestones/: every milestone_every steps up to steps_per_epoch,
+    or, if that is 0, every 10% of it (the last is the final checkpoint of a trunk that ran to completion). A trunk stopped
+    early by max_hours never reaches the later ones: with a time budget, steps_per_epoch is just the cap that lists them."""
+    if trunk.milestone_every:
+        return list(range(trunk.milestone_every, trunk.steps_per_epoch + 1, trunk.milestone_every))
     return sorted({round(k * trunk.steps_per_epoch / 10) for k in range(1, 11)})
 
 def anneal_params(i: int, trunk: Params, step: int) -> Params:
@@ -560,18 +564,23 @@ def has_branches(par: Params) -> bool:
     milestones = str(Path(par.savedir) / "checkpoints/milestones")
     return any(milestone_of(p).startswith(milestones) for p in paramsall())
 
+def latest_step(par: Params) -> int:
+    """The step of par's newest checkpoint (-1 if it has none)."""
+    return max((int(p.stem.split("_")[1]) for p in (Path(par.savedir) / "checkpoints").glob("step_*.pt")), default=-1)
+
 def run(n:int):
     """The LSF job: train paramsall()[n], then rank 0 evaluates its last finite checkpoint (pca, probe).
 
     Evals run after train() has destroyed the process group, so the other ranks exit instead of waiting at a
     collective for minutes; they only run for training runs (max_hours > 0), not throughput benchmarks, and not for a
-    trunk: its branches evaluate its milestones (so a trunk that max_hours stops between two is not evaluated at its end).
+    trunk that stopped on a milestone: its branch evaluates that checkpoint. One that max_hours stopped between two does.
     """
     train(n)
     par = paramsall()[n]
     b1 = int(os.environ.get("RANK", 0)) == 0
-    b2 = bool(par.max_hours) and not has_branches(par)
-    if b1 and b2:
+    b2 = bool(par.max_hours)
+    b3 = has_branches(par) and latest_step(par) in milestone_steps(par)
+    if b1 and b2 and not b3:
         pca(n)
         probe(n)
 

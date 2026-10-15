@@ -264,20 +264,22 @@ def test_lejepa_config_takes_the_mask_block_and_lamb_from_params():
 
 
 @pytest.mark.parametrize("anneal", [False, True])
-def test_paramsall_is_the_trunks_then_each_ones_ten_branches(tmp_path, monkeypatch, anneal):
+def test_paramsall_is_the_trunks_then_each_ones_milestone_branches(tmp_path, monkeypatch, anneal):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(experiment, "ANNEAL", anneal)
     params = experiment.paramsall()
     trunks = [p for p in params if not experiment.milestone_of(p)]
     branches = params[len(trunks):]
-    assert params[:len(trunks)] == trunks and len(branches) == 10 * len(trunks) and all(experiment.milestone_of(p) for p in branches)
+    counts = [len(experiment.milestone_steps(t)) for t in trunks]
+    assert params[:len(trunks)] == trunks and len(branches) == sum(counts) and all(experiment.milestone_of(p) for p in branches)
     assert all(bool(b.anneal_from) == anneal and bool(b.init_from) != anneal for b in branches)  # the toggle picks the kind
-    for t, mine in zip(trunks, [branches[k:k + 10] for k in range(0, len(branches), 10)]):  # each trunk's branches, one per milestone, the 10th too
+    ends = [sum(counts[:k + 1]) for k in range(len(counts))]
+    for t, mine in zip(trunks, [branches[e - c:e] for e, c in zip(ends, counts)]):  # each trunk's branches, one per milestone
         sources = [Path(experiment.milestone_of(b)) for b in mine]
-        assert [s.name for s in sources] == [f"step_{s:07d}.pt" for s in experiment.milestone_steps(t)] and len(sources) == 10
+        assert [s.name for s in sources] == [f"step_{s:07d}.pt" for s in experiment.milestone_steps(t)]
         assert all(s.parent == Path(t.savedir) / "checkpoints/milestones" for s in sources)
         assert all((b.global_size, b.patch_size, b.mask_block, b.lamb, b.decoder) == (t.global_size, t.patch_size, t.mask_block, t.lamb, "linear") for b in mine)
-        assert [b.steps_per_epoch for b in mine] == ([s // 10 for s in experiment.milestone_steps(t)] if anneal else [t.steps_per_epoch] * 10)
+        assert [b.steps_per_epoch for b in mine] == ([s // 10 for s in experiment.milestone_steps(t)] if anneal else [t.steps_per_epoch] * len(mine))
     assert [p.savedir for p in params] == [f"outdir/{experiment.EXPERIMENT}/d{j}/" for j in range(len(params))]
     experiment.check_experiment()
 
@@ -320,20 +322,28 @@ def test_run_trains_then_evals_training_runs_only(monkeypatch, max_hours, evals)
     assert calls == ["train", *evals]  # evals after train() has torn down the process group, benchmarks skip them
 
 
+def test_milestones_are_every_n_steps_or_every_tenth():
+    assert experiment.milestone_steps(experiment.Params(steps_per_epoch=1300)) == list(range(130, 1301, 130))
+    assert experiment.milestone_steps(experiment.Params(steps_per_epoch=100, milestone_every=30)) == [30, 60, 90]  # the cap lists them
+
+
 @pytest.mark.parametrize("anneal", [False, True])
-def test_a_trunk_skips_its_own_eval(tmp_path, monkeypatch, anneal):
+@pytest.mark.parametrize("final_step,evals", [(1000, False), (1234, True)])  # a trunk stopped on a milestone, or off one (max_hours)
+def test_a_trunk_evaluates_its_end_only_if_no_branch_does(tmp_path, monkeypatch, anneal, final_step, evals):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")
     monkeypatch.setattr(experiment, "ANNEAL", anneal)
-    params = experiment.with_branches([experiment.Params(savedir="outdir/e00/e01-test/d0/", steps_per_epoch=1000, max_hours=1.0)])
+    params = experiment.with_branches([experiment.Params(savedir="outdir/e00/e01-test/d0/", steps_per_epoch=2000, milestone_every=1000, max_hours=1.0)])
     monkeypatch.setattr(experiment, "paramsall", lambda: params)
     monkeypatch.delenv("RANK", raising=False)
     calls = []
     for fn in ["train", "pca", "probe"]:
         monkeypatch.setattr(experiment, fn, lambda n, fn=fn: calls.append(fn))
     assert experiment.has_branches(params[0]) and not experiment.has_branches(params[1])
+    (tmp_path / "outdir/e00/e01-test/d0/checkpoints").mkdir(parents=True)
+    (tmp_path / f"outdir/e00/e01-test/d0/checkpoints/step_{final_step:07d}.pt").touch()
     experiment.run(0)
-    assert calls == ["train"]  # its branches evaluate its milestones
+    assert calls == ["train", *(["pca", "probe"] if evals else [])]
     if anneal:  # an anneal is a run of its own, and evaluates itself
         calls.clear()
         experiment.run(1)
