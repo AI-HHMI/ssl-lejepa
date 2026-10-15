@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from math import prod
-from typing import Any, Union
+from typing import Any, Literal, Union
 
 import torch
 import torch.nn as nn
@@ -118,6 +118,10 @@ class LejepaConfig:
     mask: MaskConfig = field(default_factory=MaskConfig)
     sigreg: SIGRegConfig = field(default_factory=SIGRegConfig)
     lamb: float = 0.02  # loss = inv + lamb * sigreg
+    # SIGReg's samples: "view", each view's N tokens (a code of position alone passes it: e02-maskloss-sweep collapsed so), or
+    # "batch", at each position the batch's samples (averaged over positions), which a code shared across samples fails.
+    sigreg_over: Literal["view", "batch"] = "view"
+    stop_grad: bool = False  # detach the targets: the prediction loss trains only the context path, not what it predicts
 
 
 class Lejepa(nn.Module):
@@ -206,10 +210,12 @@ class Lejepa(nn.Module):
         pos = get_3d_sincos_pos_embed(tokens.shape[-1], grid, device=view.device, dtype=tokens.dtype).expand(batch, -1, -1)
         pred = self.project(self.predictor(context, gather(pos, visible), gather(pos, masked)))  # Batch M Dproj
         emb = self.project(tokens)  # Batch N Dproj
+        target = gather(emb.detach() if self.config.stop_grad else emb, masked)  # Batch M Dproj
+        cloud = emb if self.config.sigreg_over == "view" else emb.transpose(0, 1)  # Batch N Dproj, or N Batch Dproj
 
         # SIGReg's cos/sin statistics are precision sensitive, so keep the loss in fp32 under autocast.
         with torch.autocast(vol.device.type, enabled=False):
-            out = lejepa_loss(pred=pred.float(), target=gather(emb, masked).float(), tokens=emb.float(),
+            out = lejepa_loss(pred=pred.float(), target=target.float(), tokens=cloud.float(),
                               sigreg=self.sigreg, lamb=self.config.lamb)
         # Encoder tokens this step: the whole view, then the visible part again (python ints, no device sync).
         out.n_tokens = batch * (prod(grid) + visible.shape[1])

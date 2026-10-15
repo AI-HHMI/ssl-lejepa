@@ -133,6 +133,8 @@ class Params:
     # loss = prediction error + lamb x SIGReg. SIGReg's pull is lamb x its sample count (its statistic is N x an empirical-CF
     # distance) and it sees each view's N tokens: the old lamb 0.1 over 32 batch samples (a pull of 3.2) is 0.002 at 12^3 tokens.
     lamb: float = 0.002
+    sigreg_over: Literal["view", "batch"] = "view"  # SIGReg's samples: each view's tokens, or each position's batch (pull: lamb x batch)
+    stop_grad: bool = False  # detach the masked-token targets (lib.models.LejepaConfig.stop_grad)
 
     # optimizations
     f32mode: F32Mode = "high"

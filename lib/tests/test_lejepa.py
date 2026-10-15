@@ -177,6 +177,20 @@ def test_forward_accounts_tokens_and_flops_of_both_encoder_passes():
     assert torch.isfinite(out.loss)
 
 
+@pytest.mark.parametrize("sigreg_over,stop_grad", [("view", False), ("batch", False), ("view", True)])
+def test_sigreg_samples_and_stop_grad_reach_the_loss(monkeypatch, sigreg_over, stop_grad):
+    import lib.models.lejepa
+    seen = {}
+    def spy(**kw):
+        seen.update(kw)
+        return lejepa_loss(**kw)
+    monkeypatch.setattr(lib.models.lejepa, "lejepa_loss", spy)
+    model = Lejepa(TINY, view=ViewConfig(views="displace", global_size=(16, 16, 16)), sigreg_over=sigreg_over, stop_grad=stop_grad)
+    model(torch.randn(3, 1, 16, 16, 16)).loss.backward()
+    assert seen["tokens"].shape == ((3, 64, 8) if sigreg_over == "view" else (64, 3, 8))  # samples on -2: tokens, or the batch
+    assert seen["target"].requires_grad != stop_grad and seen["pred"].requires_grad
+
+
 def test_snapshot_copies_once(tmp_path, monkeypatch):
     import lib.util
     from lib.util import snapshot

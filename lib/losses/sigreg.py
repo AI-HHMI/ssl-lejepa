@@ -113,8 +113,8 @@ def lejepa_loss(
     Args:
         pred: Predicted embeddings of the masked tokens, shape (B, M, D).
         target: The same tokens' embeddings from the encoder seen the whole view, shape (B, M, D).
-        tokens: Every token's embedding of each view, shape (B, N, D): SIGReg makes each view's N tokens an isotropic
-            Gaussian cloud, so the targets can't collapse to a constant, nor to one code per view.
+        tokens: The embeddings SIGReg holds to an isotropic Gaussian, shape (..., N, D) with the samples on N: each view's
+            tokens (B, N, D), or each position's batch (N, B, D) (LejepaConfig.sigreg_over).
         sigreg: SIGReg module instance.
         lamb: Weight for the SIGReg regularization term.
 
