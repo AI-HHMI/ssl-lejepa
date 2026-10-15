@@ -183,35 +183,39 @@ ANNEAL = False
 
 def paramsall():
     # The masked-token objective's two knobs: how much of the view is masked (mask_block, the cube's side as a fraction of the
-    # token grid side) and SIGReg's weight (lamb). Neither is tuned: the first lamb (0.002) only matches the old pull, and the
-    # first block (0.6) is a guess. Bigger blocks make the prediction harder and its targets less locally interpolable
-    # (a lone masked token is just its neighbours' average); lamb sets how hard the per-view token cloud is held isotropic
-    # Gaussian against collapse (and against a per-view code, which the invariance loss rewarded in e01-viewsizes-2d).
-    # Fixed: e01's best config, input 128 and view 96 (12^3 tokens: cubes of 4, 5, 7 and 9 tokens, 4-42% of the view), m
-    # (12x512), batch 32 (SIGReg's pull depends on it), one B300 each. max_hours is a 3x safety cap on step_seconds' estimate
-    # (2x in e01; this objective's speed is not yet measured, see ANCHOR_STEP_S_M_B84), not the stop: the trunk runs STEPS
-    # steps, so its milestones (every 4k) are all reached.
-    BATCH, STEPS = 32, 40_000
+    # token grid side) and SIGReg's weight (lamb), each over a wide log-ish range, twice (the runs are not seeded: a repeat is
+    # a fresh init and data order). Neither is tuned: the first lamb (0.002) only matches the old pull, and the first block (0.6)
+    # is a guess. Bigger blocks make the prediction harder and its targets less locally interpolable (a lone masked token is just
+    # its neighbours' average); lamb sets how hard the per-view token cloud is held isotropic Gaussian against collapse (and
+    # against a per-view code, which the invariance loss rewarded in e01-viewsizes-2d). Blocks of 2, 4, 5, 7, 9 and 11 tokens of
+    # 12 (0.5% to 77% of the view); lamb x 1728 tokens is a pull of 0.35 to 100.
+    # Fixed: e01's best config, input 128 and view 96 (12^3 tokens), m (12x512), batch 32 (SIGReg's pull depends on it), one RTX PRO
+    # 6000 (96 GB) each (the B300s were full), at about 0.8 GB per sample, ~25 GB. Trained for a time budget, not a step count:
+    # max_hours stops each trunk, at an estimated 80k-150k steps (43 TFLOP per step at an achieved 120-230 TFLOP/s: unmeasured),
+    # and steps_per_epoch is only the cap that lists the milestones (every 10k steps; those never reached are never submitted).
+    BATCH, STEPS, HOURS = 32, 160_000, 8
     trunks = []
-    for block in [0.3, 0.45, 0.6, 0.75]:
-        for lamb in [0.0002, 0.002, 0.02]:
-            p = Params()
-            p.savedir = f"outdir/{EXPERIMENT}/d{len(trunks)}/"
-            p.data = "hemibrain_wide"
-            p.views = "displace"
-            p.patch_size = (128, 128, 128)
-            p.global_size = (96, 96, 96)
-            p.mask_block = block
-            p.lamb = lamb
-            p.batch_size = BATCH
-            p.steps_per_epoch = STEPS
-            p.max_hours = 3 * STEPS * step_seconds("m", BATCH, (12, 12, 12)) / 3600
-            p.weight_decay = 0.05
-            p.adam_beta2 = 0.95
-            p.cudagraphs = True
-            p.n_workers = 11  # 12 cores per GPU
-            p.queue = "gpu_b300"
-            trunks.append(p)
+    for block in [0.15, 0.3, 0.45, 0.6, 0.75, 0.9]:
+        for lamb in [0.0002, 0.0006, 0.002, 0.006, 0.02, 0.06]:
+            for repeat in range(2):
+                p = Params()
+                p.savedir = f"outdir/{EXPERIMENT}/d{len(trunks)}/"
+                p.data = "hemibrain_wide"
+                p.views = "displace"
+                p.patch_size = (128, 128, 128)
+                p.global_size = (96, 96, 96)
+                p.mask_block = block
+                p.lamb = lamb
+                p.batch_size = BATCH
+                p.steps_per_epoch = STEPS
+                p.milestone_every = 10_000
+                p.max_hours = HOURS
+                p.weight_decay = 0.05
+                p.adam_beta2 = 0.95
+                p.cudagraphs = True
+                p.n_workers = 11  # 12 cores per GPU
+                p.queue = "gpu_rtx6000"
+                trunks.append(p)
     return with_branches(trunks)
 
 def milestone_steps(trunk: Params) -> list[int]:
