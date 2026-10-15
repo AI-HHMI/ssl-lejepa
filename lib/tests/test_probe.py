@@ -55,7 +55,8 @@ def test_average_precision():
     assert abs(average_precision(torch.tensor([0.9, 0.8, 0.1]), torch.tensor([0, 1, 1])) - (1 / 2 + 2 / 3) / 2) < 1e-6
 
 
-def test_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch):
+@pytest.mark.parametrize("score", [True, False])
+def test_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch, score):
     # A 64^3 store in x y z, like the hemibrain crop: raw with a gradient, two objects split along x only.
     store = tmp_path / "crop.zarr"
     x, y, z = np.meshgrid(*[np.arange(64)] * 3, indexing="ij")
@@ -63,7 +64,7 @@ def test_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch):
     lab = 1 + (x >= 40)
     zarr.open_array(str(store / "labels/cells/s0"), mode="w", shape=(64, 64, 64), dtype="uint64")[:] = lab
     boxes = {"train": [[24, 56], [24, 56], [24, 56]], "fit": [[20, 52], [24, 56], [24, 56]], "test": [[24, 56], [20, 52], [24, 56]]}
-    par = experiment.Params(savedir=str(tmp_path / "run"), global_size=(24, 24, 24))  # 32^3 boxes -> 48^3 of context
+    par = experiment.Params(savedir=str(tmp_path / "run"), global_size=(24, 24, 24), score=score)  # 32^3 boxes -> 48^3 of context
     (tmp_path / "run").mkdir()
     monkeypatch.setattr(experiment, "paramsall", lambda: [par])
     monkeypatch.setattr(experiment, "HEMIBRAIN_EB_PROBE_BOXES", boxes)
@@ -73,18 +74,25 @@ def test_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch):
     monkeypatch.setattr(experiment, "code_provenance", lambda: {"commit_id": "test"})
     model = Lejepa(TINY)
     monkeypatch.setattr(experiment, "load_checkpoint", lambda p: (model.eval(), 7))
+    released = []
+    monkeypatch.setattr(experiment, "release_milestone", released.append)
     experiment.probe(0)
 
+    assert released == [par]  # its milestone, if it has one, is no longer needed
     stats = json.loads((tmp_path / "run/probe.json").read_text())
     assert stats["step"] == 7 and 0 <= stats["boundary_ap_short"] <= 1
     # Axes: only +x crosses the x = 40 split (1 of 31 valid layers); +y and +z never do.
     frac = [stats[f"boundary_frac_{o}"] for o in AFFINITY_OFFSETS_XYZ[:3]]
     assert abs(frac[0] - 1 / 31) < 0.003 and frac[1] == frac[2] == 0
-    art = zarr.open_array(str(tmp_path / "run/probe/test/hemibrain_eb_test.zarr"), mode="r")
-    assert dict(art.attrs)["kind"] == "affinity" and dict(art.attrs)["origin"] == [24, 20, 24] and dict(art.attrs)["scale"] == [1, 1, 1]
-    arr = np.asarray(art[:])
-    assert arr.shape == (6, 32, 32, 32) and 0 <= arr.min() and arr.max() <= 1
-    assert (tmp_path / "run/probe.png").is_file() and (tmp_path / "run/probe/fit/hemibrain_eb_fit.zarr").is_dir()
+    assert (tmp_path / "run/probe.png").is_file()
+    if score:
+        art = zarr.open_array(str(tmp_path / "run/probe/test/hemibrain_eb_test.zarr"), mode="r")
+        assert dict(art.attrs)["kind"] == "affinity" and dict(art.attrs)["origin"] == [24, 20, 24] and dict(art.attrs)["scale"] == [1, 1, 1]
+        arr = np.asarray(art[:])
+        assert arr.shape == (6, 32, 32, 32) and 0 <= arr.min() and arr.max() <= 1
+        assert (tmp_path / "run/probe/fit/hemibrain_eb_fit.zarr").is_dir()
+    else:
+        assert not (tmp_path / "run/probe").exists()  # nobody scores this run: GBs of artifacts nobody reads
     fit = [json.loads(l) for l in (tmp_path / "run/probe_fit.json").read_text().splitlines()]
     assert fit[0]["step"] == 0 and fit[-1]["step"] == 2999 and all(f["tbl"] == "probe_fit" for f in fit)
     assert all(0 <= f["held_boundary_ap"] <= 1 and f["held_bce"] > 0 for f in fit)
@@ -175,6 +183,7 @@ def test_score_runs_the_sister_mia_evals_on_the_probe_artifacts(tmp_path, monkey
     assert args["--leaderboard"] == str(tmp_path / "run/mia_evals") and "--no-scored" in cmd
     assert (tmp_path / "run/git_commit.txt").read_text() == "abc123\n"  # copied into the record by --run-dir
     assert json.loads((tmp_path / "run/resolved_config.json").read_text())["savedir"] == par.savedir
+    assert not (tmp_path / "run/probe").exists()  # scored: its artifacts (GBs) are deleted, the record is in mia_evals/
 
 
 def test_scorelsf_submits_a_cpu_job(tmp_path, monkeypatch):

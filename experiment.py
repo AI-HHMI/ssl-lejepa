@@ -9,6 +9,7 @@ import hashlib
 import os, sys
 import json
 import re
+import shutil
 import time
 from pathlib import Path
 
@@ -158,6 +159,7 @@ class Params:
     unetr_hidden_dim: int = 64  # decoder="unetr": its decoder channel width (lib.decoders.unetr.UnetrConfig)
     unetr_steps: int = 3000  # decoder="unetr": fit_unetr training steps (fit_probe's STEPS, for comparison)
     unetr_freeze_encoder: bool = True  # decoder="unetr": keep the encoder frozen while fitting it (fair vs. the linear probe)
+    score: bool = True  # probe() writes the affinity artifacts `score` reads (probe/{fit,test}, GBs each; score deletes them after): False for a run nobody scores
 
     # profiling params
     warmup_steps: int = 10
@@ -678,12 +680,26 @@ def load_checkpoint(par: Params):
     model.load_state_dict(ckpt["model"])  # strict: architecture drift fails loudly
     return model.to(device).eval(), ckpt["step"]
 
+def release_milestone(par: Params):
+    """Delete the trunk milestone par's run started from (a branch, see milestone_of) once nothing reads it any more: its pca
+    and probe have both written their results (the second to finish deletes it; a failed job keeps it for a retry). A
+    milestone is a full checkpoint, 0.6 GB for m."""
+    source = milestone_of(par)
+    if source and all((Path(par.savedir) / f).is_file() for f in ("pca.json", "probe.json")):
+        Path(source).unlink(missing_ok=True)
+
+def releaseall():
+    """release_milestone for every entry: frees the milestones of branches that finished before it existed."""
+    for p in paramsall():
+        release_milestone(p)
+
 def pca(n:int):
     """PCA maps (pca_maps) of paramsall()[n]'s latest checkpoint. Runs at the end of training; pcalsf(n) redoes it."""
     par = paramsall()[n]
     model, step = load_checkpoint(par)
     record(par, "pca")  # argv says whether it ran inside `run n` or on its own (pcalsf)
     pca_maps(model.encoder, par, Path(par.savedir), step)
+    release_milestone(par)
 
 def pca_maps(encoder, par: Params, savedir: Path, step: int):
     """PCA maps of patch-token embeddings on a held-out EB val crop -> savedir/pca2.png, pca.json.
@@ -778,12 +794,12 @@ def score(n:int):
     analysis_plots.mia_evals_table reads it), not mia-evals' repo. resolved_config.json (params) and git_commit.txt (the
     commit that ran) go in the savedir first: mia-evals copies them into the record from --run-dir.
     Runs the sister checkout MIA_EVALS's own CLI and .venv, from that checkout (its commit is in the record), with this
-    commit's SCORE_CONFIG (scorelsf).
+    commit's SCORE_CONFIG (scorelsf). Deletes savedir/probe/ (the artifacts it read) once the record is written.
     """
     import subprocess
     par = paramsall()[n]
     savedir = Path(par.savedir)
-    assert (savedir / "probe/test").is_dir() and (savedir / "probe/fit").is_dir(), f"no probe artifacts in {savedir}: probe first"
+    assert (savedir / "probe/test").is_dir() and (savedir / "probe/fit").is_dir(), f"no probe artifacts in {savedir}: probe first (a run with score=False writes none)"
     exe = MIA_EVALS / ".venv/bin/mia-evals"
     assert exe.is_file(), f"no mia-evals CLI at {exe}: clone github.com/AI-HHMI/mia-evals to {MIA_EVALS} and `uv sync` there"
     record(par, "score")
@@ -796,6 +812,7 @@ def score(n:int):
            "--no-scored"]  # don't keep the 5.8 GB post-processed labelling per run
     print(" ".join(cmd), flush=True)
     subprocess.run(cmd, check=True, cwd=MIA_EVALS)  # absolute paths: the cwd is mia-evals'
+    shutil.rmtree(savedir / "probe")  # the artifacts are scored (the record is in mia_evals/): GBs per run, not kept
 
 def tile_features(encoder, img, tile):
     """Encoder tokens (after its final LayerNorm) of img (Z Y X in [0, 1], on the encoder's device, a multiple of
@@ -941,7 +958,7 @@ def probe(n:int):
     (Path(par.savedir) / "probe_fit.json").write_text("".join(json.dumps({"tbl": "probe_fit", **c}) + "\n" for c in curve))
     run_name = "-".join(Path(par.savedir).parts[1:])  # mia-evals row name: letters, digits, _ and - only
     stats = {"tbl": "probe", "step": step, "run": run_name}
-    for split in ["fit", "test"]:
+    for split in ["fit", "test"] if par.score else ["test"]:  # the fit block's predictions only feed the artifacts
         box = HEMIBRAIN_EB_PROBE_BOXES[split]
         pred, labels, em = predict(box)  # C Z Y X sigmoid probabilities, Z Y X instance labels, Z Y X EM
         if split == "test":  # cheap scores, on a fixed random subset of the valid edges
@@ -962,13 +979,15 @@ def probe(n:int):
             Image.fromarray((torch.cat([row[0], gap, row[1], gap, row[2]], 1) * 255).byte().cpu().numpy()).save(Path(par.savedir) / "probe.png")
             del aff, valid
         (x0, x1), (y0, y1), (z0, z1) = box
-        write_affinities(Path(par.savedir) / "probe" / split / f"hemibrain_eb_{split}.zarr", pred.permute(0, 3, 2, 1).cpu().numpy(),
-                         origin=[x0, y0, z0], convention=f"sigmoid(logit), {par.decoder} decoder",
-                         run=run_name, step=step, axes="xyz", source_path=vol.path, source_label_key=HEMIBRAIN_EB_LABELS,
-                         native_box=box, scale=[1, 1, 1], annotated_box=HEMIBRAIN_EB_PROBE_ANNOTATED[split], covers_full_box=False)
+        if par.score:
+            write_affinities(Path(par.savedir) / "probe" / split / f"hemibrain_eb_{split}.zarr", pred.permute(0, 3, 2, 1).cpu().numpy(),
+                             origin=[x0, y0, z0], convention=f"sigmoid(logit), {par.decoder} decoder",
+                             run=run_name, step=step, axes="xyz", source_path=vol.path, source_label_key=HEMIBRAIN_EB_LABELS,
+                             native_box=box, scale=[1, 1, 1], annotated_box=HEMIBRAIN_EB_PROBE_ANNOTATED[split], covers_full_box=False)
         del pred, labels, em
     (Path(par.savedir) / "probe.json").write_text(json.dumps(stats) + "\n")
-    print(f"{par.savedir}: probe at step {step}: boundary AP (short-range mean) {stats['boundary_ap_short']:.3f}; wrote probe/", flush=True)
+    print(f"{par.savedir}: probe at step {step}: boundary AP (short-range mean) {stats['boundary_ap_short']:.3f}{'; wrote probe/' * par.score}", flush=True)
+    release_milestone(par)
 
 def bsub(par: Params, job: str, minutes: int, n_gpus: int, cmd: str, queue: str | None = None, slots: int | None = None):
     """Submit `uv run <cmd>` for par's run dir to LSF as job <sweep>-<dN>-<job>, logging to savedir/job_<job>_%J.log.

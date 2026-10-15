@@ -232,6 +232,51 @@ def test_trunk_spawns_each_milestones_eval_when_not_annealing(tmp_path, monkeypa
     assert not any(Path(p.savedir, "metrics.json").exists() for p in params[1:])  # nothing trained: the trunk's weights, as saved
 
 
+@pytest.mark.parametrize("anneal", [False, True])
+def test_a_milestone_is_deleted_once_its_branch_has_pca_and_probe_results(tmp_path, monkeypatch, anneal):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")
+    monkeypatch.setattr(experiment, "ANNEAL", anneal)
+    foreign = experiment.Params(savedir="outdir/e00/e01-test/d2/", init_from="outdir/e00/other/d0/checkpoints/step_0000100.pt")  # not our milestone
+    params = [*experiment.with_branches([experiment.Params(savedir="outdir/e00/e01-test/d0/", steps_per_epoch=1000)]), foreign]
+    monkeypatch.setattr(experiment, "paramsall", lambda: params)
+    trunk, branch = params[0], params[1]
+    milestone = Path(experiment.milestone_of(branch))
+    for path in (milestone, Path(foreign.init_from), Path(trunk.savedir) / "checkpoints/step_0001000.pt"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    for p in (trunk, branch, foreign):
+        Path(p.savedir).mkdir(parents=True, exist_ok=True)
+        (Path(p.savedir) / "pca.json").write_text("{}\n")
+    experiment.release_milestone(branch)
+    assert milestone.exists()  # its probe is still to run
+    for p in (trunk, branch, foreign):
+        (Path(p.savedir) / "probe.json").write_text("{}\n")
+    experiment.releaseall()
+    experiment.release_milestone(branch)  # again: nothing left, nothing to fail
+    assert not milestone.exists()
+    assert Path(foreign.init_from).exists() and (Path(trunk.savedir) / "checkpoints/step_0001000.pt").exists()  # only our milestones go
+
+
+def test_pca_releases_its_milestone(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")
+    monkeypatch.setattr(experiment, "ANNEAL", False)
+    params = experiment.with_branches([experiment.Params(savedir="outdir/e00/e01-test/d0/", steps_per_epoch=1000)])
+    monkeypatch.setattr(experiment, "paramsall", lambda: params)
+    par = params[1]
+    milestone = Path(par.init_from)
+    milestone.parent.mkdir(parents=True)
+    milestone.touch()
+    Path(par.savedir).mkdir(parents=True)
+    (Path(par.savedir) / "probe.json").write_text("{}\n")  # the probe finished first
+    monkeypatch.setattr(experiment, "load_checkpoint", lambda p: (SimpleNamespace(encoder=None), 100))
+    monkeypatch.setattr(experiment, "record", lambda *a: None)
+    monkeypatch.setattr(experiment, "pca_maps", lambda encoder, par, savedir, step: (savedir / "pca.json").write_text("{}\n"))
+    experiment.pca(1)
+    assert not milestone.exists()
+
+
 def test_load_checkpoint_reads_a_milestone_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     par = experiment.Params(patch_size=(8, 8, 8), views="displace", global_size=(8, 8, 8))
