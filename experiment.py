@@ -164,51 +164,47 @@ class Params:
     profile_steps: int = 10  # Set to zero to disable trace collection.
 
 # This experiment's id (README: experiment ids): its runs are outdir/<EXPERIMENT>/d<i>/.
-EXPERIMENT = "e00/e01-viewsizes-2d"
+EXPERIMENT = "e00/e02-maskloss-sweep"
 
 # This experiment's one entrypoint: submitall() submits every trunk with it (README: one experiment, one entrypoint).
-# The anneals of each trunk's milestones need no submit: the trunk submits them as it saves each (spawn_branches).
+# The branches of each trunk's milestones need no submit: the trunk submits them as it saves each (spawn_branches).
 def submit(n):
     runlsf(n)
 
-# submitall() submits only these trunks (None: every trunk). The first submitall ran d0-d9: d0-d2 and d4-d6 finished and d7,
-# d8 are still running; d3 hit max_hours at step 34090 (a cap too low: see paramsall) so its last two anneals never spawned, and
-# d9 ran out of memory at batch 32. A relaunched trunk restarts at step 0, so all its anneals respawn (the old ones are trashed).
-RELAUNCH: list[int] | None = [3, 9]
+# submitall() submits only these trunks (None: every trunk), e.g. to relaunch the ones that died or were cut short by max_hours.
+# A relaunched trunk restarts at step 0, so all its branches respawn (the old ones are trashed).
+RELAUNCH: list[int] | None = None
 
 # What each trunk milestone gets (with_branches), all on one GPU: True, an anneal (anneal_params: a training job of 10% of the
 # milestone's steps, hours at the largest milestones, and run() evaluates the result), or False, an eval of the milestone as
 # saved (eval_params: pca and probe, two short jobs of minutes: e01's took 7-32 s and 2.5 min once warm). The only toggle.
-ANNEAL = True
+ANNEAL = False
 
 def paramsall():
-    # View sizes on a 2D grid, input patch x global view, with local view = global view: viewsizes-v2's best config was
-    # local = global (d12: input 128, global 96, local 96; short AP 0.180 and 0.173 over its two repeats, vs 0.137 and 0.126
-    # for its base 128/96/64), with smaller locals worse. Does that hold across input and global size? The input must exceed
-    # the global (equal, and every view is the same crop, so invariance is trivial), so the grid is the cells above the
-    # diagonal: 4 + 3 + 2 + 1 trunks. Everything else is viewsizes-v2's stack at m (12x512), one B300 each.
-    # BATCH is fixed across cells (SIGReg's pull depends on it): viewsizes-v2/d16 (256, 192, 128) fit b44 on a B300 at ~44k
-    # tokens per sample (2 x 24^3 + 4 x 16^3); the largest cell here is 6 x 20^3 = 48k, so 32 leaves ~20% headroom (an
-    # estimate): 192/160 OOM'd at 32 (267 GiB in use), so it runs at 16, the one cell off BATCH. max_hours is scaling-law's
-    # 2x safety cap on step_seconds' estimate, not the stop: the trunk runs STEPS steps, so its milestones (every 4k) are all
-    # reached. The estimate ignores the input patch's read cost, which dominates at g=64 (192/64 needed 1.35 h for an estimated
-    # 0.62 h; g>=96 ran within 1.15x), so the cap has a 2 h floor.
+    # The masked-token objective's two knobs: how much of the view is masked (mask_block, the cube's side as a fraction of the
+    # token grid side) and SIGReg's weight (lamb). Neither is tuned: the first lamb (0.002) only matches the old pull, and the
+    # first block (0.6) is a guess. Bigger blocks make the prediction harder and its targets less locally interpolable
+    # (a lone masked token is just its neighbours' average); lamb sets how hard the per-view token cloud is held isotropic
+    # Gaussian against collapse (and against a per-view code, which the invariance loss rewarded in e01-viewsizes-2d).
+    # Fixed: e01's best config, input 128 and view 96 (12^3 tokens: cubes of 4, 5, 7 and 9 tokens, 4-42% of the view), m
+    # (12x512), batch 32 (SIGReg's pull depends on it), one B300 each. max_hours is a 3x safety cap on step_seconds' estimate
+    # (2x in e01; this objective's speed is not yet measured, see ANCHOR_STEP_S_M_B84), not the stop: the trunk runs STEPS
+    # steps, so its milestones (every 4k) are all reached.
     BATCH, STEPS = 32, 40_000
     trunks = []
-    for g in [64, 96, 128, 160]:
-        for inp in [96, 128, 160, 192]:
-            if inp <= g:
-                continue
+    for block in [0.3, 0.45, 0.6, 0.75]:
+        for lamb in [0.0002, 0.002, 0.02]:
             p = Params()
             p.savedir = f"outdir/{EXPERIMENT}/d{len(trunks)}/"
             p.data = "hemibrain_wide"
             p.views = "displace"
-            p.patch_size = (inp, inp, inp)
-            p.global_size = (g, g, g)
-            p.local_size = (g, g, g)
-            p.batch_size = 16 if g == 160 else BATCH
+            p.patch_size = (128, 128, 128)
+            p.global_size = (96, 96, 96)
+            p.mask_block = block
+            p.lamb = lamb
+            p.batch_size = BATCH
             p.steps_per_epoch = STEPS
-            p.max_hours = max(2.0, 2 * STEPS * step_seconds("m", p.batch_size, (g // 8,) * 3) / 3600)
+            p.max_hours = 3 * STEPS * step_seconds("m", BATCH, (12, 12, 12)) / 3600
             p.weight_decay = 0.05
             p.adam_beta2 = 0.95
             p.cudagraphs = True
