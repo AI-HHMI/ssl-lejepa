@@ -217,6 +217,7 @@ def paramsall():
                 p.cudagraphs = True
                 p.n_workers = 11  # 12 cores per GPU
                 p.queue = "gpu_rtx6000"
+                p.score = False  # not scored: no affinity artifacts (probe/{fit,test}, GBs per probe)
                 trunks.append(p)
     return with_branches(trunks)
 
