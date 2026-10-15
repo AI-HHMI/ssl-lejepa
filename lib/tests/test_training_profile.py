@@ -13,7 +13,6 @@ from lib.losses import LejepaOutput
 from lib.encoders import EncoderConfig
 from lib.losses import SIGRegConfig
 from lib.models import Lejepa, LejepaConfig, ProjectorConfig
-from lib.views import ViewConfig
 
 
 class SyntheticDataset:
@@ -66,7 +65,6 @@ def patch_experiment(monkeypatch, tmp_path, params):
         return LejepaConfig(
             encoder=EncoderConfig(depth=1, embed_dim=16, num_heads=2, patch_size=(4, 4, 4)),
             projector=ProjectorConfig(dim=8, hidden=16), sigreg=SIGRegConfig(num_slices=4, knots=3),
-            view=ViewConfig(n_global=2, n_local=1),
         )
 
     monkeypatch.setattr(experiment, "lejepa_config", small_model_config)
@@ -106,8 +104,8 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
     assert performance["steps"] == 2
     assert performance["samples_per_second"] > 0
     assert performance["tflops_per_second"] > 0 and "mfu" not in performance  # CPU run: no peak to compare to
-    # 8^3 input, 4^3 patches: 2 globals of 2^3 tokens, 1 local of 1^3 or 2^3 tokens.
-    assert 2 * 8 + 1 <= performance["tokens_per_sample"] <= 3 * 8
+    # 8^3 input, 4^3 patches: one 2^3-token view, encoded whole and again without its masked 1^3 token.
+    assert performance["tokens_per_sample"] == 8 + 7
     assert performance["seconds_per_step"] == performance["seconds"] / 2
 
     trace_path = tmp_path / "profile.json"
@@ -224,7 +222,6 @@ def test_submitall_relaunches_only_the_listed_trunks(tmp_path, monkeypatch):
     assert submitted == [3, 9]
     p = experiment.paramsall()
     assert [(p[i].batch_size, p[i].max_hours > 2) for i in (3, 9)] == [(32, False), (16, True)]  # 192/64 gets the floor, 192/160 b16
-    assert [round(p[i].max_hours, 2) for i in (4, 5, 6, 7, 8)] == [5.63, 5.63, 5.63, 19.89, 19.89]  # the finished and still-running trunks' caps
 
 
 def test_paramsall_is_the_viewsizes_grid_and_each_trunks_ten_anneals(tmp_path, monkeypatch):

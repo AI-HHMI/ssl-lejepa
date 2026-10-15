@@ -14,8 +14,8 @@ from lib.types import Tup3Int, Views
 class ViewConfig:
     """Configuration for multi-crop view creation (see ViewMaker)."""
     views: Views = "basic"  # 'none': Lejepa makes no views
-    n_global: int = 2
-    n_local: int = 4
+    n_global: int = 1  # Lejepa trains on one view per sample (see its mask); other counts are for ViewMaker's own use
+    n_local: int = 0
     global_scale: Tuple[float, float] = (0.5, 1.0)  # basic
     local_scale: Tuple[float, float] = (0.15, 0.5)  # basic
     global_size: Tup3Int = (40, 128, 128)  # displace
@@ -39,9 +39,9 @@ class ViewMaker:
         self.generator = generator
         self.patch_size = patch_size  # crop sizes are rounded to multiples of this
         if c.views == "displace":
-            for name, size in [("global_size", c.global_size), ("local_size", c.local_size)]:
+            for name, size in [("global_size", c.global_size), ("local_size", c.local_size)][:1 + (c.n_local > 0)]:  # no locals, no local_size
                 assert all(s % p == 0 for s, p in zip(size, patch_size)), f"{name} {size} must be a multiple of patch size {patch_size}"
-            assert all(l <= g for l, g in zip(c.local_size, c.global_size)), (
+            assert c.n_local == 0 or all(l <= g for l, g in zip(c.local_size, c.global_size)), (
                 f"local_size {c.local_size} must fit inside global_size {c.global_size}"
             )
             assert c.n_global > 0 or c.n_local == 0, "displace needs a global to anchor each local"

@@ -2,7 +2,7 @@
 
 import torch
 
-from lib.models.lejepa import Lejepa, LejepaConfig, ProjectorConfig
+from lib.models.lejepa import Lejepa, LejepaConfig, MaskConfig, ProjectorConfig, train_flops
 
 # Compatibility patch for torch.rand() with no arguments (e.g. format specifier f"{torch.rand():4f}"). Lives here
 # (not lib/__init__.py) so it still applies wherever the model stack is actually used, without forcing torch on
@@ -18,4 +18,4 @@ def _safe_rand(*args, **kwargs):
 
 torch.rand = _safe_rand
 
-__all__ = ["Lejepa", "LejepaConfig", "ProjectorConfig"]
+__all__ = ["Lejepa", "LejepaConfig", "MaskConfig", "ProjectorConfig", "train_flops"]

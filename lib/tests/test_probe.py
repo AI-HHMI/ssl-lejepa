@@ -198,18 +198,18 @@ def test_lejepa_n_params_builds_the_model_once_per_size(tmp_path, monkeypatch):
     def fake_lejepa(config):
         e = config.encoder
         built.append((e.depth, e.embed_dim))
-        return SimpleNamespace(_n_encoder_params=e.depth * e.embed_dim, _n_projector_params=7)
+        return SimpleNamespace(_n_encoder_params=e.depth * e.embed_dim, _n_predictor_params=5, _n_projector_params=7)
 
     monkeypatch.setattr(experiment, "N_PARAMS_CACHE", tmp_path / ".cache/n_params.json")
     monkeypatch.setattr(experiment, "Lejepa", fake_lejepa)
-    assert experiment.lejepa_n_params(4, 256) == (1024, 7)
-    assert experiment.lejepa_n_params(4, 256) == (1024, 7)  # read back from the cache file
-    assert experiment.lejepa_n_params(6, 384) == (2304, 7)
+    assert experiment.lejepa_n_params(4, 256) == (1024, 5, 7)
+    assert experiment.lejepa_n_params(4, 256) == (1024, 5, 7)  # read back from the cache file
+    assert experiment.lejepa_n_params(6, 384) == (2304, 5, 7)
     assert built == [(4, 256), (6, 384)]
 
 
 def test_scaling_budgets_are_m_hours_at_the_anchor_speed(monkeypatch):
-    monkeypatch.setattr(experiment, "lejepa_n_params", lambda n_layers, width: (n_layers * width ** 2, 1000))
+    monkeypatch.setattr(experiment, "lejepa_n_params", lambda n_layers, width: (n_layers * width ** 2, n_layers * width ** 2 // 3, 1000))
     assert experiment.step_seconds("m", 84) == pytest.approx(experiment.ANCHOR_STEP_S_M_B84)  # the anchor itself
     assert experiment.step_seconds("l", 84) > experiment.step_seconds("m", 84) > experiment.step_seconds("m", 42)
     budgets = experiment.scaling_budgets()

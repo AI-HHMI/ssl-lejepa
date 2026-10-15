@@ -102,35 +102,33 @@ class LejepaOutput(dict):
 
 
 def lejepa_loss(
-    globals: Tensor,
-    views: Tensor,
+    pred: Tensor,
+    target: Tensor,
+    tokens: Tensor,
     sigreg: nn.Module,
     lamb: float = 0.02,
 ) -> LejepaOutput:
-    """Compute joint invariance + SIGReg loss.
+    """Compute the masked-token prediction + SIGReg loss.
 
     Args:
-        globals: Global view embeddings of shape (n_globals, B, D).
-        views: All view embeddings of shape (n_total_views, B, D).
+        pred: Predicted embeddings of the masked tokens, shape (B, M, D).
+        target: The same tokens' embeddings from the encoder seen the whole view, shape (B, M, D).
+        tokens: Every token's embedding of each view, shape (B, N, D): SIGReg makes each view's N tokens an isotropic
+            Gaussian cloud, so the targets can't collapse to a constant, nor to one code per view.
         sigreg: SIGReg module instance.
         lamb: Weight for the SIGReg regularization term.
 
     Returns:
-        LejepaOutput containing 'loss', 'inv', 'sigreg', 'weighted_sigreg'.
+        LejepaOutput containing 'loss', 'inv' (the prediction error, the old invariance term's slot), 'sigreg',
+        'weighted_sigreg'.
     """
-    # Invariance loss: pull all views toward the mean of the global views
-    global_mean = globals.mean(dim=0, keepdim=True)
-    inv = (global_mean - views).square().mean()
-
-    # SIGReg regularization
-    sig = sigreg(views)
+    inv = (pred - target).square().mean()
+    sig = sigreg(tokens)
     weighted_sig = lamb * sig
     total_loss = inv + weighted_sig
-
     return LejepaOutput(
         loss=total_loss,
         inv=inv,
         sigreg=sig,
         weighted_sigreg=weighted_sig,
     )
-

@@ -21,7 +21,7 @@ from lib.data import HEMIBRAIN_EB, HEMIBRAIN_EB_LABELS, HEMIBRAIN_EB_PROBE_ANNOT
 from lib.benchmark import Benchmark
 from lib.losses import LejepaOutput
 from lib.encoders import EncoderConfig
-from lib.models import Lejepa, LejepaConfig
+from lib.models import Lejepa, LejepaConfig, train_flops
 from lib.views import ViewConfig, ViewMaker
 from lib.util import *
 from lib.types import *
@@ -65,8 +65,11 @@ N_PARAMS_CACHE = Path(".cache/lejepa_n_params.json")  # machine-local (gitignore
 # Model sizes and compute budgets of e00/scaling-law's IsoFLOP grid (scaling_budgets), for designing size x budget sweeps.
 SIZES = {"xs": (4, 256), "s": (6, 384), "m": (12, 512), "l": (16, 768), "xl": (24, 1024)}  # (n_layers, width); m = Params' default
 SCALING_BATCH = 64  # per GPU, fixed across sizes (== gpu_b300's validated default at m); xl OOMs at it on one B300
-ANCHOR_STEP_S_M_B84 = 0.32  # cudagraph-fix/d3: 1425 ktok/s at b84, flash + eager-pe cudagraphs (m: n_layers=12, width=512)
-SCALING_VIEWS = ((2, 12 ** 3), (4, 8 ** 3))  # (count, tokens) of scaling-law's views: 2 globals of 12^3, 4 locals of 8^3 (patch 8)
+ANCHOR_STEP_S_M_B84 = 0.32  # cudagraph-fix/d3: 1425 ktok/s at b84, flash + eager-pe cudagraphs (m: n_layers=12, width=512).
+# Measured on the multi-view objective (2 global + 4 local views, about 5.5k token-passes per sample); the masked-token objective
+# costs about the same by FLOPs (sample_flops) but has no measurement of its own yet.
+SIGREG_PULL = 3.2  # lamb x SIGReg samples: lejepa_config's lamb 0.1 at 32 per-view samples
+SCALING_GRID = (12, 12, 12)  # token grid of the view cost estimates assume (a 96^3 view at patch 8)
 BUDGET_HOURS_AT_M = {"c1": 1, "c2": 2, "c3": 4, "c4": 8}  # m's wall-clock at each budget; other sizes get more/fewer steps
 
 def on_queue(p: Params, queue: str) -> Params:
@@ -76,8 +79,8 @@ def on_queue(p: Params, queue: str) -> Params:
     p.width, p.batch_size = QUEUE_ARCH[queue]
     return p
 
-def lejepa_n_params(n_layers: int, width: int) -> tuple[int, int]:
-    """(encoder, projector) parameter counts of the scaling-law grid's Lejepa at this size. Building the model just to
+def lejepa_n_params(n_layers: int, width: int) -> tuple[int, int, int]:
+    """(encoder, predictor, projector) parameter counts of the scaling-law grid's Lejepa at this size. Building the model just to
     count them takes seconds, so they are cached in N_PARAMS_CACHE, keyed by size and by a hash of the model and encoder
     code (a changed architecture recounts)."""
     lib = Path(__file__).resolve().parent / "lib"  # the snapshot's own, when run from one
@@ -85,24 +88,22 @@ def lejepa_n_params(n_layers: int, width: int) -> tuple[int, int]:
     key = f"{code}/{n_layers}x{width}"
     cache = json.loads(N_PARAMS_CACHE.read_text()) if N_PARAMS_CACHE.is_file() else {}
     if key not in cache:
-        model = Lejepa(lejepa_config(replace(Params(), n_layers=n_layers, width=width, views="displace",
-                                             global_size=(96, 96, 96), local_size=(64, 64, 64), batch_views=True)))
-        cache[key] = [model._n_encoder_params, model._n_projector_params]
+        model = Lejepa(lejepa_config(replace(Params(), n_layers=n_layers, width=width, views="displace", global_size=(96, 96, 96))))
+        cache[key] = [model._n_encoder_params, model._n_predictor_params, model._n_projector_params]
         N_PARAMS_CACHE.parent.mkdir(exist_ok=True)
         N_PARAMS_CACHE.write_text(json.dumps(cache))
-    return cache[key][0], cache[key][1]
+    return tuple(cache[key])
 
-def sample_flops(name: str, views=SCALING_VIEWS) -> float:
-    """Model training FLOPs per sample of SIZES[name] (exact: lib.models.lejepa.Lejepa.forward's own out.n_flops
-    accounting), at these (count, tokens) views: by default the scaling-law view sizes' fixed token counts."""
+def sample_flops(name: str, grid=SCALING_GRID) -> float:
+    """Model training FLOPs per sample of SIZES[name] (exact: lib.models.lejepa.train_flops, which Lejepa.forward's own
+    out.n_flops uses), for a view with this token grid."""
     n_layers, width = SIZES[name]
-    n_params, n_proj = lejepa_n_params(n_layers, width)
-    return sum(k * (n * (6 * n_params + 12 * n_layers * width * n) + 6 * n_proj) for k, n in views)
+    return train_flops(lejepa_config(replace(Params(), n_layers=n_layers, width=width)), grid, *lejepa_n_params(n_layers, width))
 
-def step_seconds(name: str, batch: int, views=SCALING_VIEWS) -> float:
+def step_seconds(name: str, batch: int, grid=SCALING_GRID) -> float:
     """Estimated seconds per training step of SIZES[name] at this per-GPU batch: ANCHOR_STEP_S_M_B84 scaled by FLOPs per
     step relative to m at batch 84. An a-priori estimate (it under-predicted small sizes' cost in mia-muvit's e07)."""
-    return ANCHOR_STEP_S_M_B84 * (batch * sample_flops(name, views)) / (84 * sample_flops("m"))
+    return ANCHOR_STEP_S_M_B84 * (batch * sample_flops(name, grid)) / (84 * sample_flops("m"))
 
 def scaling_budgets() -> dict[str, float]:
     """Training FLOPs of each compute budget (c1..c4): BUDGET_HOURS_AT_M x m's estimated FLOPs per hour at SCALING_BATCH.
@@ -124,9 +125,9 @@ class Params:
     n_layers: int = 12
     width: int = 512  # encoder width; heads = width // 64
     lr: float = 1e-4  # run(): linear warmup, then held at this lr (no decay; see anneal_from)
-    views: Views = "basic"  # 'basic' (random scales) or 'displace' (fixed sizes below, locals inside globals)
+    views: Views = "basic"  # the one crop each sample trains on: 'basic' (a random scale) or 'displace' (global_size)
     global_size: Tup3Int = (88, 88, 88)  # displace only
-    local_size: Tup3Int = (56, 56, 56)  # displace only
+    local_size: Tup3Int = (56, 56, 56)  # unused: no local views since the masked-token objective (analysis_utils reads it)
 
     # optimizations
     f32mode: F32Mode = "high"
@@ -137,7 +138,6 @@ class Params:
     cudagraphs: bool = False  # instead compile static with CUDA graphs (mode="reduce-overhead"); needs compile + displace views
     compile_blocks: bool = False  # compile each transformer block separately so DDP can overlap all-reduce with backward
     defer_image_ops: bool = True  # workers ship uint8 crops; cast + normalize on the GPU (miao.finish_images)
-    batch_views: bool = False  # one encoder call per group of same-shape views (2 per step with displace)
     eager_patch_embed: bool = True  # keep PatchEmbed3d out of torch.compile (see compile_model); False only to study the bug
     weight_decay: float = 0.0  # AdamW decay on weight matrices (biases/norms excluded); 0 = the original plain Adam
     adam_beta2: float = 0.999  # Adam second-moment decay; 0.999 = torch default (all runs so far), mia-muvit uses 0.95
@@ -200,11 +200,10 @@ def paramsall():
             p.local_size = (g, g, g)
             p.batch_size = 16 if g == 160 else BATCH
             p.steps_per_epoch = STEPS
-            p.max_hours = max(2.0, 2 * STEPS * step_seconds("m", p.batch_size, ((2, (g // 8) ** 3), (4, (g // 8) ** 3))) / 3600)
+            p.max_hours = max(2.0, 2 * STEPS * step_seconds("m", p.batch_size, (g // 8,) * 3) / 3600)
             p.weight_decay = 0.05
             p.adam_beta2 = 0.95
             p.cudagraphs = True
-            p.batch_views = True
             p.n_workers = 11  # 12 cores per GPU
             p.queue = "gpu_b300"
             trunks.append(p)
@@ -254,9 +253,10 @@ def collate_images(samples):
 def lejepa_config(par: Params):
     return LejepaConfig(
         encoder = EncoderConfig(depth=par.n_layers, embed_dim=par.width, num_heads=par.width // 64),
-        view = ViewConfig(views=par.views, global_size=par.global_size, local_size=par.local_size),
-        batch_views = par.batch_views,
-        lamb = 0.1,
+        view = ViewConfig(views=par.views, global_size=par.global_size),
+        # SIGReg's pull is lamb x its sample count (its statistic is N x an empirical-CF distance), and it now sees each view's
+        # tokens, not a batch of 32: lamb = PULL / tokens keeps the old lamb 0.1 x 32 samples. Untuned for this objective.
+        lamb = SIGREG_PULL / math.prod(g // p for g, p in zip(par.global_size, EncoderConfig().patch_size)),
     )
 
 def compile_model(model: Lejepa, par: Params):
@@ -268,7 +268,7 @@ def compile_model(model: Lejepa, par: Params):
     torch._logging.set_logs(recompiles=True)  # pyright: ignore[reportPrivateImportUsage]  # recompiles show up in job_*.log
     if par.cudagraphs:
         # CUDA graphs replay whole kernel sequences, removing per-kernel CPU launch cost.
-        # They need static shapes: displace has exactly 2 view shapes, basic has ~9.
+        # They need static shapes: displace has exactly 2 encoder shapes (the whole view, and its visible tokens), basic has ~9.
         assert par.views == "displace", "cudagraphs needs views='displace' (few static shapes)"
         kwargs = dict(mode="reduce-overhead", dynamic=False)
     else:

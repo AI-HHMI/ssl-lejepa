@@ -7,7 +7,7 @@ import torch
 
 from lib.encoders import EncoderConfig, ViT3DEncoder, get_3d_sincos_pos_embed
 from lib.losses import SIGReg, SIGRegConfig, lejepa_loss
-from lib.models import Lejepa, LejepaConfig, ProjectorConfig
+from lib.models import Lejepa, LejepaConfig, MaskConfig, ProjectorConfig, train_flops
 from lib.views import ViewConfig, ViewMaker
 
 TINY = LejepaConfig(encoder=EncoderConfig(depth=1, embed_dim=32, num_heads=2, patch_size=(4, 4, 4)),
@@ -16,12 +16,13 @@ TINY = LejepaConfig(encoder=EncoderConfig(depth=1, embed_dim=32, num_heads=2, pa
 
 def test_each_part_keeps_its_config_whole():
     cfg = LejepaConfig(encoder=EncoderConfig(depth=2, embed_dim=64, num_heads=2), view=ViewConfig(n_local=0),
-                       sigreg=SIGRegConfig(num_slices=16), projector=None)
+                       mask=MaskConfig(block=0.5, predictor_depth=1), sigreg=SIGRegConfig(num_slices=16), projector=None)
     model = Lejepa(cfg)
     assert model.encoder.config == cfg.encoder and model.sigreg.config == cfg.sigreg and model.view_maker is not None
     assert model.view_maker.config == cfg.view and model.projector is None
     # Old checkpoints load: the parts keep their module names, so state-dict keys are unchanged.
-    assert {k.split(".")[0] for k in Lejepa(TINY).state_dict()} == {"encoder", "projector", "sigreg"}
+    assert {k.split(".")[0] for k in Lejepa(TINY).state_dict()} == {"encoder", "projector", "predictor", "sigreg"}
+    assert len(model.predictor.blocks) == 1
     assert Lejepa(TINY, view=ViewConfig(views="none")).view_maker is None
 
 
@@ -76,14 +77,12 @@ def test_sigreg_floor_is_batch_independent_but_its_pull_is_not():
 
 def test_lejepa_loss():
     sigreg = SIGReg(num_slices=32, knots=9, t_max=3.0)
-    globals_ = torch.randn(2, 4, 64)
-    locals_ = torch.randn(4, 4, 64)
-    all_views = torch.cat([globals_, locals_], dim=0)
+    pred, target, tokens = torch.randn(4, 5, 64), torch.randn(4, 5, 64), torch.randn(4, 20, 64)
 
-    res = lejepa_loss(globals_, all_views, sigreg, lamb=0.02)
-    assert "loss" in res
-    assert "inv" in res
-    assert "sigreg" in res
+    res = lejepa_loss(pred, target, tokens, sigreg, lamb=0.02)
+    assert res.inv == (pred - target).square().mean()  # the prediction error alone
+    assert res.sigreg == pytest.approx(sigreg(tokens).item(), rel=0.5)  # over each view's own tokens (random slices differ)
+    assert res.loss == pytest.approx((res.inv + 0.02 * res.sigreg).item())
     assert "weighted_sigreg" in res
 
 
@@ -145,14 +144,37 @@ def test_view_maker_displace_locals_inside_globals():
             assert any(set(l[b].flatten().tolist()) <= set(g[b].flatten().tolist()) for g in globals_)
 
 
-def test_batch_views_matches_per_view():
-    per_view = Lejepa(TINY)
-    batched = Lejepa(TINY, batch_views=True)
-    batched.load_state_dict(per_view.state_dict())
-    per_view.eval()  # BatchNorm running stats: identical math either way
-    batched.eval()
-    views = [torch.randn(3, 1, 8, 8, 8), torch.randn(3, 1, 4, 8, 8), torch.randn(3, 1, 8, 8, 8)]
-    torch.testing.assert_close(per_view.encode_views(views), batched.encode_views(views))
+def test_mask_block_is_one_cube_per_sample():
+    model = Lejepa(TINY)
+    grid = (4, 5, 6)  # round(0.6 * grid) is a 2 3 4 cube: 24 tokens
+    visible, masked = model.mask_block(grid, 16, torch.device("cpu"))
+    assert visible.shape == (16, 120 - 24) and masked.shape == (16, 24)
+    for v, m in zip(visible, masked):
+        assert sorted(torch.cat([v, m]).tolist()) == list(range(120))  # a partition of the tokens
+        z, y, x = m // 30, m // 6 % 5, m % 6
+        assert [(c.max() - c.min() + 1).item() for c in (z, y, x)] == [2, 3, 4]  # the cube fills its bounding box
+
+
+def test_the_context_never_sees_the_masked_voxels():
+    torch.manual_seed(0)
+    model = Lejepa(TINY).eval()
+    x = torch.randn(2, 1, 16, 16, 16)  # grid 4 4 4
+    visible, masked = model.mask_block((4, 4, 4), 2, torch.device("cpu"))
+    x2 = x.clone()
+    for b in range(2):
+        for t in masked[b].tolist():
+            z, y, xx = t // 16, t // 4 % 4, t % 4
+            x2[b, :, z * 4:z * 4 + 4, y * 4:y * 4 + 4, xx * 4:xx * 4 + 4] = torch.randn(1, 4, 4, 4)
+    torch.testing.assert_close(model.encoder.forward_features(x, keep=visible), model.encoder.forward_features(x2, keep=visible))
+    assert not torch.allclose(model.encoder.forward_features(x), model.encoder.forward_features(x2))  # the whole-view targets do
+
+
+def test_forward_accounts_tokens_and_flops_of_both_encoder_passes():
+    model = Lejepa(TINY, view=ViewConfig(views="displace", global_size=(16, 16, 16)))  # grid 4 4 4: a masked cube of side round(0.6 * 4) = 2
+    out = model(torch.randn(3, 1, 16, 16, 16))
+    assert out.n_tokens == 3 * (64 + 56)
+    assert out.n_flops == 3 * train_flops(model.config, (4, 4, 4), model._n_encoder_params, model._n_predictor_params, model._n_projector_params)
+    assert torch.isfinite(out.loss)
 
 
 def test_snapshot_copies_once(tmp_path, monkeypatch):

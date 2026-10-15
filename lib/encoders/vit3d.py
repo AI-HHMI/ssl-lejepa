@@ -217,18 +217,19 @@ class ViT3DEncoder(nn.Module):
         ])
         self.norm = nn.LayerNorm(c.embed_dim)
 
-    def forward_features(self, x: Tensor) -> Tensor:
+    def forward_features(self, x: Tensor, keep: Tensor | None = None) -> Tensor:
         """Extract patch token representations.
 
         Args:
             x: (B, C, Z, Y, X)
+            keep: (B, Nkeep) indices of the tokens to encode, each with its own position (the rest are never seen)
 
         Returns:
-            tokens: (B, N, embed_dim), after the final LayerNorm
+            tokens: (B, N or Nkeep, embed_dim), after the final LayerNorm
         """
-        return self.norm(self.forward_residual(x))
+        return self.norm(self.forward_residual(x, keep))
 
-    def forward_residual(self, x: Tensor) -> Tensor:
+    def forward_residual(self, x: Tensor, keep: Tensor | None = None) -> Tensor:
         """Patch tokens from the residual stream after the last block, before the final LayerNorm.
 
         The LayerNorm fixes every token's norm to ~sqrt(embed_dim), so token-norm analyses
@@ -242,6 +243,8 @@ class ViT3DEncoder(nn.Module):
             dtype=tokens.dtype,
         )
         x = tokens + pos_embed
+        if keep is not None:
+            x = torch.gather(x, 1, keep.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
 
         # Token dropout (random patch token drop during training)
         if self.training and self.config.token_dropout > 0.0:
