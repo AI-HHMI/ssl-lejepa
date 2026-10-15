@@ -187,7 +187,7 @@ def test_score_runs_the_sister_mia_evals_on_the_probe_artifacts(tmp_path, monkey
 def test_lsf_score_submits_a_cpu_job_on_the_runs_own_eval(tmp_path, monkeypatch):
     run = str(tmp_path / "run")
     (tmp_path / "run/probe/test").mkdir(parents=True)
-    monkeypatch.setattr(experiment, "paramsall", lambda: [experiment.Train(savedir=run)])
+    monkeypatch.setattr(experiment, "roots", lambda: [experiment.Train(savedir=run)])
     monkeypatch.setattr(experiment, "assert_committed", lambda: None)
     monkeypatch.setattr(experiment, "snapshot", lambda paths, dest: tmp_path / "code")
     submitted = []

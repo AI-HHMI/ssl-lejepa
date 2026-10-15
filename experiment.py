@@ -1,5 +1,5 @@
 """Experiment code (remote): LeJEPA 3D ViT training runs, benchmarks, inference (pca) and replays, and their LSF
-sweep (paramsall, savedirs under outdir/e00/). Depends on lib/, so it runs only from its experiment's commit.
+sweep (roots, reconciled by a driver job; savedirs under outdir/e00/). Depends on lib/, so it runs only from its experiment's commit.
 Each job is an entrypoint taking its spec (Train or Eval) or the path of the spec's json, e.g. `run outdir/.../train.json`:
 called in-process with the spec, or as an LSF job with the file that submit() writes, so any job can submit another.
 Analysis of the results lives in analysis_utils.py (readers), analysis_plots.py (report cards) and reports/ (one page per experiment)."""
@@ -60,6 +60,9 @@ CPUS_PER_GPU = 12  # LSF slots per GPU: 8 GPUs -> all 96 cores; training process
 # mia-evals scoring (score): CPU only. mia-evals: ~1 h and ~200 GB peak for the mutex watershed at 896^3, "give it a
 # whole node". The shortest CPU queue; check its run limit and memory per slot with `bqueues -l short`.
 SCORE_QUEUE, SCORE_SLOTS, SCORE_MINUTES = "local", 16, 4*60
+# The driver (drive): one CPU slot that reconciles every DRIVE_SECONDS, for up to DRIVE_MINUTES (local's limit is 14 days),
+# which covers queue waits; one that runs out is resumed by submitall.
+DRIVE_QUEUE, DRIVE_MINUTES, DRIVE_SECONDS = "local", 3 * 24 * 60, 60
 SCORE_CONFIG = "mia_evals/gary_comparison_neuron_instance/mws.toml"  # ours: truth_kind = "instances"
 # score() runs mia-evals from this sister checkout, with its own .venv (`uv sync` there) and its own commit, which
 # mia-evals records in each score's provenance (mia_evals_commit). Not a dependency of this repo.
@@ -175,19 +178,17 @@ class Eval:
     unetr_freeze_encoder: bool = True  # decoder="unetr": keep the encoder frozen while fitting it (fair vs. the linear probe)
     score: bool = False  # probe() also writes the affinity artifacts `score` reads (probe/{fit,test}, GBs each; score deletes them after)
 
-# This experiment's id (README: experiment ids): its runs are outdir/<EXPERIMENT>/d<i>/.
+# This experiment's id (README: experiment ids): its roots are outdir/<EXPERIMENT>/d<i>/, a trunk's branches in its own dir.
 EXPERIMENT = "e00/e04-sigreg-both"
 
-# submitall() submits only these trunks (None: every trunk), e.g. to relaunch the ones that died or were cut short by max_hours.
-# A relaunched trunk restarts at step 0, so all its branches respawn (the old ones are trashed).
-RELAUNCH: list[int] | None = None
-
-# What each trunk milestone gets (with_branches), all on one GPU: True, an anneal (anneal_params: a training job of 10% of the
+# What each trunk milestone gets (branch), all on one GPU: True, an anneal (anneal_params: a training job of 10% of the
 # milestone's steps, hours at the largest milestones, and run() evaluates the result), or False, an eval of the milestone as
 # saved (eval_params: pca and probe, two short jobs of minutes: e01's took 7-32 s and 2.5 min once warm). The only toggle.
 ANNEAL = False
 
-def paramsall():
+def roots() -> list[Train | Eval]:
+    """This experiment: the runs it starts from nothing (trunks, other training runs, evals of another experiment's weights).
+    Everything else (a branch of each trunk milestone) follows from what they save (reconcile)."""
     # Each SIGReg alone left the masked-token objective one shortcut: over each view's tokens (e02-maskloss-sweep), a code of
     # position alone, shared by every sample (identical PCA lattices on every crop); over each position's batch (e03-anticollapse,
     # its "batch" half), a code of the sample alone, one per view (between-tile variance ~1, effective rank 9-30), short AP
@@ -220,7 +221,7 @@ def paramsall():
             p.n_workers = 11  # 12 cores per GPU
             p.queue = "gpu_rtx6000"
             trunks.append(p)
-    return with_branches(trunks)
+    return trunks
 
 def milestone_steps(trunk: Train) -> list[int]:
     """The steps whose checkpoints train() keeps in checkpoints/milestones/: every milestone_every steps up to steps_per_epoch,
@@ -230,22 +231,32 @@ def milestone_steps(trunk: Train) -> list[int]:
         return list(range(trunk.milestone_every, trunk.steps_per_epoch + 1, trunk.milestone_every))
     return sorted({round(k * trunk.steps_per_epoch / 10) for k in range(1, 11)})
 
-def anneal_params(i: int, trunk: Train, step: int) -> Train:
-    """Train of the anneal of `trunk`'s milestone at `step`: continued for 10% of its steps on a cosine decay from its lr
-    to 1% of it (Train.anneal_from), then run()'s pca maps and linear probe, in outdir/<EXPERIMENT>/d<i>/. Everything
-    else (model, views, data, optimizer) is the trunk's own. The checkpoint need not exist yet: its path is deterministic."""
+def milestone(trunk: Train, step: int) -> Path:
+    """The checkpoint train() keeps for good (until its branch is done with it, release_milestone) at this milestone step."""
     assert step in milestone_steps(trunk), f"step {step} is not a milestone of {trunk.savedir}: {milestone_steps(trunk)}"
+    return Path(trunk.savedir) / "checkpoints/milestones" / f"step_{step:07d}.pt"
+
+def branch_dir(trunk: Train, step: int) -> str:
+    """A milestone branch's savedir: inside its trunk's, <trunk>/step_<step>/."""
+    return f"{Path(trunk.savedir) / f'step_{step:07d}'}/"
+
+def anneal_params(trunk: Train, step: int) -> Train:
+    """Train of the anneal of `trunk`'s milestone at `step`: continued for 10% of its steps on a cosine decay from its lr
+    to 1% of it (Train.anneal_from), then run()'s pca maps and linear probe, in branch_dir. Everything else (model, views,
+    data, optimizer) is the trunk's own."""
     assert step // 10 > 0, f"step {step} leaves no anneal steps"
-    return replace(trunk, savedir=f"outdir/{EXPERIMENT}/d{i}/", steps_per_epoch=step // 10, max_hours=0.2 * trunk.max_hours,
-                   anneal_from=str(Path(trunk.savedir) / "checkpoints/milestones" / f"step_{step:07d}.pt"),
+    return replace(trunk, savedir=branch_dir(trunk, step), steps_per_epoch=step // 10, max_hours=0.2 * trunk.max_hours,
+                   anneal_from=str(milestone(trunk, step)),
                    benchmark_steps=0, profile_steps=0)  # the trunk's throughput and trace say it all
 
-def eval_params(i: int, trunk: Train, step: int) -> Eval:
+def eval_params(trunk: Train, step: int) -> Eval:
     """The eval of `trunk`'s milestone at `step`: pca maps and the linear probe (pca, probe) of that checkpoint as saved, not
-    annealed, in outdir/<EXPERIMENT>/d<i>/. The checkpoint need not exist yet: its path is deterministic."""
-    assert step in milestone_steps(trunk), f"step {step} is not a milestone of {trunk.savedir}: {milestone_steps(trunk)}"
-    return Eval(savedir=f"outdir/{EXPERIMENT}/d{i}/", train=trunk,
-                init_from=str(Path(trunk.savedir) / "checkpoints/milestones" / f"step_{step:07d}.pt"))
+    annealed, in branch_dir."""
+    return Eval(savedir=branch_dir(trunk, step), train=trunk, init_from=str(milestone(trunk, step)))
+
+def branch(trunk: Train, step: int) -> Train | Eval:
+    """What `trunk`'s milestone at `step` gets: an anneal if ANNEAL, else an eval."""
+    return anneal_params(trunk, step) if ANNEAL else eval_params(trunk, step)
 
 def own_eval(t: Train) -> Eval:
     """The eval of a training run's own latest checkpoint, in its own savedir: what run() does after training."""
@@ -256,23 +267,12 @@ def source(p: Train | Eval) -> str:
     return p.anneal_from if isinstance(p, Train) else p.init_from
 
 def milestone_of(p: Train | Eval) -> str:
-    """The milestone checkpoint of this experiment's own trunk that a branch (with_branches) starts from, the one it anneals or
-    evaluates; "" for a trunk, and for an eval-only run of another experiment's weights (init_from outside outdir/<EXPERIMENT>/)."""
+    """The milestone checkpoint of this experiment's own trunk that a branch starts from, the one it anneals or evaluates;
+    "" for a trunk, and for an eval of another experiment's weights (init_from outside outdir/<EXPERIMENT>/)."""
     return source(p) if source(p).startswith(f"outdir/{EXPERIMENT}/") else ""
 
-def with_branches(trunks: list[Train]) -> list[Train | Eval]:
-    """paramsall() for a trunk sweep: the trunks, then one branch per milestone of each: an anneal if ANNEAL, else an eval.
-    A trunk submits its milestone's branch itself, the moment it saves it (spawn_branches); submitall() submits only the
-    trunks."""
-    branch = anneal_params if ANNEAL else eval_params
-    params: list[Train | Eval] = list(trunks)
-    for t in trunks:
-        for step in milestone_steps(t):
-            params.append(branch(len(params), t, step))
-    return params
-
 def printparams():
-    for p in paramsall():
+    for p in roots():
         pprint(p)
 
 def record(par: Train | Eval, fn: str):
@@ -433,8 +433,8 @@ def train(job: Train | str):
     LR_WARMUP, LR_FLOOR = 1000, 0.01  # trunk: linear warmup steps; anneal: its cosine ends at LR_FLOOR * the checkpoint's lr
     GRAD_CLIP = 1.0  # max global grad norm
     CHECKPOINT_EVERY, CHECKPOINT_KEEP = 2000, 1  # steps (~15 min at 8 GPUs); newest checkpoints kept
-    # Also kept for good, in checkpoints/milestones/, each submitting its anneal (spawn_branches) the moment it is saved.
-    # None for an anneal, whose own checkpoint is the one eval.
+    # Also kept for good, in checkpoints/milestones/, until their branch is done with them (reconcile submits it, release_milestone
+    # deletes the checkpoint). None for an anneal, whose own checkpoint is the one eval.
     MILESTONES = set() if par.anneal_from else set(milestone_steps(par))
     # AdamW with weight_decay=0 is exactly Adam. Decay only weight matrices, not biases or norm gains.
     decay = [p for p in model.parameters() if p.ndim >= 2]
@@ -472,11 +472,10 @@ def train(job: Train | str):
         torch.save({"step": step, "params": asdict(par), "model_config": asdict(lejepa.config), "model": state,
                     "opt": opt.state_dict(), "sched": sched.state_dict()}, tmp)
         tmp.replace(path)  # never leave a half-written checkpoint
-        milestone = ckdir / "milestones" / path.name
-        if step in MILESTONES and not milestone.exists():  # (the last step is saved twice: in the loop, and after it)
-            milestone.parent.mkdir(exist_ok=True)
-            os.link(path, milestone)  # a hard link outlives the prune below
-            spawn_branches(milestone)
+        kept = ckdir / "milestones" / path.name
+        if step in MILESTONES and not kept.exists():  # (the last step is saved twice: in the loop, and after it)
+            kept.parent.mkdir(exist_ok=True)
+            os.link(path, kept)  # a hard link outlives the prune below; complete when it appears, so reconcile may branch it
         for old in sorted(ckdir.glob("step_*.pt"))[:-CHECKPOINT_KEEP]:
             old.unlink()
         print(f"Saved {path}", flush=True)
@@ -575,11 +574,6 @@ def train(job: Train | str):
     if world_size > 1:
         dist.destroy_process_group()
 
-def has_branches(par: Train) -> bool:
-    """Whether paramsall() has an entry (with_branches) that starts from one of par's milestones: par is a trunk."""
-    milestones = str(Path(par.savedir) / "checkpoints/milestones")
-    return any(milestone_of(p).startswith(milestones) for p in paramsall())
-
 def latest_step(par: Train) -> int:
     """The step of par's newest checkpoint (-1 if it has none)."""
     return max((int(p.stem.split("_")[1]) for p in (Path(par.savedir) / "checkpoints").glob("step_*.pt")), default=-1)
@@ -590,13 +584,14 @@ def run(job: Train | str):
 
     Evals run after train() has destroyed the process group, so the other ranks exit instead of waiting at a
     collective for minutes; they only run for training runs (max_hours > 0), not throughput benchmarks, and not for a
-    trunk that stopped on a milestone: its branch evaluates that checkpoint. One that max_hours stopped between two does.
+    trunk (a run with milestones: not an anneal) that stopped on a milestone: that milestone's branch (reconcile) evaluates
+    that checkpoint. One that max_hours stopped between two does.
     """
     par = load(job, Train)
     train(par)
     b1 = int(os.environ.get("RANK", 0)) == 0
     b2 = bool(par.max_hours)
-    b3 = has_branches(par) and latest_step(par) in milestone_steps(par)
+    b3 = not par.anneal_from and latest_step(par) in milestone_steps(par)
     if b1 and b2 and not b3:
         pca(own_eval(par))
         probe(own_eval(par))
@@ -621,8 +616,8 @@ def replay_bad_batch(path: str):
     from contextlib import nullcontext
     from torch.nn.attention import SDPBackend, sdpa_kernel
     # Like training, replay depends on lib/: only for dumps of this commit's own experiment (replaylsf submits it).
-    ours = {Path(p.savedir).resolve() for p in paramsall()}
-    assert Path(path).resolve().parent in ours, f"{path} isn't from this commit's paramsall(): replay it from its experiment's commit"
+    ours = Path("outdir", EXPERIMENT).resolve()
+    assert Path(path).resolve().is_relative_to(ours), f"{path} isn't from this commit's experiment: replay it from its experiment's commit"
     dump = torch.load(path, map_location="cpu", weights_only=False)
     par = parse(Train, dump["params"])
     record(par, "replay_bad_batch")
@@ -695,14 +690,9 @@ def release_milestone(e: Eval):
     """Delete the trunk milestone e's weights came from (see milestone_of: an eval of it, or an anneal's own eval) once nothing
     reads it any more: e's pca and probe have both written their results (the second to finish deletes it; a failed job keeps
     it for a retry). A milestone is a full checkpoint, 0.6 GB for m."""
-    milestone = milestone_of(e) or milestone_of(e.train)
-    if milestone and all((Path(e.savedir) / f).is_file() for f in ("pca.json", "probe.json")):
-        Path(milestone).unlink(missing_ok=True)
-
-def releaseall():
-    """release_milestone for every entry: frees the milestones of branches that finished before it existed."""
-    for p in paramsall():
-        release_milestone(p if isinstance(p, Eval) else own_eval(p))
+    kept = milestone_of(e) or milestone_of(e.train)
+    if kept and all((Path(e.savedir) / f).is_file() for f in ("pca.json", "probe.json")):
+        Path(kept).unlink(missing_ok=True)
 
 def pca(job: Eval | str):
     """PCA maps (pca_maps) of the spec job's weights (or those of the eval.json it names). run() does it at the end of
@@ -1014,8 +1004,8 @@ def bsub(savedir: str, job: str, minutes: int, n_gpus: int, queue: str, cmd: str
     import subprocess
     name = "-".join(Path(savedir).parts[1:]) + f"-{job}"  # e.g. e00-nanhunt-d9-run, so bjobs shows which is which
     here = Path(__file__).resolve().parent
-    # A job submitting a job (spawn_branches) hands on the snapshot it runs itself, not the shared checkout's current state.
-    code = here if ".tmpcode" in here.parts else snapshot(SNAPSHOT_PATHS, Path(".tmpcode") / "-".join(Path(savedir).parts[1:-1]))
+    # A job submitting a job (the driver) hands on the snapshot it runs itself, not the shared checkout's current state.
+    code = here if ".tmpcode" in here.parts else snapshot(SNAPSHOT_PATHS, Path(".tmpcode") / EXPERIMENT.replace("/", "-"))
     gpu = f'-gpu "num={n_gpus}:mode=exclusive_process"' if n_gpus else ""
     full = f""" bsub -J {name} \
         -W {minutes // 60}:{minutes % 60:02d} \
@@ -1054,37 +1044,58 @@ def start(p: Train | Eval):
     for fn in ["run"] if isinstance(p, Train) else ["pca", "probe"]:
         submit(fn, p)
 
-def lsf(fn: str, n: int):
-    """Redo one job of paramsall()[n] on LSF, e.g. `lsf probe 3` after changing probe: pca, probe or score of an eval, or of a
-    training run's own checkpoint (own_eval), in place; or run, which restarts the run fresh (start)."""
+def lsf(fn: str, target: int | str):
+    """Redo one job on LSF, of roots()[target] or of the spec file target names (any run's, e.g. a milestone eval's
+    outdir/.../d3/step_0005000/eval.json): `lsf probe 3` after changing probe. pca, probe or score of an eval, or of a training
+    run's own checkpoint (own_eval), in place; run restarts a training run fresh (start), its branches with it."""
     assert_committed()
-    p = paramsall()[n]
+    p = roots()[target] if isinstance(target, int) else load(target, Eval if target.endswith("eval.json") else Train)
     if fn == "run":
         start(p)
     else:
         submit(fn, p if isinstance(p, Eval) else own_eval(p))
 
-def spawn_branches(milestone: Path):
-    """Submit the paramsall() entries (with_branches) that start from `milestone`, which the trunk just saved. The trunk is
-    hours in, so a submit that fails must not kill it: it prints ERR, and spawnall() redoes what was missed."""
-    for p in paramsall():
-        if milestone_of(p) == str(milestone):
-            try:
-                start(p)
-            except Exception as err:
-                print(f"ERR: could not submit the branch of {milestone} ({p.savedir}): {err!r}", flush=True)
+def ensure(p: Train | Eval) -> int:
+    """Start p unless its spec is already in its savedir, i.e. it was submitted before (whether it finished, is still going, or
+    failed: `lsf` redoes one). 1 if it submitted p, else 0."""
+    if spec_path(p).is_file():
+        return 0
+    start(p)
+    return 1
 
-def spawnall():
-    """Recovery for spawn_branches: submit every branch whose milestone exists but which has no savedir yet, i.e. was never
-    submitted (its trunk's submit failed, or the trunk died right after saving it)."""
-    assert_committed()
-    for p in paramsall():
-        if milestone_of(p) and Path(milestone_of(p)).is_file() and not Path(p.savedir).exists():
-            start(p)
+def reconcile() -> int:
+    """Submit what this experiment should have but doesn't, given what is on disk now: every root, and a branch of every
+    milestone a trunk among them has saved so far. Idempotent, so safe to run any time and as often as wanted (drive runs it
+    every DRIVE_SECONDS). The number of runs it submitted."""
+    n = 0
+    for r in roots():
+        n += ensure(r)
+        if isinstance(r, Train) and not r.anneal_from:
+            for m in sorted((Path(r.savedir) / "checkpoints/milestones").glob("step_*.pt")):
+                n += ensure(branch(r, int(m.stem.split("_")[1])))
+    return n
+
+def lsf_jobs() -> list[str]:
+    """Names of this experiment's LSF jobs still pending or running (bjobs lists only unfinished ones), the driver's included."""
+    import subprocess
+    prefix = EXPERIMENT.replace("/", "-") + "-"
+    out = subprocess.run(["bjobs", "-noheader", "-o", "job_name", "-J", f"{prefix}*"], capture_output=True, text=True).stdout
+    return [name for name in out.split() if name.startswith(prefix)]
+
+def drive():
+    """The driver job (submitall): reconcile every DRIVE_SECONDS until this experiment has nothing left running and nothing new
+    to submit. It holds no state: if it dies, submitall (or `drive` itself) picks up from what is on disk."""
+    while True:
+        b1 = reconcile() == 0
+        b2 = not [j for j in lsf_jobs() if not j.endswith("-drive")]
+        if b1 and b2:
+            print(f"{EXPERIMENT}: nothing running, nothing left to submit", flush=True)
+            return
+        time.sleep(DRIVE_SECONDS)
 
 def replaylsf(n:int):
-    """replay_bad_batch on LSF for paramsall()[n]'s first bad_batch dump. CUDA_LAUNCH_BLOCKING names a crashing kernel."""
-    par = paramsall()[n]
+    """replay_bad_batch on LSF for roots()[n]'s first bad_batch dump. CUDA_LAUNCH_BLOCKING names a crashing kernel."""
+    par = roots()[n]
     assert isinstance(par, Train), f"{par.savedir}: an eval trains nothing, so it has no bad batches"
     dumps = sorted(Path(par.savedir).glob("bad_batch_*.pt"))
     assert dumps, f"no bad_batch_*.pt in {par.savedir}"
@@ -1108,7 +1119,7 @@ def check_experiment():
     sweeps = [d.name for d in Path("outdir", series).glob("*")]
     taken = [s for s in sweeps if experiment_id(s) == eid and s != name]
     assert not taken, f"{EXPERIMENT}: id {eid} is taken by {series}/{taken[0]}"
-    params = paramsall()
+    params = roots()
     assert all(p.savedir.startswith(f"outdir/{EXPERIMENT}/") for p in params), f"every savedir must be under outdir/{EXPERIMENT}/"
     sources = [source(p) for p in params]
     deps = sorted({Path(s).parts[2] for s in sources if s not in ("", "random")} - {name})  # outdir/<series>/<sweep>/dN; not our own trunks
@@ -1122,16 +1133,14 @@ def check_experiment():
         assert not numbered, f"{EXPERIMENT} builds on {series}/{numbered[0]}: name it {experiment_id(numbered[0])}-<NN>-<slug>"
 
 def submitall():
-    """Submit this experiment (README: one experiment, one entrypoint): every root of paramsall(), fresh (start). A root is a
-    trunk (or another training run), or an eval of weights from outside this experiment (an eval-only sweep); a branch is
-    submitted by its trunk as it saves the milestone (spawn_branches; spawnall redoes it)."""
+    """Submit this experiment (README: one experiment, one entrypoint): reconcile now (its roots, the first time), and a driver
+    job (drive) that keeps reconciling until it's done, unless one is running already. Idempotent: run it again to resume, e.g.
+    after the driver hit its walltime; a run already submitted is left alone (`lsf run n` restarts one fresh)."""
     check_experiment()
     assert_committed()
-    for i, p in enumerate(paramsall()):
-        b1 = not milestone_of(p)
-        b2 = RELAUNCH is None or i in RELAUNCH
-        if b1 and b2:
-            start(p)
+    reconcile()
+    if not any(j.endswith("-drive") for j in lsf_jobs()):  # two drivers could both submit a branch before either wrote its spec
+        bsub(f"outdir/{EXPERIMENT}/", "drive", DRIVE_MINUTES, 0, DRIVE_QUEUE, "python {code}/experiment.py drive", slots=1)
 
 
 def mpix_per_week():

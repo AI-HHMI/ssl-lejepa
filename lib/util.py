@@ -136,9 +136,13 @@ def load(job, cls):
     assert isinstance(job, cls), f"want a {cls.__name__} or the path of one's json, got {type(job).__name__}"
     return job
 
+def spec_path(job) -> Path:
+    """Where dump writes the spec job (a dataclass with a savedir): <savedir>/<its class, lowercased>.json, e.g. train.json."""
+    return Path(job.savedir) / f"{type(job).__name__.lower()}.json"
+
 def dump(job) -> Path:
-    """Write the spec job (a dataclass with a savedir) to <savedir>/<its class, lowercased>.json, e.g. train.json; its path."""
-    path = Path(job.savedir) / f"{type(job).__name__.lower()}.json"
+    """Write the spec job to spec_path(job); its path."""
+    path = spec_path(job)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(asdict(job), indent=1) + "\n")
     return path
