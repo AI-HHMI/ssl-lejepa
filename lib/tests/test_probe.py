@@ -64,9 +64,8 @@ def test_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch, score):
     lab = 1 + (x >= 40)
     zarr.open_array(str(store / "labels/cells/s0"), mode="w", shape=(64, 64, 64), dtype="uint64")[:] = lab
     boxes = {"train": [[24, 56], [24, 56], [24, 56]], "fit": [[20, 52], [24, 56], [24, 56]], "test": [[24, 56], [20, 52], [24, 56]]}
-    par = experiment.Params(savedir=str(tmp_path / "run"), global_size=(24, 24, 24), score=score)  # 32^3 boxes -> 48^3 of context
+    par = experiment.Eval(savedir=str(tmp_path / "run"), train=experiment.Train(global_size=(24, 24, 24)), score=score)  # 32^3 boxes -> 48^3 of context
     (tmp_path / "run").mkdir()
-    monkeypatch.setattr(experiment, "paramsall", lambda: [par])
     monkeypatch.setattr(experiment, "HEMIBRAIN_EB_PROBE_BOXES", boxes)
     monkeypatch.setattr(experiment, "HEMIBRAIN_EB_PROBE_ANNOTATED", {k: v for k, v in boxes.items() if k != "train"})
     monkeypatch.setattr(experiment, "HEMIBRAIN_EB_LABELS", "labels/cells")
@@ -76,7 +75,7 @@ def test_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch, score):
     monkeypatch.setattr(experiment, "load_checkpoint", lambda p: (model.eval(), 7))
     released = []
     monkeypatch.setattr(experiment, "release_milestone", released.append)
-    experiment.probe(0)
+    experiment.probe(par)
 
     assert released == [par]  # its milestone, if it has one, is no longer needed
     stats = json.loads((tmp_path / "run/probe.json").read_text())
@@ -108,10 +107,9 @@ def test_unetr_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch):
     lab = 1 + (x >= 40)
     zarr.open_array(str(store / "labels/cells/s0"), mode="w", shape=(64, 64, 64), dtype="uint64")[:] = lab
     boxes = {"train": [[24, 56], [24, 56], [24, 56]], "fit": [[20, 52], [24, 56], [24, 56]], "test": [[24, 56], [20, 52], [24, 56]]}
-    par = experiment.Params(savedir=str(tmp_path / "run"), global_size=(24, 24, 24),
-                            decoder="unetr", unetr_hidden_dim=8, unetr_steps=20)
+    par = experiment.Eval(savedir=str(tmp_path / "run"), train=experiment.Train(global_size=(24, 24, 24)),
+                          decoder="unetr", unetr_hidden_dim=8, unetr_steps=20, score=True)
     (tmp_path / "run").mkdir()
-    monkeypatch.setattr(experiment, "paramsall", lambda: [par])
     monkeypatch.setattr(experiment, "HEMIBRAIN_EB_PROBE_BOXES", boxes)
     monkeypatch.setattr(experiment, "HEMIBRAIN_EB_PROBE_ANNOTATED", {k: v for k, v in boxes.items() if k != "train"})
     monkeypatch.setattr(experiment, "HEMIBRAIN_EB_LABELS", "labels/cells")
@@ -119,7 +117,7 @@ def test_unetr_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch):
     monkeypatch.setattr(experiment, "code_provenance", lambda: {"commit_id": "test"})
     model = Lejepa(TINY, encoder=EncoderConfig(depth=2, embed_dim=16, num_heads=2, patch_size=(2, 2, 2)))
     monkeypatch.setattr(experiment, "load_checkpoint", lambda p: (model.eval(), 7))
-    experiment.probe(0)
+    experiment.probe(par)
 
     stats = json.loads((tmp_path / "run/probe.json").read_text())
     assert stats["step"] == 7 and 0 <= stats["boundary_ap_short"] <= 1
@@ -137,15 +135,16 @@ def test_unetr_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch):
 
 def test_load_checkpoint_init_from(tmp_path, monkeypatch):
     monkeypatch.setattr(experiment, "lejepa_config", lambda par: TINY)
-    a, step = experiment.load_checkpoint(experiment.Params(init_from="random", n_layers=1, width=16))
-    b, _ = experiment.load_checkpoint(experiment.Params(init_from="random", n_layers=1, width=16))
+    small = experiment.Train(n_layers=1, width=16)
+    a, step = experiment.load_checkpoint(experiment.Eval(savedir=str(tmp_path), train=small, init_from="random"))
+    b, _ = experiment.load_checkpoint(experiment.Eval(savedir=str(tmp_path), train=small, init_from="random"))
     assert step == 0 and all(torch.equal(x, y) for x, y in zip(a.state_dict().values(), b.state_dict().values()))  # seeded
     # Another run's checkpoint: loaded into par's architecture even though its saved params differ from par's.
     other = tmp_path / "old/d0"
     (other / "checkpoints").mkdir(parents=True)
     trained = {k: v + 1 if v.is_floating_point() else v for k, v in a.state_dict().items()}
     torch.save({"step": 42, "params": {"savedir": str(other), "width": 16}, "model": trained}, other / "checkpoints/step_0000042.pt")
-    c, step = experiment.load_checkpoint(experiment.Params(savedir=str(tmp_path / "new/d0"), init_from=str(other), n_layers=1, width=16))
+    c, step = experiment.load_checkpoint(experiment.Eval(savedir=str(tmp_path / "new/d0"), train=small, init_from=str(other)))
     assert step == 42 and all(torch.equal(x, trained[k]) for k, x in c.state_dict().items())
 
 
@@ -161,20 +160,19 @@ def test_scoring_config_reads_instances_truth_from_its_own_data_configs():
 
 
 def test_score_runs_the_sister_mia_evals_on_the_probe_artifacts(tmp_path, monkeypatch):
-    par = experiment.Params(savedir=str(tmp_path / "run"))
+    par = experiment.Eval(savedir=str(tmp_path / "run"), train=experiment.Train(), score=True)
     for split in ["fit", "test"]:
         (tmp_path / "run/probe" / split).mkdir(parents=True)
-    monkeypatch.setattr(experiment, "paramsall", lambda: [par])
     monkeypatch.setattr(experiment, "code_provenance", lambda: {"commit_id": "abc123"})
     monkeypatch.setattr(experiment, "MIA_EVALS", tmp_path / "mia-evals")
     calls = []
     import subprocess
     monkeypatch.setattr(subprocess, "run", lambda cmd, check, cwd: calls.append((cmd, cwd)))
     with pytest.raises(AssertionError, match="no mia-evals CLI"):  # not cloned and synced yet
-        experiment.score(0)
+        experiment.score(par)
     (tmp_path / "mia-evals/.venv/bin").mkdir(parents=True)
     (tmp_path / "mia-evals/.venv/bin/mia-evals").touch()
-    experiment.score(0)
+    experiment.score(par)
     ((cmd, cwd),) = calls
     assert cmd[0] == str(tmp_path / "mia-evals/.venv/bin/mia-evals") and cwd == tmp_path / "mia-evals"
     assert cmd[1] == "score" and cmd[2].endswith(experiment.SCORE_CONFIG)
@@ -186,19 +184,20 @@ def test_score_runs_the_sister_mia_evals_on_the_probe_artifacts(tmp_path, monkey
     assert not (tmp_path / "run/probe").exists()  # scored: its artifacts (GBs) are deleted, the record is in mia_evals/
 
 
-def test_scorelsf_submits_a_cpu_job(tmp_path, monkeypatch):
-    par = experiment.Params(savedir=str(tmp_path / "run"))
+def test_lsf_score_submits_a_cpu_job_on_the_runs_own_eval(tmp_path, monkeypatch):
+    run = str(tmp_path / "run")
     (tmp_path / "run/probe/test").mkdir(parents=True)
-    monkeypatch.setattr(experiment, "paramsall", lambda: [par])
+    monkeypatch.setattr(experiment, "paramsall", lambda: [experiment.Train(savedir=run)])
     monkeypatch.setattr(experiment, "assert_committed", lambda: None)
     monkeypatch.setattr(experiment, "snapshot", lambda paths, dest: tmp_path / "code")
     submitted = []
     import subprocess
     monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: submitted.append(cmd))
-    experiment.scorelsf(0)
+    experiment.lsf("score", 0)
     (cmd,) = submitted
     assert f"-q {experiment.SCORE_QUEUE}" in cmd and f"-n {experiment.SCORE_SLOTS}" in cmd and "-gpu" not in cmd
-    assert "experiment.py score 0" in cmd and "job_score_%J.log" in cmd
+    assert f"experiment.py score {run}/eval.json" in cmd and "job_score_%J.log" in cmd
+    assert experiment.load(f"{run}/eval.json", experiment.Eval) == experiment.own_eval(experiment.Train(savedir=run))
 
 
 def test_lejepa_n_params_builds_the_model_once_per_size(tmp_path, monkeypatch):

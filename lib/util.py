@@ -2,6 +2,7 @@
 
 import inspect
 import json
+from dataclasses import asdict
 import os
 import re
 from hashlib import sha256
@@ -86,7 +87,7 @@ def code_provenance() -> dict:
 
 def log_command(argv: list[str]):
     """Append one JSON line per CLI call of an experiment script outside LSF jobs, i.e. the commands you issue
-    (submitall, runlsf n, pcalsf n, ... on the login node via jrun.sh), to outdir/_log/commands.jsonl: time, host,
+    (submitall, lsf probe n, ... on the login node via jrun.sh), to outdir/_log/commands.jsonl: time, host,
     argv and code_provenance(). Jobs don't log here: each records what it ran in its savedir's runs.json
     (experiment.record), and appends from many cluster hosts to one NFS file could interleave or overwrite."""
     if "LSB_JOBID" in os.environ:
@@ -118,6 +119,29 @@ def json_equal(a, b) -> bool:
     if isinstance(a, dict) and isinstance(b, dict):
         return a.keys() == b.keys() and all(json_equal(a[k], b[k]) for k in a)
     return a == b
+
+def parse(cls, data: dict):
+    """data validated as the dataclass cls (pydantic: nested dataclasses, Literals, tuple lengths), strictly: the result must
+    dump back to exactly data, so a field cls doesn't have, one data lacks, or a value pydantic coerced (e.g. "3" for 3) fails."""
+    import pydantic
+    job = pydantic.TypeAdapter(cls).validate_python(data)
+    assert json_equal(asdict(job), data), f"{cls.__name__} spec doesn't round-trip (a field added, missing or mistyped): {data}"
+    return job
+
+def load(job, cls):
+    """job itself, or, given a path (a spec dump wrote, e.g. <savedir>/train.json), the spec in it validated as cls (parse):
+    so an entrypoint runs the same in-process, called with its spec, and as a job, called with the spec's file."""
+    if isinstance(job, str):
+        return parse(cls, json.loads(Path(job).read_text()))
+    assert isinstance(job, cls), f"want a {cls.__name__} or the path of one's json, got {type(job).__name__}"
+    return job
+
+def dump(job) -> Path:
+    """Write the spec job (a dataclass with a savedir) to <savedir>/<its class, lowercased>.json, e.g. train.json; its path."""
+    path = Path(job.savedir) / f"{type(job).__name__.lower()}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(asdict(job), indent=1) + "\n")
+    return path
 
 
 def trace_summary(trace_path: str | Path) -> dict[str, float]:

@@ -1,5 +1,7 @@
 """Experiment code (remote): LeJEPA 3D ViT training runs, benchmarks, inference (pca) and replays, and their LSF
 sweep (paramsall, savedirs under outdir/e00/). Depends on lib/, so it runs only from its experiment's commit.
+Each job is an entrypoint taking its spec (Train or Eval) or the path of the spec's json, e.g. `run outdir/.../train.json`:
+called in-process with the spec, or as an LSF job with the file that submit() writes, so any job can submit another.
 Analysis of the results lives in analysis_utils.py (readers), analysis_plots.py (report cards) and reports/ (one page per experiment)."""
 
 from __future__ import annotations
@@ -51,7 +53,7 @@ QUEUE_ARCH = {
                             # (patchembed-linear/d1's 49% was a NaN run: cudagraphs miscompile, see eager_patch_embed)
 }
  
-# Code copied into .tmpcode/<sweep>/ at submission (runlsf); jobs import only from these. Add files here if
+# Code copied into .tmpcode/<sweep>/ at submission (bsub); jobs import only from these. Add files here if
 # the experiment starts depending on others. Dependencies (pyproject.toml / uv.lock) are not frozen.
 SNAPSHOT_PATHS = ["experiment.py", "lib", "mia_evals"]
 CPUS_PER_GPU = 12  # LSF slots per GPU: 8 GPUs -> all 96 cores; training processes need cores beyond the data workers
@@ -64,7 +66,7 @@ SCORE_CONFIG = "mia_evals/gary_comparison_neuron_instance/mws.toml"  # ours: tru
 MIA_EVALS = Path.home() / "proj/mia-evals"
 N_PARAMS_CACHE = Path(".cache/lejepa_n_params.json")  # machine-local (gitignored): see lejepa_n_params
 # Model sizes and compute budgets of e00/scaling-law's IsoFLOP grid (scaling_budgets), for designing size x budget sweeps.
-SIZES = {"xs": (4, 256), "s": (6, 384), "m": (12, 512), "l": (16, 768), "xl": (24, 1024)}  # (n_layers, width); m = Params' default
+SIZES = {"xs": (4, 256), "s": (6, 384), "m": (12, 512), "l": (16, 768), "xl": (24, 1024)}  # (n_layers, width); m = Train' default
 SCALING_BATCH = 64  # per GPU, fixed across sizes (== gpu_b300's validated default at m); xl OOMs at it on one B300
 ANCHOR_STEP_S_M_B84 = 0.32  # cudagraph-fix/d3: 1425 ktok/s at b84, flash + eager-pe cudagraphs (m: n_layers=12, width=512).
 # Measured on the multi-view objective (2 global + 4 local views, about 5.5k token-passes per sample); the masked-token objective
@@ -72,7 +74,7 @@ ANCHOR_STEP_S_M_B84 = 0.32  # cudagraph-fix/d3: 1425 ktok/s at b84, flash + eage
 SCALING_GRID = (12, 12, 12)  # token grid of the view cost estimates assume (a 96^3 view at patch 8)
 BUDGET_HOURS_AT_M = {"c1": 1, "c2": 2, "c3": 4, "c4": 8}  # m's wall-clock at each budget; other sizes get more/fewer steps
 
-def on_queue(p: Params, queue: str) -> Params:
+def on_queue(p: Train, queue: str) -> Train:
     """Put p on an LSF GPU queue with that queue's default architecture (QUEUE_ARCH)."""
     assert queue in QUEUE_ARCH, f"no default architecture for {queue!r}; add it to QUEUE_ARCH"
     p.queue = queue
@@ -88,7 +90,7 @@ def lejepa_n_params(n_layers: int, width: int) -> tuple[int, int, int]:
     key = f"{code}/{n_layers}x{width}"
     cache = json.loads(N_PARAMS_CACHE.read_text()) if N_PARAMS_CACHE.is_file() else {}
     if key not in cache:
-        model = Lejepa(lejepa_config(replace(Params(), n_layers=n_layers, width=width, views="displace", global_size=(96, 96, 96))))
+        model = Lejepa(lejepa_config(replace(Train(), n_layers=n_layers, width=width, views="displace", global_size=(96, 96, 96))))
         cache[key] = [model._n_encoder_params, model._n_predictor_params, model._n_projector_params]
         N_PARAMS_CACHE.parent.mkdir(exist_ok=True)
         N_PARAMS_CACHE.write_text(json.dumps(cache))
@@ -98,7 +100,7 @@ def sample_flops(name: str, grid=SCALING_GRID) -> float:
     """Model training FLOPs per sample of SIZES[name] (exact: lib.models.lejepa.train_flops, which Lejepa.forward's own
     out.n_flops uses), for a view with this token grid."""
     n_layers, width = SIZES[name]
-    return train_flops(lejepa_config(replace(Params(), n_layers=n_layers, width=width)), grid, *lejepa_n_params(n_layers, width))
+    return train_flops(lejepa_config(replace(Train(), n_layers=n_layers, width=width)), grid, *lejepa_n_params(n_layers, width))
 
 def step_seconds(name: str, batch: int, grid=SCALING_GRID) -> float:
     """Estimated seconds per training step of SIZES[name] at this per-GPU batch: ANCHOR_STEP_S_M_B84 scaled by FLOPs per
@@ -114,7 +116,7 @@ def scaling_budgets() -> dict[str, float]:
     return {b: h * flops_per_hour_m for b, h in BUDGET_HOURS_AT_M.items()}
 
 @dataclass(slots=True)
-class Params:
+class Train:
     savedir: str = "outdir/e00/main/basic/"
     data: TrainData = "hemibrain_eb"  # training volumes, see lib.data.TRAIN_BOXES
     patch_size: Tup3Int = (104, 104, 104)  # hemibrain EB is 8 nm isotropic
@@ -155,26 +157,26 @@ class Params:
     anneal_from: str = ""  # a checkpoint .pt (anneal_params): train() continues it for steps_per_epoch steps, Adam moments kept,
                            # lr cosine-decaying from the checkpoint's lr to 1% of it; run() then evals the result (pca, probe)
 
-    # evals
-    init_from: str = ""  # weights pca/probe evaluate: "" this run's checkpoint; a run dir, its latest one; a checkpoint .pt; "random" untrained
-    decoder: Decoder = "linear"  # probe(): "linear" (per-token Linear, lib.probe.fit_probe) or "unetr" (lib.decoders.unetr)
-    unetr_hidden_dim: int = 64  # decoder="unetr": its decoder channel width (lib.decoders.unetr.UnetrConfig)
-    unetr_steps: int = 3000  # decoder="unetr": fit_unetr training steps (fit_probe's STEPS, for comparison)
-    unetr_freeze_encoder: bool = True  # decoder="unetr": keep the encoder frozen while fitting it (fair vs. the linear probe)
-    score: bool = True  # probe() writes the affinity artifacts `score` reads (probe/{fit,test}, GBs each; score deletes them after): False for a run nobody scores
-
     # profiling params
     warmup_steps: int = 10
     benchmark_steps: int = 50
     profile_steps: int = 10  # Set to zero to disable trace collection.
 
+@dataclass(slots=True)
+class Eval:
+    """The spec of pca, probe and score: one set of weights, in the architecture of the run that made them. A run's own
+    end-of-training eval (own_eval), a trunk milestone's (eval_params), or an older run's or untrained weights."""
+    savedir: str
+    train: Train  # the run the weights are of: its architecture, its view size (the tiles pca and probe encode), its queue
+    init_from: str = ""  # the weights: "" train's own latest checkpoint; a run dir, its latest; a checkpoint .pt; "random" untrained
+    decoder: Decoder = "linear"  # probe(): "linear" (per-token Linear, lib.probe.fit_probe) or "unetr" (lib.decoders.unetr)
+    unetr_hidden_dim: int = 64  # decoder="unetr": its decoder channel width (lib.decoders.unetr.UnetrConfig)
+    unetr_steps: int = 3000  # decoder="unetr": fit_unetr training steps (fit_probe's STEPS, for comparison)
+    unetr_freeze_encoder: bool = True  # decoder="unetr": keep the encoder frozen while fitting it (fair vs. the linear probe)
+    score: bool = False  # probe() also writes the affinity artifacts `score` reads (probe/{fit,test}, GBs each; score deletes them after)
+
 # This experiment's id (README: experiment ids): its runs are outdir/<EXPERIMENT>/d<i>/.
 EXPERIMENT = "e00/e04-sigreg-both"
-
-# This experiment's one entrypoint: submitall() submits every trunk with it (README: one experiment, one entrypoint).
-# The branches of each trunk's milestones need no submit: the trunk submits them as it saves each (spawn_branches).
-def submit(n):
-    runlsf(n)
 
 # submitall() submits only these trunks (None: every trunk), e.g. to relaunch the ones that died or were cut short by max_hours.
 # A relaunched trunk restarts at step 0, so all its branches respawn (the old ones are trashed).
@@ -199,7 +201,7 @@ def paramsall():
     trunks = []
     for block in [0.3, 0.6]:
         for pull in [1, 3.2, 10, 32]:
-            p = Params()
+            p = Train()
             p.savedir = f"outdir/{EXPERIMENT}/d{len(trunks)}/"
             p.data = "hemibrain_wide"
             p.views = "displace"
@@ -217,11 +219,10 @@ def paramsall():
             p.cudagraphs = True
             p.n_workers = 11  # 12 cores per GPU
             p.queue = "gpu_rtx6000"
-            p.score = False  # not scored: no affinity artifacts (probe/{fit,test}, GBs per probe)
             trunks.append(p)
     return with_branches(trunks)
 
-def milestone_steps(trunk: Params) -> list[int]:
+def milestone_steps(trunk: Train) -> list[int]:
     """The steps whose checkpoints train() keeps in checkpoints/milestones/: every milestone_every steps up to steps_per_epoch,
     or, if that is 0, every 10% of it (the last is the final checkpoint of a trunk that ran to completion). A trunk stopped
     early by max_hours never reaches the later ones: with a time budget, steps_per_epoch is just the cap that lists them."""
@@ -229,35 +230,42 @@ def milestone_steps(trunk: Params) -> list[int]:
         return list(range(trunk.milestone_every, trunk.steps_per_epoch + 1, trunk.milestone_every))
     return sorted({round(k * trunk.steps_per_epoch / 10) for k in range(1, 11)})
 
-def anneal_params(i: int, trunk: Params, step: int) -> Params:
-    """Params of the anneal of `trunk`'s milestone at `step`: continued for 10% of its steps on a cosine decay from its lr
-    to 1% of it (Params.anneal_from), then run()'s pca maps and linear probe, in outdir/<EXPERIMENT>/d<i>/. Everything
+def anneal_params(i: int, trunk: Train, step: int) -> Train:
+    """Train of the anneal of `trunk`'s milestone at `step`: continued for 10% of its steps on a cosine decay from its lr
+    to 1% of it (Train.anneal_from), then run()'s pca maps and linear probe, in outdir/<EXPERIMENT>/d<i>/. Everything
     else (model, views, data, optimizer) is the trunk's own. The checkpoint need not exist yet: its path is deterministic."""
     assert step in milestone_steps(trunk), f"step {step} is not a milestone of {trunk.savedir}: {milestone_steps(trunk)}"
     assert step // 10 > 0, f"step {step} leaves no anneal steps"
     return replace(trunk, savedir=f"outdir/{EXPERIMENT}/d{i}/", steps_per_epoch=step // 10, max_hours=0.2 * trunk.max_hours,
-                   anneal_from=str(Path(trunk.savedir) / "checkpoints/milestones" / f"step_{step:07d}.pt"), decoder="linear",
+                   anneal_from=str(Path(trunk.savedir) / "checkpoints/milestones" / f"step_{step:07d}.pt"),
                    benchmark_steps=0, profile_steps=0)  # the trunk's throughput and trace say it all
 
-def eval_params(i: int, trunk: Params, step: int) -> Params:
-    """Params of the eval of `trunk`'s milestone at `step`: pca maps and the linear probe (pca, probe) of that checkpoint as
-    saved, not annealed, in outdir/<EXPERIMENT>/d<i>/. Everything else is the trunk's own. The checkpoint need not exist yet."""
+def eval_params(i: int, trunk: Train, step: int) -> Eval:
+    """The eval of `trunk`'s milestone at `step`: pca maps and the linear probe (pca, probe) of that checkpoint as saved, not
+    annealed, in outdir/<EXPERIMENT>/d<i>/. The checkpoint need not exist yet: its path is deterministic."""
     assert step in milestone_steps(trunk), f"step {step} is not a milestone of {trunk.savedir}: {milestone_steps(trunk)}"
-    return replace(trunk, savedir=f"outdir/{EXPERIMENT}/d{i}/", decoder="linear", benchmark_steps=0, profile_steps=0,
-                   init_from=str(Path(trunk.savedir) / "checkpoints/milestones" / f"step_{step:07d}.pt"))
+    return Eval(savedir=f"outdir/{EXPERIMENT}/d{i}/", train=trunk,
+                init_from=str(Path(trunk.savedir) / "checkpoints/milestones" / f"step_{step:07d}.pt"))
 
-def milestone_of(p: Params) -> str:
+def own_eval(t: Train) -> Eval:
+    """The eval of a training run's own latest checkpoint, in its own savedir: what run() does after training."""
+    return Eval(savedir=t.savedir, train=t)
+
+def source(p: Train | Eval) -> str:
+    """The weights p starts from: an anneal's checkpoint (Train.anneal_from), or the ones an eval reads (Eval.init_from)."""
+    return p.anneal_from if isinstance(p, Train) else p.init_from
+
+def milestone_of(p: Train | Eval) -> str:
     """The milestone checkpoint of this experiment's own trunk that a branch (with_branches) starts from, the one it anneals or
     evaluates; "" for a trunk, and for an eval-only run of another experiment's weights (init_from outside outdir/<EXPERIMENT>/)."""
-    source = p.anneal_from or p.init_from
-    return source if source.startswith(f"outdir/{EXPERIMENT}/") else ""
+    return source(p) if source(p).startswith(f"outdir/{EXPERIMENT}/") else ""
 
-def with_branches(trunks: list[Params]) -> list[Params]:
+def with_branches(trunks: list[Train]) -> list[Train | Eval]:
     """paramsall() for a trunk sweep: the trunks, then one branch per milestone of each: an anneal if ANNEAL, else an eval.
     A trunk submits its milestone's branch itself, the moment it saves it (spawn_branches); submitall() submits only the
     trunks."""
     branch = anneal_params if ANNEAL else eval_params
-    params = list(trunks)
+    params: list[Train | Eval] = list(trunks)
     for t in trunks:
         for step in milestone_steps(t):
             params.append(branch(len(params), t, step))
@@ -267,8 +275,8 @@ def printparams():
     for p in paramsall():
         pprint(p)
 
-def record(par: Params, fn: str):
-    """Append one row to par.savedir/runs.json: which experiment function ran (fn), its params, code_provenance(),
+def record(par: Train | Eval, fn: str):
+    """Append one row to par.savedir/runs.json: which experiment function ran (fn), its spec (params), code_provenance(),
     argv and LSF job. Written first thing, so even a run that crashes before any results describes itself.
     Repro for the dir's artifacts: that commit + argv. The command that submitted the job is in
     outdir/_log/commands.jsonl (log_command)."""
@@ -280,7 +288,7 @@ def collate_images(samples):
     import torch
     return torch.stack([s["img"] for s in samples])
 
-def lejepa_config(par: Params):
+def lejepa_config(par: Train):
     return LejepaConfig(
         encoder = EncoderConfig(depth=par.n_layers, embed_dim=par.width, num_heads=par.width // 64),
         view = ViewConfig(views=par.views, global_size=par.global_size),
@@ -290,7 +298,7 @@ def lejepa_config(par: Params):
         stop_grad = par.stop_grad,
     )
 
-def compile_model(model: Lejepa, par: Params):
+def compile_model(model: Lejepa, par: Train):
     """torch.compile the encoder in place, as par says (no-op unless par.compile)."""
     import torch
     assert par.compile or not (par.cudagraphs or par.compile_blocks), "cudagraphs / compile_blocks require compile"
@@ -315,7 +323,7 @@ def compile_model(model: Lejepa, par: Params):
         pe = model.encoder.patch_embed
         setattr(pe, "forward", torch.compiler.disable(pe.forward))  # instance override; nn.Module.__call__ uses it
 
-def save_view_pngs(par: Params, dataset, n_samples: int = 3):
+def save_view_pngs(par: Train, dataset, n_samples: int = 3):
     """Save what the model sees: for n_samples fresh samples, the input and each of its views, as
     center-z slices at native voxel size, left to right (input | globals | locals) -> savedir/views_{i}.png."""
     from PIL import Image
@@ -335,9 +343,8 @@ def save_view_pngs(par: Params, dataset, n_samples: int = 3):
         Image.fromarray(np.concatenate(panels, axis=1)).save(savedir / f"views_{b}.png")
     print(f"Saved {n_samples} input + view slices to {savedir}/views_*.png", flush=True)
 
-def dataloader(n:int):
+def dataloader(par: Train):
     import torch
-    par: Params = paramsall()[n]
     # volumes = [x.to_miao() for x in lmd.all() if x.name == "exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001"]
     # Training volumes (lib/data.py), images only. Boxes are x y z; output is z y x.
     # With several volumes miao samples each equally (size_weighting_exponent=0); the wide crops are ~equal size.
@@ -370,15 +377,15 @@ def dataloader(n:int):
         save_view_pngs(par, dl)
     return batches
 
-def train(n:int):
-    """Train paramsall()[n] (every DDP rank); ends with no process group left. run() adds the evals."""
+def train(job: Train | str):
+    """Train the spec job, or the one in the train.json it names (load), on every DDP rank; ends with no process group left.
+    run() adds the evals."""
     start_time = time.time()
-    # LSF jobs must run a runlsf snapshot: the shared checkout's paramsall()[n] may be another sweep by now.
+    # LSF jobs must run a code snapshot (bsub): the shared checkout's lib/ may be another sweep's by now.
     b1 = "LSB_JOBID" in os.environ
     b2 = ".tmpcode" not in Path(__file__).resolve().parts
-    assert not (b1 and b2), f"LSF job running {__file__} from the shared checkout; submit via runlsf (code snapshot)"
-    par : Params = paramsall()[n]
-    assert not par.init_from, f"{par.savedir}: init_from={par.init_from!r} is a probe-only run (training ignores it); use probe"
+    assert not (b1 and b2), f"LSF job running {__file__} from the shared checkout; submit via submit() (code snapshot)"
+    par = load(job, Train)
     if int(os.environ.get("RANK", 0)) == 0:  # first thing, so even a run that crashes early describes itself
         record(par, "run")
     import torch
@@ -402,7 +409,7 @@ def train(n:int):
         dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo")
 
     # each rank/process gets it's own dataloader with a distinct np.random generator?
-    batches = dataloader(n)
+    batches = dataloader(par)
 
     savedir = Path(par.savedir)
 
@@ -568,30 +575,31 @@ def train(n:int):
     if world_size > 1:
         dist.destroy_process_group()
 
-def has_branches(par: Params) -> bool:
+def has_branches(par: Train) -> bool:
     """Whether paramsall() has an entry (with_branches) that starts from one of par's milestones: par is a trunk."""
     milestones = str(Path(par.savedir) / "checkpoints/milestones")
     return any(milestone_of(p).startswith(milestones) for p in paramsall())
 
-def latest_step(par: Params) -> int:
+def latest_step(par: Train) -> int:
     """The step of par's newest checkpoint (-1 if it has none)."""
     return max((int(p.stem.split("_")[1]) for p in (Path(par.savedir) / "checkpoints").glob("step_*.pt")), default=-1)
 
-def run(n:int):
-    """The LSF job: train paramsall()[n], then rank 0 evaluates its last finite checkpoint (pca, probe).
+def run(job: Train | str):
+    """The LSF training job: train the spec job (or its train.json's), then rank 0 evaluates its last finite checkpoint (pca,
+    probe of own_eval).
 
     Evals run after train() has destroyed the process group, so the other ranks exit instead of waiting at a
     collective for minutes; they only run for training runs (max_hours > 0), not throughput benchmarks, and not for a
     trunk that stopped on a milestone: its branch evaluates that checkpoint. One that max_hours stopped between two does.
     """
-    train(n)
-    par = paramsall()[n]
+    par = load(job, Train)
+    train(par)
     b1 = int(os.environ.get("RANK", 0)) == 0
     b2 = bool(par.max_hours)
     b3 = has_branches(par) and latest_step(par) in milestone_steps(par)
     if b1 and b2 and not b3:
-        pca(n)
-        probe(n)
+        pca(own_eval(par))
+        probe(own_eval(par))
 
 
 def replay_bad_batch(path: str):
@@ -604,7 +612,7 @@ def replay_bad_batch(path: str):
        cuDNN gives non-finite grads, its attention backward is the culprit. Eager because compiled replays
        ignored sdpa_kernel (identical losses for every backend). The math backend is left out: it materializes
        Batch Head N N attention and doesn't fit at training batch sizes. CUDA only (fused kernels).
-    3. As trained (compiled per the run's Params): does the gradient come out non-finite again? Runs last:
+    3. As trained (compiled per the run's Train): does the gradient come out non-finite again? Runs last:
        its CUDA graph pools stay allocated. Uses torch's default SDPA pick (cuDNN), as runs before run()
        disabled cuDNN attention did; 1 does too.
     Returns loss and non-finite param count per replay; also prints which params kept finite grads.
@@ -616,7 +624,7 @@ def replay_bad_batch(path: str):
     ours = {Path(p.savedir).resolve() for p in paramsall()}
     assert Path(path).resolve().parent in ours, f"{path} isn't from this commit's paramsall(): replay it from its experiment's commit"
     dump = torch.load(path, map_location="cpu", weights_only=False)
-    par = Params(**dump["params"])
+    par = parse(Train, dump["params"])
     record(par, "replay_bad_batch")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.set_float32_matmul_precision(par.f32mode)
@@ -658,53 +666,54 @@ def replay_bad_batch(path: str):
     res["as trained"] = step("as trained", compiled=True)
     return res
 
-def load_checkpoint(par: Params):
-    """(model on the GPU if any, step) for inference (pca, probe): the weights par.init_from names.
+def load_checkpoint(e: Eval):
+    """(model on the GPU if any, step) for inference (pca, probe): the weights e.init_from names, in e.train's architecture.
 
-    "" (default): par's own latest checkpoint, whose saved params must match par. Inference depends on lib/, so
+    "" (default): e.train's own latest checkpoint, whose saved params must match e.train. Inference depends on lib/, so
     like training it only runs for this commit's own experiment: for an older sweep, go back to its commit.
-    A run dir (e.g. outdir/e00/viewsizes/d0): that run's latest checkpoint, loaded strictly into par's architecture,
+    A run dir (e.g. outdir/e00/viewsizes/d0): that run's latest checkpoint, loaded strictly into e.train's architecture,
     so an incompatible one fails loudly (Conv3d-era patch embeds load, see PatchEmbed3d). The run dir is an
     artifact in outdir/'s append-only log, so this is how a probe reuses a known-good older model.
     "random": untrained weights, seeded (the baseline every trained encoder must beat). Step 0.
     """
     import torch
-    model = Lejepa(lejepa_config(par))
+    model = Lejepa(lejepa_config(e.train))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if par.init_from == "random":
+    if e.init_from == "random":
         torch.manual_seed(0)
-        return Lejepa(lejepa_config(par)).to(device).eval(), 0
-    src = Path(par.init_from or par.savedir)
+        return Lejepa(lejepa_config(e.train)).to(device).eval(), 0
+    src = Path(e.init_from or e.train.savedir)
     paths = [src] if src.suffix == ".pt" else sorted((src / "checkpoints").glob("step_*.pt")) or sorted(src.glob("checkpoint.pt"))
     assert paths, f"no checkpoints in {src}"
     ckpt = torch.load(paths[-1], map_location="cpu", weights_only=False)
-    if not par.init_from:
-        assert json_equal(ckpt["params"], asdict(par)), f"{paths[-1]} was made by other params: run from its experiment's commit"
+    if not e.init_from:
+        assert json_equal(ckpt["params"], asdict(e.train)), f"{paths[-1]} was made by other params: run from its experiment's commit"
     model.load_state_dict(ckpt["model"])  # strict: architecture drift fails loudly
     return model.to(device).eval(), ckpt["step"]
 
-def release_milestone(par: Params):
-    """Delete the trunk milestone par's run started from (a branch, see milestone_of) once nothing reads it any more: its pca
-    and probe have both written their results (the second to finish deletes it; a failed job keeps it for a retry). A
-    milestone is a full checkpoint, 0.6 GB for m."""
-    source = milestone_of(par)
-    if source and all((Path(par.savedir) / f).is_file() for f in ("pca.json", "probe.json")):
-        Path(source).unlink(missing_ok=True)
+def release_milestone(e: Eval):
+    """Delete the trunk milestone e's weights came from (see milestone_of: an eval of it, or an anneal's own eval) once nothing
+    reads it any more: e's pca and probe have both written their results (the second to finish deletes it; a failed job keeps
+    it for a retry). A milestone is a full checkpoint, 0.6 GB for m."""
+    milestone = milestone_of(e) or milestone_of(e.train)
+    if milestone and all((Path(e.savedir) / f).is_file() for f in ("pca.json", "probe.json")):
+        Path(milestone).unlink(missing_ok=True)
 
 def releaseall():
     """release_milestone for every entry: frees the milestones of branches that finished before it existed."""
     for p in paramsall():
-        release_milestone(p)
+        release_milestone(p if isinstance(p, Eval) else own_eval(p))
 
-def pca(n:int):
-    """PCA maps (pca_maps) of paramsall()[n]'s latest checkpoint. Runs at the end of training; pcalsf(n) redoes it."""
-    par = paramsall()[n]
-    model, step = load_checkpoint(par)
-    record(par, "pca")  # argv says whether it ran inside `run n` or on its own (pcalsf)
-    pca_maps(model.encoder, par, Path(par.savedir), step)
-    release_milestone(par)
+def pca(job: Eval | str):
+    """PCA maps (pca_maps) of the spec job's weights (or those of the eval.json it names). run() does it at the end of
+    training; `lsf pca n` redoes it."""
+    e = load(job, Eval)
+    model, step = load_checkpoint(e)
+    record(e, "pca")  # argv says whether it ran inside `run` or on its own
+    pca_maps(model.encoder, e.train, Path(e.savedir), step)
+    release_milestone(e)
 
-def pca_maps(encoder, par: Params, savedir: Path, step: int):
+def pca_maps(encoder, par: Train, savedir: Path, step: int):
     """PCA maps of patch-token embeddings on a held-out EB val crop -> savedir/pca2.png, pca.json.
 
     pca2.png rows: the middle z-slice of each of the crop's 3 tile layers (a token's tile is the 96^3 view the encoder
@@ -789,18 +798,18 @@ def pca_maps(encoder, par: Params, savedir: Path, step: int):
     print(f"{savedir}: step {step}, effective rank {erank:.1f}, top-3 variance {sum(var[:3]):.2f}, "
           f"between-tile variance {between_tile:.2f}, norm outliers (>2x median) {stats['norm_outliers']}/{norms.numel()}; wrote pca2.png")
 
-def score(n:int):
-    """Score probe(n)'s affinities as mia-evals' neuron-instance task (SCORE_CONFIG: mutex watershed + size filter,
+def score(job: Eval | str):
+    """Score probe(job)'s affinities as mia-evals' neuron-instance task (SCORE_CONFIG: mutex watershed + size filter,
     fitted on the fit block, reported on the test block; panoptic quality ranks, VOI and ARE reported).
 
     Writes the record into the run's own dir, savedir/mia_evals/<task>/records/*.json (pull.sh brings it down;
     analysis_plots.mia_evals_table reads it), not mia-evals' repo. resolved_config.json (params) and git_commit.txt (the
     commit that ran) go in the savedir first: mia-evals copies them into the record from --run-dir.
     Runs the sister checkout MIA_EVALS's own CLI and .venv, from that checkout (its commit is in the record), with this
-    commit's SCORE_CONFIG (scorelsf). Deletes savedir/probe/ (the artifacts it read) once the record is written.
+    commit's SCORE_CONFIG (`lsf score n`). Deletes savedir/probe/ (the artifacts it read) once the record is written.
     """
     import subprocess
-    par = paramsall()[n]
+    par = load(job, Eval)
     savedir = Path(par.savedir)
     assert (savedir / "probe/test").is_dir() and (savedir / "probe/fit").is_dir(), f"no probe artifacts in {savedir}: probe first (a run with score=False writes none)"
     exe = MIA_EVALS / ".venv/bin/mia-evals"
@@ -808,7 +817,7 @@ def score(n:int):
     record(par, "score")
     (savedir / "resolved_config.json").write_text(json.dumps(asdict(par)) + "\n")
     (savedir / "git_commit.txt").write_text(code_provenance()["commit_id"] + "\n")
-    config = Path(__file__).resolve().parent / SCORE_CONFIG  # the snapshot's copy when run by scorelsf
+    config = Path(__file__).resolve().parent / SCORE_CONFIG  # the snapshot's copy when run as a job
     cmd = [str(exe), "score", str(config),
            "--test", str(savedir.resolve() / "probe/test"), "--val", str(savedir.resolve() / "probe/fit"),
            "--leaderboard", str(savedir.resolve() / "mia_evals"), "--run-dir", str(savedir.resolve()),
@@ -855,14 +864,14 @@ def write_affinities(path: Path, array, **attrs):
     store[:] = array
     store.attrs.update(kind="affinity", **attrs)
 
-def probe(n:int):
-    """Linear or dense (par.decoder) affinity probe of paramsall()[n]'s latest checkpoint, scored as mia-evals'
-    neuron-instance task, fitted on HEMIBRAIN_EB_PROBE_BOXES["train"] against proofread-cell-hemibrain-v1.2.
+def probe(job: Eval | str):
+    """Linear or dense (par.decoder) affinity probe of the spec job's weights (or those of the eval.json it names), scored as
+    mia-evals' neuron-instance task, fitted on HEMIBRAIN_EB_PROBE_BOXES["train"] against proofread-cell-hemibrain-v1.2.
 
     decoder="linear" (default, lib.probe): frozen encoder, one Linear per token to mia-evals' 6 affinity channels
       at every voxel of its patch.
     decoder="unetr" (lib.decoders.unetr): Unetr, with skip connections into the encoder's own intermediate blocks,
-      fitted end to end on crops the same size as the encoder's own training views (par.global_size); frozen
+      fitted end to end on crops the same size as the encoder's own training views (par.train.global_size); frozen
       unless par.unetr_freeze_encoder=False.
     Either way:
       savedir/probe.json          test-block BCE and boundary AP per channel (cheap, immediate)
@@ -872,14 +881,15 @@ def probe(n:int):
       savedir/probe/{fit,test}/hemibrain_eb_{split}.zarr   mia-evals affinity artifacts, (6, X, Y, Z) float16, for
                                   `mia-evals score` with truth_kind = "instances" (reads the GT from the store)
       savedir/probe.png           test block, middle z: EM | true boundaries | predicted boundaries
-    Reads get whole tiles of context (par.global_size) around each 896^3 block, as in training.
+    Reads get whole tiles of context (the training view, tile) around each 896^3 block, as in training.
     """
     import math
     import torch
     import zarr
     from PIL import Image
     from lib.probe import AFFINITY_OFFSETS_XYZ, affinities, average_precision, fit_probe, to_tokens, to_voxels
-    par = paramsall()[n]
+    par = load(job, Eval)
+    tile = par.train.global_size
     model, step = load_checkpoint(par)
     record(par, "probe")
     encoder, device = model.encoder, next(model.parameters()).device
@@ -888,18 +898,18 @@ def probe(n:int):
     raw, lab = zarr.open_array(f"{vol.path}/raw/s0", mode="r"), zarr.open_array(f"{vol.path}/{HEMIBRAIN_EB_LABELS}/s0", mode="r")
     offsets = [o[::-1] for o in AFFINITY_OFFSETS_XYZ]  # the store is x y z; the model sees z y x
 
-    def block(box):  # (token features N D, labels Z Y X, EM Z Y X, padded img Z Y X [a multiple of par.global_size],
+    def block(box):  # (token features N D, labels Z Y X, EM Z Y X, padded img Z Y X [a multiple of tile],
         # margin m, box size) for an x y z box of the store: img/m/size let a dense model (unetr) tile the padded
-        # region (tile_logits needs an exact multiple of par.global_size, unlike em, trimmed to the box's own size)
+        # region (tile_logits needs an exact multiple of tile, unlike em, trimmed to the box's own size)
         # and then trim its predictions back to the box with the same margin feats are trimmed by, in token space.
         lo, size = [b[0] for b in box][::-1], [b[1] - b[0] for b in box][::-1]  # z y x
-        region = [math.ceil(s / t) * t for s, t in zip(size, par.global_size)]  # whole tiles around the box
+        region = [math.ceil(s / t) * t for s, t in zip(size, tile)]  # whole tiles around the box
         m = [(r - s) // 2 for r, s in zip(region, size)]
         assert all(mi % q == 0 for mi, q in zip(m, p)) and all(s % q == 0 for s, q in zip(size, p)), (box, region)
         (z0, y0, x0), (zs, ys, xs) = [l - mi for l, mi in zip(lo, m)], region
         assert min(z0, y0, x0) >= 0 and max(z0 + zs, y0 + ys, x0 + xs) <= min(raw.shape), f"{box}: context leaves the crop"
         img = torch.from_numpy(np.asarray(raw[x0:x0 + xs, y0:y0 + ys, z0:z0 + zs])).permute(2, 1, 0).to(device).float() / 255
-        feats = tile_features(encoder, img, par.global_size)
+        feats = tile_features(encoder, img, tile)
         t0 = [mi // q for mi, q in zip(m, p)]
         feats = feats[t0[0]:t0[0] + size[0] // p[0], t0[1]:t0[1] + size[1] // p[1], t0[2]:t0[2] + size[2] // p[2]]
         (bx0, bx1), (by0, by1), (bz0, bz1) = box
@@ -941,12 +951,12 @@ def probe(n:int):
             encoder.requires_grad_(False)
         test_aff, test_valid = affinities(test_labels, offsets)
         g = torch.Generator().manual_seed(0)
-        held = random_crop(test_em[None], test_aff, test_valid, par.global_size, g)  # one crop, monitoring only
+        held = random_crop(test_em[None], test_aff, test_valid, tile, g)  # one crop, monitoring only
         del test_aff, test_valid
         _, train_labels, train_em, _, _, _ = block(HEMIBRAIN_EB_PROBE_BOXES["train"])
         train_aff, train_valid = affinities(train_labels, offsets)
         del train_labels
-        curve = fit_unetr(unetr, train_em[None], train_aff, train_valid, par.global_size, held, steps=par.unetr_steps)
+        curve = fit_unetr(unetr, train_em[None], train_aff, train_valid, tile, held, steps=par.unetr_steps)
         del train_em, train_aff, train_valid, held
 
         def predict(box):
@@ -954,7 +964,7 @@ def probe(n:int):
                 labels, em, img, m, size = test_labels, test_em, test_img, test_m, test_size
             else:
                 _, labels, em, img, m, size = block(box)
-            logits = tile_logits(unetr, img, par.global_size)  # OutDim (padded region) Z Y X
+            logits = tile_logits(unetr, img, tile)  # OutDim (padded region) Z Y X
             pred = torch.sigmoid(logits[:, m[0]:m[0] + size[0], m[1]:m[1] + size[1], m[2]:m[2] + size[2]])
             return pred, labels, em
 
@@ -992,110 +1002,94 @@ def probe(n:int):
     print(f"{par.savedir}: probe at step {step}: boundary AP (short-range mean) {stats['boundary_ap_short']:.3f}{'; wrote probe/' * par.score}", flush=True)
     release_milestone(par)
 
-def bsub(par: Params, job: str, minutes: int, n_gpus: int, cmd: str, queue: str | None = None, slots: int | None = None):
-    """Submit `uv run <cmd>` for par's run dir to LSF as job <sweep>-<dN>-<job>, logging to savedir/job_<job>_%J.log.
-    Default: par.queue with CPUS_PER_GPU slots per GPU. A CPU job (n_gpus = 0) names its queue and slots.
+def bsub(savedir: str, job: str, minutes: int, n_gpus: int, queue: str, cmd: str, slots: int | None = None):
+    """Submit `uv run <cmd>` for the run dir savedir to LSF as job <sweep>-<dN>-<job>, logging to savedir/job_<job>_%J.log,
+    on queue with CPUS_PER_GPU slots per GPU (a CPU job, n_gpus = 0, names its slots).
 
     {code} in cmd is this commit's code snapshot (.tmpcode/<sweep>/), which the job runs instead of the shared
     checkout: that may have moved on (another sweep pushed) by the time the job starts. Python puts the script's
     dir first on sys.path, so `lib` comes from the snapshot too; cwd stays the repo root, so outdir/ and data paths
-    resolve as before. Callers assert_committed() first.
+    resolve as before. Callers from the shared checkout assert_committed() first.
     """
     import subprocess
-    name = "-".join(Path(par.savedir).parts[1:]) + f"-{job}"  # e.g. e00-nanhunt-d9-run, so bjobs shows which is which
+    name = "-".join(Path(savedir).parts[1:]) + f"-{job}"  # e.g. e00-nanhunt-d9-run, so bjobs shows which is which
     here = Path(__file__).resolve().parent
     # A job submitting a job (spawn_branches) hands on the snapshot it runs itself, not the shared checkout's current state.
-    code = here if ".tmpcode" in here.parts else snapshot(SNAPSHOT_PATHS, Path(".tmpcode") / "-".join(Path(par.savedir).parts[1:-1]))
+    code = here if ".tmpcode" in here.parts else snapshot(SNAPSHOT_PATHS, Path(".tmpcode") / "-".join(Path(savedir).parts[1:-1]))
     gpu = f'-gpu "num={n_gpus}:mode=exclusive_process"' if n_gpus else ""
     full = f""" bsub -J {name} \
         -W {minutes // 60}:{minutes % 60:02d} \
         -P miaai \
         -n {slots or n_gpus * CPUS_PER_GPU} \
         -R "span[hosts=1]" {gpu} \
-        -q {queue or par.queue} \
-        -o {par.savedir}/job_{job}_%J.log \
+        -q {queue} \
+        -o {savedir}/job_{job}_%J.log \
         uv run {cmd.format(code=code)}
         """
     subprocess.Popen(full, shell=True, stdin=subprocess.DEVNULL, start_new_session=True)
     print(f"Submitted {name} (code {code}) to LSF.")
 
-def runlsf(n:int):
-    """Train paramsall()[n] on LSF, in a fresh savedir (old contents -> outdir/.trash/)."""
+def submit(fn: str, job: Train | Eval):
+    """Run the entrypoint fn on the spec job as an LSF job: job written to its savedir (dump: train.json or eval.json), and
+    `experiment.py <fn> <that file>` submitted (bsub), which loads it. Resources by fn: run, a training job on job's queue
+    and GPUs (torchrun); pca and probe, one GPU on the trained run's queue; score, a CPU job on SCORE_QUEUE. No commit check:
+    callers from the shared checkout (submitall, lsf) assert_committed() first; a job submitting one is committed code."""
+    b1 = fn == "run" and isinstance(job, Train)
+    b2 = fn in ("pca", "probe", "score") and isinstance(job, Eval)
+    assert b1 or b2, f"{job.savedir}: no LSF job {fn!r} for a {type(job).__name__} (run takes a Train; pca, probe and score an Eval)"
+    assert not isinstance(job, Train) or job.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={job.n_workers} leaves no core for the training process"
+    spec = dump(job)
+    if isinstance(job, Train):
+        minutes = int(job.max_hours * 60) + 60 if job.max_hours else 15  # slack: startup, final checkpoint, pca + probe
+        bsub(job.savedir, fn, minutes, job.n_gpus, job.queue, f"torchrun --standalone --nproc_per_node={job.n_gpus} {{code}}/experiment.py run {spec}")
+    elif fn == "score":
+        bsub(job.savedir, fn, SCORE_MINUTES, 0, SCORE_QUEUE, f"python {{code}}/experiment.py score {spec}", slots=SCORE_SLOTS)
+    else:
+        bsub(job.savedir, fn, {"pca": 30, "probe": 60}[fn], 1, job.train.queue, f"python {{code}}/experiment.py {fn} {spec}")
+
+def start(p: Train | Eval):
+    """Submit p fresh: its savedir emptied (old contents -> outdir/.trash/), then its jobs: a training run (which evals itself
+    after), or an eval's pca and probe."""
+    trash(p.savedir)
+    for fn in ["run"] if isinstance(p, Train) else ["pca", "probe"]:
+        submit(fn, p)
+
+def lsf(fn: str, n: int):
+    """Redo one job of paramsall()[n] on LSF, e.g. `lsf probe 3` after changing probe: pca, probe or score of an eval, or of a
+    training run's own checkpoint (own_eval), in place; or run, which restarts the run fresh (start)."""
     assert_committed()
-    submit_run(n)
-
-def submit_run(n:int):
-    """runlsf without the commit check, for a job that submits one (spawn_branches): its own code is already committed."""
-    par:Params = paramsall()[n]
-    assert not par.init_from, f"{par.savedir}: init_from={par.init_from!r} is an eval-only run (training ignores it)"
-    assert par.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={par.n_workers} leaves no core for the training process"
-    trash(par.savedir)
-    minutes = int(par.max_hours * 60) + 60 if par.max_hours else 15  # slack: startup, final checkpoint, pca + probe
-    bsub(par, "run", minutes, par.n_gpus, f"torchrun --standalone --nproc_per_node={par.n_gpus} {{code}}/experiment.py run {n}")
-
-def submit_eval(n:int):
-    """pca(n) and probe(n) as two LSF jobs, in a fresh savedir (old contents -> outdir/.trash/), for an eval branch (its weights
-    are par.init_from). No commit check: a trunk's job submits it (spawn_branches), and its own code is already committed."""
-    par:Params = paramsall()[n]
-    assert par.init_from, f"{par.savedir}: no init_from: nothing for an eval to read"
-    trash(par.savedir)
-    bsub(par, "pca", 30, 1, f"python {{code}}/experiment.py pca {n}")
-    bsub(par, "probe", 60, 1, f"python {{code}}/experiment.py probe {n}")
-
-def submit_branch(n:int):
-    """Submit paramsall()[n], a branch (with_branches): an anneal is a training run (which evals itself after), an eval is two jobs."""
-    (submit_run if paramsall()[n].anneal_from else submit_eval)(n)
+    p = paramsall()[n]
+    if fn == "run":
+        start(p)
+    else:
+        submit(fn, p if isinstance(p, Eval) else own_eval(p))
 
 def spawn_branches(milestone: Path):
     """Submit the paramsall() entries (with_branches) that start from `milestone`, which the trunk just saved. The trunk is
     hours in, so a submit that fails must not kill it: it prints ERR, and spawnall() redoes what was missed."""
-    for j, p in enumerate(paramsall()):
+    for p in paramsall():
         if milestone_of(p) == str(milestone):
             try:
-                submit_branch(j)
+                start(p)
             except Exception as err:
-                print(f"ERR: could not submit the branch of {milestone} (d{j}): {err!r}", flush=True)
+                print(f"ERR: could not submit the branch of {milestone} ({p.savedir}): {err!r}", flush=True)
 
 def spawnall():
     """Recovery for spawn_branches: submit every branch whose milestone exists but which has no savedir yet, i.e. was never
     submitted (its trunk's submit failed, or the trunk died right after saving it)."""
     assert_committed()
-    for j, p in enumerate(paramsall()):
+    for p in paramsall():
         if milestone_of(p) and Path(milestone_of(p)).is_file() and not Path(p.savedir).exists():
-            submit_branch(j)
-
-def pcalsf(n:int):
-    """Redo pca(n) on LSF, e.g. after changing pca_maps in this experiment's change (run() already does it once)."""
-    par = paramsall()[n]
-    assert_committed()
-    Path(par.savedir).mkdir(parents=True, exist_ok=True)  # a pca-only run (par.init_from set) has no training job to create it
-    bsub(par, "pca", 30, 1, f"python {{code}}/experiment.py pca {n}")
-
-def probelsf(n:int):
-    """probe(n) as its own LSF job: redo a training run's probe, or a probe-only run (par.init_from set)."""
-    par = paramsall()[n]
-    assert_committed()
-    Path(par.savedir).mkdir(parents=True, exist_ok=True)  # a probe-only run has no training job to create it
-    bsub(par, "probe", 60, 1, f"python {{code}}/experiment.py probe {n}")
-
-def scorelsf(n:int):
-    """score(n) as a CPU job on SCORE_QUEUE: mia-evals' mutex watershed over probe(n)'s affinity artifacts.
-    A run without them (not probed, or its training failed) is logged and skipped, so submitall goes on to the rest."""
-    par = paramsall()[n]
-    test = Path(par.savedir) / "probe/test"
-    if not test.is_dir():
-        print(f"ERR: MISSING: {test}: probe first (probelsf)", flush=True)
-        return
-    assert_committed()
-    bsub(par, "score", SCORE_MINUTES, 0, f"python {{code}}/experiment.py score {n}", queue=SCORE_QUEUE, slots=SCORE_SLOTS)
+            start(p)
 
 def replaylsf(n:int):
     """replay_bad_batch on LSF for paramsall()[n]'s first bad_batch dump. CUDA_LAUNCH_BLOCKING names a crashing kernel."""
     par = paramsall()[n]
+    assert isinstance(par, Train), f"{par.savedir}: an eval trains nothing, so it has no bad batches"
     dumps = sorted(Path(par.savedir).glob("bad_batch_*.pt"))
     assert dumps, f"no bad_batch_*.pt in {par.savedir}"
     assert_committed()
-    bsub(par, "replay", 30, 1, f"env CUDA_LAUNCH_BLOCKING=1 python {{code}}/experiment.py replay_bad_batch {dumps[0]}")
+    bsub(par.savedir, "replay", 30, 1, par.queue, f"env CUDA_LAUNCH_BLOCKING=1 python {{code}}/experiment.py replay_bad_batch {dumps[0]}")
 
 def experiment_id(name: str) -> str | None:
     """The id of a sweep dir name under outdir/<series>/: 'e15-02-pca' -> 'e15-02'. None for one from before
@@ -1116,7 +1110,7 @@ def check_experiment():
     assert not taken, f"{EXPERIMENT}: id {eid} is taken by {series}/{taken[0]}"
     params = paramsall()
     assert all(p.savedir.startswith(f"outdir/{EXPERIMENT}/") for p in params), f"every savedir must be under outdir/{EXPERIMENT}/"
-    sources = [p.init_from or p.anneal_from for p in params]
+    sources = [source(p) for p in params]
     deps = sorted({Path(s).parts[2] for s in sources if s not in ("", "random")} - {name})  # outdir/<series>/<sweep>/dN; not our own trunks
     parent = eid.rsplit("-", 1)[0] if "-" in eid else None
     if parent:
@@ -1128,12 +1122,16 @@ def check_experiment():
         assert not numbered, f"{EXPERIMENT} builds on {series}/{numbered[0]}: name it {experiment_id(numbered[0])}-<NN>-<slug>"
 
 def submitall():
+    """Submit this experiment (README: one experiment, one entrypoint): every root of paramsall(), fresh (start). A root is a
+    trunk (or another training run), or an eval of weights from outside this experiment (an eval-only sweep); a branch is
+    submitted by its trunk as it saves the milestone (spawn_branches; spawnall redoes it)."""
     check_experiment()
+    assert_committed()
     for i, p in enumerate(paramsall()):
-        b1 = not milestone_of(p)  # a branch is submitted by its trunk as it saves the milestone (spawn_branches; spawnall redoes it)
+        b1 = not milestone_of(p)
         b2 = RELAUNCH is None or i in RELAUNCH
         if b1 and b2:
-            submit(i)
+            start(p)
 
 
 def mpix_per_week():
