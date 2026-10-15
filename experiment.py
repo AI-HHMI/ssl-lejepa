@@ -133,7 +133,7 @@ class Params:
     # loss = prediction error + lamb x SIGReg. SIGReg's pull is lamb x its sample count (its statistic is N x an empirical-CF
     # distance) and it sees each view's N tokens: the old lamb 0.1 over 32 batch samples (a pull of 3.2) is 0.002 at 12^3 tokens.
     lamb: float = 0.002
-    sigreg_over: Literal["view", "batch"] = "view"  # SIGReg's samples: each view's tokens, or each position's batch (pull: lamb x batch)
+    sigreg_over: Literal["view", "batch", "both"] = "view"  # SIGReg's samples: each view's tokens, each position's batch, or both (lib.models.Lejepa.sigreg_term)
     stop_grad: bool = False  # detach the masked-token targets (lib.models.LejepaConfig.stop_grad)
 
     # optimizations
@@ -169,7 +169,7 @@ class Params:
     profile_steps: int = 10  # Set to zero to disable trace collection.
 
 # This experiment's id (README: experiment ids): its runs are outdir/<EXPERIMENT>/d<i>/.
-EXPERIMENT = "e00/e03-anticollapse"
+EXPERIMENT = "e00/e04-sigreg-both"
 
 # This experiment's one entrypoint: submitall() submits every trunk with it (README: one experiment, one entrypoint).
 # The branches of each trunk's milestones need no submit: the trunk submits them as it saves each (spawn_branches).
@@ -186,41 +186,39 @@ RELAUNCH: list[int] | None = None
 ANNEAL = False
 
 def paramsall():
-    # e02-maskloss-sweep collapsed in every cell to a code of token position alone (identical PCA lattices on every crop, probe AP
-    # at the boundary fraction, below a random encoder's): the predictor is told the masked positions, the targets weren't
-    # detached, and SIGReg over each view's tokens is passed by a position code shared by every sample. Two fixes, one per half:
-    # "batch", SIGReg at each position over the batch's samples, which a shared code fails (targets still not detached); and
-    # "stopgrad", targets detached with e02's per-view SIGReg (a position code still passes that, so this half tests whether
-    # the stop-gradient alone keeps content). A small grid of e02's knobs: blocks of 4 and 7 tokens of 12 (2% and 20% of the
-    # view) x SIGReg pull lamb x N of 1, 3.2 (e01's 0.1 x 32) and 10, where N is SIGReg's sample count: batch 32, or 1728 tokens.
-    # Short: e02 collapsed by step 500 (its prediction error ~0.001-0.09 there). 2 h at e02's ~11k steps/h is ~22k steps, an
-    # eval every 5k. Everything else is e02's: input 128, view 96 (12^3 tokens), m (12x512), batch 32, one RTX PRO 6000, not scored.
+    # Each SIGReg alone left the masked-token objective one shortcut: over each view's tokens (e02-maskloss-sweep), a code of
+    # position alone, shared by every sample (identical PCA lattices on every crop); over each position's batch (e03-anticollapse,
+    # its "batch" half), a code of the sample alone, one per view (between-tile variance ~1, effective rank 9-30), short AP
+    # 0.03-0.045, above the 0.02 base rate but far below a random encoder's 0.124. Both terms at once (sigreg_over="both") hold
+    # the tokens zero-mean and isotropic within every view and at every position, so neither code passes: a token must depend
+    # on its sample and its position together. Stop-gradient is set aside (e03's diverged: the targets' scale ran away while
+    # its saturated SIGReg, ~2000 of a ~2500 ceiling, could not pull it back). e03's "batch" grid, with the pull (lamb x 32, each
+    # term's) extended to 32: blocks of 4 and 7 tokens of 12 x pull 1, 3.2, 10, 32. Everything else is e03's: 2 h (~22k steps,
+    # an eval every 5k), input 128, view 96 (12^3 tokens), m (12x512), batch 32, one RTX PRO 6000, not scored.
     BATCH, STEPS, HOURS = 32, 30_000, 2
     trunks = []
-    for fix in ["batch", "stopgrad"]:
-        for block in [0.3, 0.6]:
-            for pull in [1, 3.2, 10]:
-                p = Params()
-                p.savedir = f"outdir/{EXPERIMENT}/d{len(trunks)}/"
-                p.data = "hemibrain_wide"
-                p.views = "displace"
-                p.patch_size = (128, 128, 128)
-                p.global_size = (96, 96, 96)
-                p.mask_block = block
-                p.sigreg_over = "batch" if fix == "batch" else "view"
-                p.stop_grad = fix == "stopgrad"
-                p.lamb = pull / (BATCH if p.sigreg_over == "batch" else 12 ** 3)
-                p.batch_size = BATCH
-                p.steps_per_epoch = STEPS
-                p.milestone_every = 5_000
-                p.max_hours = HOURS
-                p.weight_decay = 0.05
-                p.adam_beta2 = 0.95
-                p.cudagraphs = True
-                p.n_workers = 11  # 12 cores per GPU
-                p.queue = "gpu_rtx6000"
-                p.score = False  # not scored: no affinity artifacts (probe/{fit,test}, GBs per probe)
-                trunks.append(p)
+    for block in [0.3, 0.6]:
+        for pull in [1, 3.2, 10, 32]:
+            p = Params()
+            p.savedir = f"outdir/{EXPERIMENT}/d{len(trunks)}/"
+            p.data = "hemibrain_wide"
+            p.views = "displace"
+            p.patch_size = (128, 128, 128)
+            p.global_size = (96, 96, 96)
+            p.mask_block = block
+            p.sigreg_over = "both"
+            p.lamb = pull / BATCH
+            p.batch_size = BATCH
+            p.steps_per_epoch = STEPS
+            p.milestone_every = 5_000
+            p.max_hours = HOURS
+            p.weight_decay = 0.05
+            p.adam_beta2 = 0.95
+            p.cudagraphs = True
+            p.n_workers = 11  # 12 cores per GPU
+            p.queue = "gpu_rtx6000"
+            p.score = False  # not scored: no affinity artifacts (probe/{fit,test}, GBs per probe)
+            trunks.append(p)
     return with_branches(trunks)
 
 def milestone_steps(trunk: Params) -> list[int]:

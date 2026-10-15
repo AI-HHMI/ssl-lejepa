@@ -76,12 +76,11 @@ def test_sigreg_floor_is_batch_independent_but_its_pull_is_not():
 
 
 def test_lejepa_loss():
-    sigreg = SIGReg(num_slices=32, knots=9, t_max=3.0)
-    pred, target, tokens = torch.randn(4, 5, 64), torch.randn(4, 5, 64), torch.randn(4, 20, 64)
+    pred, target, sig = torch.randn(4, 5, 64), torch.randn(4, 5, 64), torch.tensor(3.0)
 
-    res = lejepa_loss(pred, target, tokens, sigreg, lamb=0.02)
+    res = lejepa_loss(pred, target, sig, lamb=0.02)
     assert res.inv == (pred - target).square().mean()  # the prediction error alone
-    assert res.sigreg == pytest.approx(sigreg(tokens).item(), rel=0.5)  # over each view's own tokens (random slices differ)
+    assert res.sigreg == sig
     assert res.loss == pytest.approx((res.inv + 0.02 * res.sigreg).item())
     assert "weighted_sigreg" in res
 
@@ -177,17 +176,21 @@ def test_forward_accounts_tokens_and_flops_of_both_encoder_passes():
     assert torch.isfinite(out.loss)
 
 
-@pytest.mark.parametrize("sigreg_over,stop_grad", [("view", False), ("batch", False), ("view", True)])
+@pytest.mark.parametrize("sigreg_over,stop_grad", [("view", False), ("batch", False), ("both", False), ("view", True)])
 def test_sigreg_samples_and_stop_grad_reach_the_loss(monkeypatch, sigreg_over, stop_grad):
     import lib.models.lejepa
-    seen = {}
+    seen, calls = {}, []
     def spy(**kw):
         seen.update(kw)
         return lejepa_loss(**kw)
     monkeypatch.setattr(lib.models.lejepa, "lejepa_loss", spy)
     model = Lejepa(TINY, view=ViewConfig(views="displace", global_size=(16, 16, 16)), sigreg_over=sigreg_over, stop_grad=stop_grad)
+    model.sigreg.register_forward_hook(lambda m, args, out: calls.append((tuple(args[0].shape), out)))
     model(torch.randn(3, 1, 16, 16, 16)).loss.backward()
-    assert seen["tokens"].shape == ((3, 64, 8) if sigreg_over == "view" else (64, 3, 8))  # samples on -2: tokens, or the batch
+    view, batch = (3, 64, 8), (64, 3, 8)  # samples on -2: each view's 64 tokens, or each position's batch of 3
+    assert [shape for shape, _ in calls] == {"view": [view], "batch": [batch], "both": [batch, view]}[sigreg_over]
+    if sigreg_over == "both":  # the view term scaled by Batch / N: both pull lamb x Batch
+        assert seen["sig"].item() == pytest.approx((calls[0][1] + 3 / 64 * calls[1][1]).item())
     assert seen["target"].requires_grad != stop_grad and seen["pred"].requires_grad
 
 

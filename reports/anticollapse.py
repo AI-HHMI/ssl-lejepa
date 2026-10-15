@@ -18,15 +18,16 @@ TOKEN_SIDE = 8  # the encoder's patch side (lib.encoders.EncoderConfig's default
 
 
 def cell(p: dict) -> str:
-    """A trunk's cell: its fix, mask block and SIGReg pull (lamb x SIGReg's sample count: the batch, or the view's tokens)."""
-    batch = p["sigreg_over"] == "batch"
-    n = p["batch_size"] if batch else (p["global_size"][0] // TOKEN_SIDE) ** 3
-    return f"{'batch' if batch else 'stopgrad'} block {p['mask_block']} pull {p['lamb'] * n:.3g}"
+    """A trunk's cell: its fix (stopgrad, or SIGReg's samples), mask block and SIGReg pull (lamb x SIGReg's sample count: the
+    batch, or the view's tokens; "both" scales its view term to the batch's pull, lib.models.Lejepa.sigreg_term)."""
+    over = p["sigreg_over"]
+    n = (p["global_size"][0] // TOKEN_SIDE) ** 3 if over == "view" else p["batch_size"]
+    return f"{'stopgrad' if p['stop_grad'] else over} block {p['mask_block']} pull {p['lamb'] * n:.3g}"
 
 
-def build() -> tuple:
-    """Return (tiles, sections) for page.write."""
-    params = {d: saved_params(d) for d in run_dirs(SWEEP)}
+def build(sweep: str = SWEEP) -> tuple:
+    """Return (tiles, sections) for page.write: of this sweep, or another of the same shape (reports/sigreg_both.py)."""
+    params = {d: saved_params(d) for d in run_dirs(sweep)}
     params = {d: p for d, p in params.items() if p}  # a dir with no runs.json is a job that hasn't started
     labels = {d.name: f"{d.name} {cell(p)}" for d, p in params.items() if not p["init_from"]}
     evals = pandas.DataFrame([{"trunk": labels[Path(p["init_from"]).parents[2].name], "step": int(Path(p["init_from"]).stem.split("_")[1]),
@@ -49,7 +50,7 @@ def build() -> tuple:
                                      for k in BOUNDARY_CHANNELS]),
             ("PCA maps", [("Rows the trunks, columns the milestone's trunk step",
                            pi.images({t: {str(r.step): [r.pca2] if r.pca2.is_file() else [] for r in g.itertuples()} for t, g in evals.groupby("trunk")},
-                                     base=page.out_path(SWEEP).parent))]),
+                                     base=page.out_path(sweep).parent))]),
         ]
     return tiles, sections
 

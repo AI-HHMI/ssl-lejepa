@@ -104,8 +104,7 @@ class LejepaOutput(dict):
 def lejepa_loss(
     pred: Tensor,
     target: Tensor,
-    tokens: Tensor,
-    sigreg: nn.Module,
+    sig: Tensor,
     lamb: float = 0.02,
 ) -> LejepaOutput:
     """Compute the masked-token prediction + SIGReg loss.
@@ -113,9 +112,7 @@ def lejepa_loss(
     Args:
         pred: Predicted embeddings of the masked tokens, shape (B, M, D).
         target: The same tokens' embeddings from the encoder seen the whole view, shape (B, M, D).
-        tokens: The embeddings SIGReg holds to an isotropic Gaussian, shape (..., N, D) with the samples on N: each view's
-            tokens (B, N, D), or each position's batch (N, B, D) (LejepaConfig.sigreg_over).
-        sigreg: SIGReg module instance.
+        sig: The SIGReg statistic of the tokens, over the samples LejepaConfig.sigreg_over picks (Lejepa.sigreg_term).
         lamb: Weight for the SIGReg regularization term.
 
     Returns:
@@ -123,7 +120,6 @@ def lejepa_loss(
         'weighted_sigreg'.
     """
     inv = (pred - target).square().mean()
-    sig = sigreg(tokens)
     weighted_sig = lamb * sig
     total_loss = inv + weighted_sig
     return LejepaOutput(

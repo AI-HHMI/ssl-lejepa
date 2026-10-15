@@ -297,10 +297,10 @@ def submit_every_trunk(monkeypatch):
 def test_submitall_relaunches_only_the_listed_trunks(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     submitted = []
-    monkeypatch.setattr(experiment, "RELAUNCH", [3, 9])
+    monkeypatch.setattr(experiment, "RELAUNCH", [1, 3])  # trunks of the current sweep, whatever its size (>= 4 trunks)
     monkeypatch.setattr(experiment, "submit", lambda n: submitted.append(n))
     experiment.submitall()
-    assert submitted == [3, 9]
+    assert submitted == [1, 3]
 
 
 def test_lejepa_config_takes_the_mask_block_and_lamb_from_params():

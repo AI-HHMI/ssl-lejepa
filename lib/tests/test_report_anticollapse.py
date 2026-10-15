@@ -38,3 +38,8 @@ def test_report_labels_trunks_and_plots_their_probes(tmp_path, monkeypatch):
     assert [s for s, _ in sections] == ["Loss trajectories", "Probe vs trunk step", "PCA maps"]
     anticollapse.main()
     assert (tmp_path / "results/e00/e03-anticollapse/report.html").is_file()
+
+
+def test_cell_reads_both_as_the_batch_pull():
+    p = {"sigreg_over": "both", "stop_grad": False, "batch_size": 32, "global_size": [96] * 3, "mask_block": 0.6, "lamb": 0.1}
+    assert anticollapse.cell(p) == "both block 0.6 pull 3.2"

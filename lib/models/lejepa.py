@@ -118,9 +118,10 @@ class LejepaConfig:
     mask: MaskConfig = field(default_factory=MaskConfig)
     sigreg: SIGRegConfig = field(default_factory=SIGRegConfig)
     lamb: float = 0.02  # loss = inv + lamb * sigreg
-    # SIGReg's samples: "view", each view's N tokens (a code of position alone passes it: e02-maskloss-sweep collapsed so), or
-    # "batch", at each position the batch's samples (averaged over positions), which a code shared across samples fails.
-    sigreg_over: Literal["view", "batch"] = "view"
+    # SIGReg's samples: "view", each view's N tokens (a code of position alone passes it: e02-maskloss-sweep collapsed so);
+    # "batch", at each position the batch's samples (averaged over positions), which a code of the sample alone passes
+    # (e03-anticollapse collapsed so: between-tile variance ~1); or "both" terms, which neither code passes (sigreg_term).
+    sigreg_over: Literal["view", "batch", "both"] = "view"
     stop_grad: bool = False  # detach the targets: the prediction loss trains only the context path, not what it predicts
 
 
@@ -157,6 +158,16 @@ class Lejepa(nn.Module):
     def project(self, tokens: Tensor) -> Tensor:
         """Batch N D -> Batch N Dproj: the projector per token (its BatchNorm pools every token of the batch)."""
         return self.projector(tokens.flatten(0, 1)).unflatten(0, tokens.shape[:2]) if self.projector else tokens
+
+    def sigreg_term(self, emb: Tensor) -> Tensor:
+        """SIGReg of the projected tokens emb (Batch N D) over config.sigreg_over's samples: each view's N tokens, each
+        position's batch, or both. A term's pull is lamb x its sample count, so "both" scales the view term by Batch / N:
+        each then pulls lamb x Batch, as "batch" alone does."""
+        over = self.config.sigreg_over
+        if over == "view":
+            return self.sigreg(emb)
+        across = self.sigreg(emb.transpose(0, 1))  # N Batch D: at each position, the batch's samples
+        return across if over == "batch" else across + emb.shape[0] / emb.shape[1] * self.sigreg(emb)
 
     def mask_block(self, grid: tuple[int, ...], batch: int, device: torch.device) -> tuple[Tensor, Tensor]:
         """Token indices (visible: Batch Nvis, masked: Batch M) of one cube per sample, at a uniformly random origin."""
@@ -211,12 +222,10 @@ class Lejepa(nn.Module):
         pred = self.project(self.predictor(context, gather(pos, visible), gather(pos, masked)))  # Batch M Dproj
         emb = self.project(tokens)  # Batch N Dproj
         target = gather(emb.detach() if self.config.stop_grad else emb, masked)  # Batch M Dproj
-        cloud = emb if self.config.sigreg_over == "view" else emb.transpose(0, 1)  # Batch N Dproj, or N Batch Dproj
 
         # SIGReg's cos/sin statistics are precision sensitive, so keep the loss in fp32 under autocast.
         with torch.autocast(vol.device.type, enabled=False):
-            out = lejepa_loss(pred=pred.float(), target=target.float(), tokens=cloud.float(),
-                              sigreg=self.sigreg, lamb=self.config.lamb)
+            out = lejepa_loss(pred=pred.float(), target=target.float(), sig=self.sigreg_term(emb.float()), lamb=self.config.lamb)
         # Encoder tokens this step: the whole view, then the visible part again (python ints, no device sync).
         out.n_tokens = batch * (prod(grid) + visible.shape[1])
         out.n_flops = batch * train_flops(self.config, grid, self._n_encoder_params, self._n_predictor_params, self._n_projector_params)
