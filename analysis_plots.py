@@ -36,6 +36,15 @@ def loss_curves(sweep: str) -> list:
                     + " w" + res.width.astype(str) + " b" + res.batch_size.astype(str))
     return [(f"Loss per run: {sweep}", pi.lines(series_by(res, "label", "idx_step", "loss"), "step", "loss", logy=True))]
 
+def trunk_loss_curves(curves: dict, terms: list) -> list:
+    """Loss trajectories of a trunk sweep: one card per term, one line per run. curves: label -> trunk_metrics frame. Each line
+    is the mean over 20 logged rows, thinned to every 20th, to 4 significant digits (e02's 72 trunks of ~8.6k rows each made
+    1.7 MB a card at every 10th); log y."""
+    def smooth(m: pandas.DataFrame, t: str) -> tuple:
+        return m.step.iloc[19::20].tolist(), [float(f"{v:.4g}") for v in m[t].rolling(20).mean().iloc[19::20]]
+    return [(f"{t} vs step (mean of 20 logged rows), one line per trunk",
+             pi.lines({k: smooth(m, t) for k, m in curves.items() if t in m}, "step", t, logy=True)) for t in terms]
+
 def bench_table(sweep: str, *compare: str) -> list:
     """A benchmark sweep's per-run table (analysis.bench_rows), next to any reference sweeps it's compared with.
     Also results/<sweep>/bench.csv."""

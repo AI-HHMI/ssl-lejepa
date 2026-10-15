@@ -1,0 +1,40 @@
+"""Tests for reports/anticollapse.py: the e03 page labels each trunk by its fix and pull, and draws losses before any probe."""
+
+import json
+
+import pytest
+
+pytest.importorskip("pandas")  # the `analysis` extra
+
+from reports import anticollapse  # noqa: E402
+
+CHANNELS = ["(1, 0, 0)", "(0, 1, 0)", "(0, 0, 1)", "(10, 0, 0)", "(0, 10, 0)", "(0, 0, 10)"]
+
+
+def write(d, name, *rows):
+    d.mkdir(parents=True, exist_ok=True)
+    (d / name).write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
+def test_report_labels_trunks_and_plots_their_probes(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    e03 = tmp_path / "outdir/e00/e03-anticollapse"
+    base = {"init_from": "", "batch_size": 32, "global_size": [96] * 3, "mask_block": 0.3}
+    write(e03 / "d0", "runs.json", {"params": {**base, "sigreg_over": "batch", "stop_grad": False, "lamb": 0.1}})
+    write(e03 / "d1", "runs.json", {"params": {**base, "sigreg_over": "view", "stop_grad": True, "lamb": 10 / 1728}})
+    for d in ["d0", "d1"]:
+        write(e03 / d, "metrics.json", *[{"tbl": "metrics", "idx_step": 10 * i, "time": i, "loss": 1.0, "inv": 0.5, "sigreg": 5.0,
+                                          "resid_norm": 100.0} for i in range(40)])
+    write(tmp_path / "outdir/e00/probe-test/d1", "probe.json", {"tbl": "probe", **{f"boundary_ap_{c}": 0.1 for c in CHANNELS}})
+
+    tiles, sections = anticollapse.build()  # trunks only, nothing probed yet: losses alone
+    assert [s for s, _ in sections] == ["Loss trajectories"] and "d0 batch block 0.3 pull 3.2" in sections[0][1][0][1]
+    assert "d1 stopgrad block 0.3 pull 10" in sections[0][1][0][1]
+
+    write(e03 / "d2", "runs.json", {"params": {**base, "init_from": "outdir/e00/e03-anticollapse/d0/checkpoints/milestones/step_0005000.pt"}})
+    write(e03 / "d2", "probe.json", {"tbl": "probe", **{f"boundary_ap_{c}": 0.3 for c in CHANNELS}, **{f"boundary_frac_{c}": 0.02 for c in CHANNELS}})
+    tiles, sections = anticollapse.build()
+    assert dict((label, n) for n, label in tiles)["best short AP: d0 batch block 0.3 pull 3.2 @ 5000"] == "0.300"
+    assert [s for s, _ in sections] == ["Loss trajectories", "Probe vs trunk step", "PCA maps"]
+    anticollapse.main()
+    assert (tmp_path / "results/e00/e03-anticollapse/report.html").is_file()

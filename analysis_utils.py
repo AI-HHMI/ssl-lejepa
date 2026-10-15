@@ -49,6 +49,11 @@ def saved_params(d: Path) -> dict:
             return found
     return {}
 
+def trunk_metrics(d: Path) -> pandas.DataFrame:
+    """A training run's logged metrics rows (tbl == "metrics"), with step = idx_step + 1; no rows if it never logged."""
+    m = pandas.DataFrame([r for r in read_jsonl(d / "metrics.json") if r["tbl"] == "metrics"])
+    return m.assign(step=m.idx_step + 1) if len(m) else pandas.DataFrame(columns=["step", "idx_step", "time", "loss"])
+
 def load_table(sweep: str, filename: str) -> pandas.DataFrame:
     """JSON-lines rows of `filename` from every run dir outdir/<sweep>/dN/, each joined with that run's own saved
     params (saved_params), savedir and run name. Params a run predates are missing (NaN in the table)."""

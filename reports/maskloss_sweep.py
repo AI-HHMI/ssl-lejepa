@@ -13,19 +13,13 @@ from pathlib import Path
 import pandas
 
 import plots_interactive as pi
-from analysis_plots import LINEAR_RANDOM
-from analysis_utils import boundary_ap, probe_stats, read_jsonl, run_dirs, saved_params
+from analysis_plots import LINEAR_RANDOM, trunk_loss_curves
+from analysis_utils import boundary_ap, probe_stats, read_jsonl, run_dirs, saved_params, trunk_metrics
 from reports import page
 
 SWEEP = "e00/e02-maskloss-sweep"
 LOSS_TERMS = ["inv", "sigreg", "resid_norm"]
 SHORT_CHANNELS = ["(1, 0, 0)", "(0, 1, 0)", "(0, 0, 1)"]
-
-
-def trunk_losses(d: Path) -> pandas.DataFrame:
-    """A trunk's logged loss, inv, sigreg and pre-LN residual norm per step (idx_step + 1)."""
-    m = pandas.DataFrame([r for r in read_jsonl(d / "metrics.json") if r["tbl"] == "metrics"])
-    return m.assign(step=m.idx_step + 1)[["step", "loss", *LOSS_TERMS]] if len(m) else pandas.DataFrame(columns=["step", "loss", *LOSS_TERMS])
 
 
 def run_info(d: Path, trunk_dir: Path, losses: pandas.DataFrame) -> dict:
@@ -53,7 +47,7 @@ def build() -> tuple:
     """Return (tiles, sections) for page.write."""
     dirs = [d for d in run_dirs(SWEEP) if saved_params(d)]  # a dir with no runs.json is a job that hasn't started
     trunk_of = lambda d: Path(saved_params(d)["init_from"]).parents[2] if saved_params(d)["init_from"] else d  # the trunk dir an eval reads
-    all_losses = {d.name: trunk_losses(d) for d in dirs if not saved_params(d)["init_from"]}
+    all_losses = {d.name: trunk_metrics(d) for d in dirs if not saved_params(d)["init_from"]}
     runs = pandas.DataFrame([run_info(d, trunk_of(d), all_losses[trunk_of(d).name]) for d in dirs if trunk_of(d).name in all_losses])
     trunks = runs.query("kind == 'trunk'").sort_values("trunk")
     repeat = trunks.groupby(["block", "lamb"]).cumcount() + 1  # a trunk's repeat: its rank among the trunks of its (block, lamb)
@@ -111,8 +105,10 @@ def build() -> tuple:
     table = pi.table(["Run", "Kind", "Block", "Lamb", "Repeat", "Trunk step", "AP short", "AP long", "Base rate", "Between-tile", "Effective rank", "Loss", "Inv", "SIGReg", "Resid norm"],
                      [[r.run, r.kind, r.block, r.lamb, r.repeat, r.step, r.ap_short, r.ap_long, r.base_short, r.between_tile, r.effective_rank, r.loss, r.inv, r.sigreg, r.resid_norm]
                       for r in runs.itertuples()])
+    curves = {f"{r.run} block {r.block} lamb {r.lamb}": all_losses[r.run] for r in trunks.itertuples()}
     sections = [
         ("Coverage", [("Trunks: how far each got (a trunk's later milestones are never evaluated if it stopped early)", coverage)]),
+        ("Loss trajectories", trunk_loss_curves(curves, ["loss", *LOSS_TERMS])),
         ("Short-range AP heatmaps", heatmaps("ap_short")),
         ("Long-range AP heatmaps", heatmaps("ap_long")),
         ("Probe vs trunk step", [(f"Short-range AP, block {b}, one line per lamb", over_steps("ap_short", b)) for b in blocks]
