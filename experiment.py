@@ -1,5 +1,5 @@
 """Experiment code (remote): LeJEPA 3D ViT training runs, benchmarks, inference (pca) and replays, and their LSF
-sweep (roots, reconciled by a driver job; savedirs under outdir/e00/). Depends on lib/, so it runs only from its experiment's commit.
+sweep (roots, each trunk evaluating its own milestones; savedirs under outdir/e00/). Depends on lib/, so it runs only from its experiment's commit.
 Each job is an entrypoint taking its spec (Train or Eval) or the path of the spec's json, e.g. `run outdir/.../train.json`:
 called in-process with the spec, or as an LSF job with the file that submit() writes, so any job can submit another.
 Analysis of the results lives in analysis_utils.py (readers), analysis_plots.py (report cards) and reports/ (one page per experiment)."""
@@ -7,6 +7,7 @@ Analysis of the results lives in analysis_utils.py (readers), analysis_plots.py 
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict, fields, replace
+from datetime import timedelta
 import hashlib
 import os, sys
 import json
@@ -60,9 +61,6 @@ CPUS_PER_GPU = 12  # LSF slots per GPU: 8 GPUs -> all 96 cores; training process
 # mia-evals scoring (score): CPU only. mia-evals: ~1 h and ~200 GB peak for the mutex watershed at 896^3, "give it a
 # whole node". The shortest CPU queue; check its run limit and memory per slot with `bqueues -l short`.
 SCORE_QUEUE, SCORE_SLOTS, SCORE_MINUTES = "local", 16, 4*60
-# The driver (drive): one CPU slot that reconciles every DRIVE_SECONDS, for up to DRIVE_MINUTES (local's limit is 14 days),
-# which covers queue waits; one that runs out is resumed by submitall.
-DRIVE_QUEUE, DRIVE_MINUTES, DRIVE_SECONDS = "local", 3 * 24 * 60, 60
 SCORE_CONFIG = "mia_evals/gary_comparison_neuron_instance/mws.toml"  # ours: truth_kind = "instances"
 # score() runs mia-evals from this sister checkout, with its own .venv (`uv sync` there) and its own commit, which
 # mia-evals records in each score's provenance (mia_evals_commit). Not a dependency of this repo.
@@ -163,7 +161,7 @@ class Train:
     queue: str = "gpu_h200"  # LSF queue
     n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); batch_size and n_workers are per GPU
 
-    anneal_from: str = ""  # a checkpoint .pt (anneal_params): train() continues it for steps_per_epoch steps, Adam moments kept,
+    anneal_from: str = ""  # a checkpoint .pt (e.g. a trunk's milestone): train() continues it for steps_per_epoch steps, Adam moments kept,
                            # lr cosine-decaying from the checkpoint's lr to 1% of it; run() then evals the result (pca, probe)
 
     # profiling params
@@ -202,14 +200,9 @@ class Rank:
 # This experiment's id (README: experiment ids): its roots are outdir/<EXPERIMENT>/d<i>/, a trunk's branches in its own dir.
 EXPERIMENT = "e00/e04-sigreg-both"
 
-# What each trunk milestone gets (branch), all on one GPU: True, an anneal (anneal_params: a training job of 10% of the
-# milestone's steps, hours at the largest milestones, and run() evaluates the result), or False, an eval of the milestone as
-# saved (eval_params: pca and probe, two short jobs of minutes: e01's took 7-32 s and 2.5 min once warm). The only toggle.
-ANNEAL = False
-
 def roots() -> list[Train | Eval]:
     """This experiment: the runs it starts from nothing (trunks, other training runs, evals of another experiment's weights).
-    Everything else (a branch of each trunk milestone) follows from what they save (reconcile)."""
+    Each trunk evaluates its own milestones as it saves them (eval_milestone)."""
     # Each SIGReg alone left the masked-token objective one shortcut: over each view's tokens (e02-maskloss-sweep), a code of
     # position alone, shared by every sample (identical PCA lattices on every crop); over each position's batch (e03-anticollapse,
     # its "batch" half), a code of the sample alone, one per view (between-tile variance ~1, effective rank 9-30), short AP
@@ -253,7 +246,7 @@ def milestone_steps(trunk: Train) -> list[int]:
     return sorted({round(k * trunk.steps_per_epoch / 10) for k in range(1, 11)})
 
 def milestone(trunk: Train, step: int) -> Path:
-    """The checkpoint train() keeps for good (until its branch is done with it, release_milestone) at this milestone step."""
+    """The checkpoint train() keeps (until its eval is done with it, release_milestone) at this milestone step."""
     assert step in milestone_steps(trunk), f"step {step} is not a milestone of {trunk.savedir}: {milestone_steps(trunk)}"
     return Path(trunk.savedir) / "checkpoints/milestones" / f"step_{step:07d}.pt"
 
@@ -261,23 +254,10 @@ def branch_dir(trunk: Train, step: int) -> str:
     """A milestone branch's savedir: inside its trunk's, <trunk>/step_<step>/."""
     return f"{Path(trunk.savedir) / f'step_{step:07d}'}/"
 
-def anneal_params(trunk: Train, step: int) -> Train:
-    """Train of the anneal of `trunk`'s milestone at `step`: continued for 10% of its steps on a cosine decay from its lr
-    to 1% of it (Train.anneal_from), then run()'s pca maps and linear probe, in branch_dir. Everything else (model, views,
-    data, optimizer) is the trunk's own."""
-    assert step // 10 > 0, f"step {step} leaves no anneal steps"
-    return replace(trunk, savedir=branch_dir(trunk, step), steps_per_epoch=step // 10, max_hours=0.2 * trunk.max_hours,
-                   anneal_from=str(milestone(trunk, step)),
-                   benchmark_steps=0, profile_steps=0)  # the trunk's throughput and trace say it all
-
 def eval_params(trunk: Train, step: int) -> Eval:
     """The eval of `trunk`'s milestone at `step`: pca maps and the linear probe (pca, probe) of that checkpoint as saved, not
     annealed, in branch_dir."""
     return Eval(savedir=branch_dir(trunk, step), train=trunk, init_from=str(milestone(trunk, step)))
-
-def branch(trunk: Train, step: int) -> Train | Eval:
-    """What `trunk`'s milestone at `step` gets: an anneal if ANNEAL, else an eval."""
-    return anneal_params(trunk, step) if ANNEAL else eval_params(trunk, step)
 
 def own_eval(t: Train) -> Eval:
     """The eval of a training run's own latest checkpoint, in its own savedir: what run() does after training."""
@@ -414,7 +394,8 @@ def setup(par: Train) -> Rank:
     if torch.cuda.is_available():
         torch.cuda.set_device(r.local)
     if r.world > 1:
-        dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo")
+        # The other ranks wait at their next collective while rank 0 evaluates a milestone (eval_milestone): minutes, past NCCL's default 10.
+        dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo", timeout=timedelta(hours=1))
     print(f"Rank {r.rank}/{r.world} is using torch device {r.device()} .")
     return r
 
@@ -447,7 +428,7 @@ def build(par: Train, r: Rank):
         ckpt["opt"]["param_groups"] = opt.state_dict()["param_groups"]
         opt.load_state_dict(ckpt["opt"])
     # By step count, so every rank uses the same lr. A trunk run warms up, then holds par.lr until it stops: it never
-    # decays, so its milestone checkpoints are branch points (anneal_params). An anneal has no warmup (the loaded moments
+    # decays, so its milestone checkpoints are branch points (Train.anneal_from). An anneal has no warmup (the loaded moments
     # are warm) and cosine-decays from the checkpoint's lr to LR_FLOOR of it over steps_per_epoch.
     if ckpt is None:
         lr_scale = lambda s: min(1.0, (s + 1) / LR_WARMUP)
@@ -495,8 +476,8 @@ def save_bad_batch(par: Train, lejepa, x, rng, step: int):
                Path(par.savedir) / f"bad_batch_{step:07d}.pt")
 
 def save_checkpoint(par: Train, lejepa, opt, sched, step: int):
-    """checkpoints/step_<step>.pt, keeping the newest CHECKPOINT_KEEP; a milestone step's also kept for good in
-    checkpoints/milestones/ (until its branch is done with it, release_milestone). Never non-finite weights."""
+    """checkpoints/step_<step>.pt, keeping the newest CHECKPOINT_KEEP; a milestone step's also kept in checkpoints/milestones/
+    and evaluated there and then (eval_milestone, which deletes it once done: release_milestone). Never non-finite weights."""
     import torch
     state = lejepa.state_dict()
     bad = [k for k, v in state.items() if v.is_floating_point() and not torch.isfinite(v).all()]
@@ -511,13 +492,33 @@ def save_checkpoint(par: Train, lejepa, opt, sched, step: int):
     tmp.replace(path)  # never leave a half-written checkpoint
     kept = ckdir / "milestones" / path.name
     b1 = not par.anneal_from and step in milestone_steps(par)  # an anneal has none: its own checkpoint is the one eval
-    b2 = not kept.exists()  # (the last step is saved twice: in the loop, and after it)
-    if b1 and b2:
-        kept.parent.mkdir(exist_ok=True)
-        os.link(path, kept)  # a hard link outlives the prune below; complete when it appears, so reconcile may branch it
+    b2 = not kept.exists()
     for old in sorted(ckdir.glob("step_*.pt"))[:-CHECKPOINT_KEEP]:
         old.unlink()
     print(f"Saved {path}", flush=True)
+    if b1 and b2:
+        kept.parent.mkdir(exist_ok=True)
+        os.link(path, kept)  # a hard link outlives the rolling checkpoints' prune
+        eval_milestone(par, step)
+
+def eval_milestone(trunk: Train, step: int):
+    """The trunk's own eval of its milestone at step (eval_params: pca and probe, in branch_dir), in this process between two
+    training steps: as LSF jobs, e02's waited hours behind the per-user GPU cap for minutes of work. Its eval.json is written
+    first, so `lsf pca|probe <eval.json>` can redo one. A fresh eager model from the milestone file (load_checkpoint) leaves
+    the compiled training model alone, and the RNG state is put back after, so training draws as if no eval had run. Its
+    minutes count against max_hours; the other DDP ranks wait at their next collective (setup's timeout). A failed eval
+    prints its traceback and keeps the milestone for a redo; the trunk trains on."""
+    import torch
+    import traceback
+    e = eval_params(trunk, step)
+    dump(e)
+    try:
+        with torch.random.fork_rng(devices=[torch.cuda.current_device()] if torch.cuda.is_available() else []):
+            pca(e)
+            probe(e)
+    except Exception:
+        traceback.print_exc()
+    torch.cuda.empty_cache()  # the eval's memory back for training (a no-op without CUDA)
 
 def log_metrics(f, par: Train, lejepa, x, out, grad_norm, sched, step: int, n_skipped: int, seconds: float):
     """One metrics.json row (and a progress line) for this step."""
@@ -571,7 +572,8 @@ def check_snapshot():
 
 def train(job: Train | str):
     """Train the spec job, or the one in the train.json it names (load), on every DDP rank; ends with no process group left.
-    run() adds the evals. Rank 0 writes metrics.json, checkpoints, and the throughput window and profile of Benchmark."""
+    Rank 0 writes metrics.json, checkpoints (evaluating each milestone's: save_checkpoint), and the throughput window and
+    profile of Benchmark. run() adds the eval of the end."""
     import torch
     import torch.distributed as dist
     start_time = time.time()
@@ -608,7 +610,7 @@ def train(job: Train | str):
         if r.rank0:
             record_oom(par, r, step, err)
         raise  # then fail the job as usual
-    if r.rank0:
+    if r.rank0 and latest_step(par) < step + 1:  # not saved in the loop already (that would evaluate a milestone twice)
         save_checkpoint(par, lejepa, opt, sched, step + 1)
     if r.world > 1:
         dist.destroy_process_group()
@@ -643,8 +645,8 @@ def run(job: Train | str):
     probe of own_eval).
 
     Evals run after train() has destroyed the process group, so the other ranks exit instead of waiting at a
-    collective for minutes; not for a trunk (a run with milestones: not an anneal) that stopped on a milestone: that
-    milestone's branch (reconcile) evaluates that checkpoint. One that max_hours stopped between two does. (Throughput
+    collective for minutes; not for a trunk (a run with milestones: not an anneal) that stopped on a milestone: train()
+    evaluated that checkpoint already (eval_milestone). One that max_hours stopped between two does. (Throughput
     benchmarks are their own entrypoint, benchmark, with no evals.)
     """
     par = load(job, Train)
@@ -1063,7 +1065,7 @@ def bsub(savedir: str, job: str, minutes: int, n_gpus: int, queue: str, cmd: str
     import subprocess
     name = "-".join(Path(savedir).parts[1:]) + f"-{job}"  # e.g. e00-nanhunt-d9-run, so bjobs shows which is which
     here = Path(__file__).resolve().parent
-    # A job submitting a job (the driver) hands on the snapshot it runs itself, not the shared checkout's current state.
+    # A job submitting a job hands on the snapshot it runs itself, not the shared checkout's current state.
     code = here if ".tmpcode" in here.parts else snapshot(SNAPSHOT_PATHS, Path(".tmpcode") / EXPERIMENT.replace("/", "-"))
     gpu = f'-gpu "num={n_gpus}:mode=exclusive_process"' if n_gpus else ""
     full = f""" bsub -J {name} \
@@ -1107,51 +1109,13 @@ def start(p: Train | Eval):
 def lsf(fn: str, target: int | str):
     """Redo one job on LSF, of roots()[target] or of the spec file target names (any run's, e.g. a milestone eval's
     outdir/.../d3/step_0005000/eval.json): `lsf probe 3` after changing probe. pca, probe or score of an eval, or of a training
-    run's own checkpoint (own_eval), in place; run restarts a training run fresh (start), its branches with it."""
+    run's own checkpoint (own_eval), in place; run restarts a training run fresh (start), its milestone evals with it."""
     assert_committed()
     p = roots()[target] if isinstance(target, int) else load(target, Eval if target.endswith("eval.json") else Train)
     if fn == "run":
         start(p)
     else:
         submit(fn, p if isinstance(p, Eval) else own_eval(p))
-
-def ensure(p: Train | Eval) -> int:
-    """Start p unless its spec is already in its savedir, i.e. it was submitted before (whether it finished, is still going, or
-    failed: `lsf` redoes one). 1 if it submitted p, else 0."""
-    if spec_path(p).is_file():
-        return 0
-    start(p)
-    return 1
-
-def reconcile() -> int:
-    """Submit what this experiment should have but doesn't, given what is on disk now: every root, and a branch of every
-    milestone a trunk among them has saved so far. Idempotent, so safe to run any time and as often as wanted (drive runs it
-    every DRIVE_SECONDS). The number of runs it submitted."""
-    n = 0
-    for r in roots():
-        n += ensure(r)
-        if isinstance(r, Train) and not r.anneal_from:
-            for m in sorted((Path(r.savedir) / "checkpoints/milestones").glob("step_*.pt")):
-                n += ensure(branch(r, int(m.stem.split("_")[1])))
-    return n
-
-def lsf_jobs() -> list[str]:
-    """Names of this experiment's LSF jobs still pending or running (bjobs lists only unfinished ones), the driver's included."""
-    import subprocess
-    prefix = EXPERIMENT.replace("/", "-") + "-"
-    out = subprocess.run(["bjobs", "-noheader", "-o", "job_name", "-J", f"{prefix}*"], capture_output=True, text=True).stdout
-    return [name for name in out.split() if name.startswith(prefix)]
-
-def drive():
-    """The driver job (submitall): reconcile every DRIVE_SECONDS until this experiment has nothing left running and nothing new
-    to submit. It holds no state: if it dies, submitall (or `drive` itself) picks up from what is on disk."""
-    while True:
-        b1 = reconcile() == 0
-        b2 = not [j for j in lsf_jobs() if not j.endswith("-drive")]
-        if b1 and b2:
-            print(f"{EXPERIMENT}: nothing running, nothing left to submit", flush=True)
-            return
-        time.sleep(DRIVE_SECONDS)
 
 def replaylsf(n:int):
     """replay_bad_batch on LSF for roots()[n]'s first bad_batch dump. CUDA_LAUNCH_BLOCKING names a crashing kernel."""
@@ -1193,14 +1157,14 @@ def check_experiment():
         assert not numbered, f"{EXPERIMENT} builds on {series}/{numbered[0]}: name it {experiment_id(numbered[0])}-<NN>-<slug>"
 
 def submitall():
-    """Submit this experiment (README: one experiment, one entrypoint): reconcile now (its roots, the first time), and a driver
-    job (drive) that keeps reconciling until it's done, unless one is running already. Idempotent: run it again to resume, e.g.
-    after the driver hit its walltime; a run already submitted is left alone (`lsf run n` restarts one fresh)."""
+    """Submit this experiment (README: one experiment, one entrypoint): every root whose spec isn't in its savedir yet, i.e. not
+    submitted before (whether it finished, is still going, or failed). Idempotent: run it again after adding roots; a run
+    already submitted is left alone (`lsf run n` restarts one fresh)."""
     check_experiment()
     assert_committed()
-    reconcile()
-    if not any(j.endswith("-drive") for j in lsf_jobs()):  # two drivers could both submit a branch before either wrote its spec
-        bsub(f"outdir/{EXPERIMENT}/", "drive", DRIVE_MINUTES, 0, DRIVE_QUEUE, "python {code}/experiment.py drive", slots=1)
+    for r in roots():
+        if not spec_path(r).is_file():
+            start(r)
 
 
 def mpix_per_week():
