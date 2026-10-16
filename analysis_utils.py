@@ -49,6 +49,16 @@ def saved_params(d: Path) -> dict:
             return found
     return {}
 
+def run_params(d: Path) -> dict:
+    """A run dir's training params as one flat dict with its init_from ("" for a training run): from its spec, train.json or
+    eval.json (an eval's are its train's), for runs since spec entrypoints; else saved_params (older runs' flat params)."""
+    if (d / "train.json").is_file():
+        return {**json.loads((d / "train.json").read_text()), "init_from": ""}
+    if (d / "eval.json").is_file():
+        e = json.loads((d / "eval.json").read_text())
+        return {**e["train"], "init_from": e["init_from"]}
+    return saved_params(d)
+
 def trunk_metrics(d: Path) -> pandas.DataFrame:
     """A training run's logged metrics rows (tbl == "metrics"), with step = idx_step + 1; no rows if it never logged."""
     m = pandas.DataFrame([r for r in read_jsonl(d / "metrics.json") if r["tbl"] == "metrics"])

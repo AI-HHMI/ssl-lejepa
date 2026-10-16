@@ -10,7 +10,7 @@ import pandas
 
 import plots_interactive as pi
 from analysis_plots import LINEAR_RANDOM, trunk_loss_curves
-from analysis_utils import BOUNDARY_CHANNELS, boundary_ap, probe_stats, run_dirs, saved_params, trunk_metrics
+from analysis_utils import BOUNDARY_CHANNELS, boundary_ap, probe_stats, read_jsonl, run_dirs, run_params, trunk_metrics
 from reports import page
 
 SWEEP = "e00/e03-anticollapse"
@@ -27,15 +27,17 @@ def cell(p: dict) -> str:
 
 def build(sweep: str = SWEEP) -> tuple:
     """Return (tiles, sections) for page.write: of this sweep, or another of the same shape (reports/sigreg_both.py)."""
-    params = {d: saved_params(d) for d in run_dirs(sweep)}
+    # Since e04 a trunk's milestone evals nest in it (<trunk>/step_*/); before, they were sibling dN/ dirs.
+    params = {e: run_params(e) for d in run_dirs(sweep) for e in [d, *sorted(d.glob("step_*/"))]}
     params = {d: p for d, p in params.items() if p}  # a dir with no runs.json is a job that hasn't started
     labels = {d.name: f"{d.name} {cell(p)}" for d, p in params.items() if not p["init_from"]}
-    evals = pandas.DataFrame([{"trunk": labels[Path(p["init_from"]).parents[2].name], "step": int(Path(p["init_from"]).stem.split("_")[1]),
-                               **boundary_ap(probe_stats(d)), "pca2": d / "pca2.png",
+    # Every probe of a trunk's weights: its milestones', and its own end's if it stopped off one (max_hours).
+    evals = pandas.DataFrame([{"trunk": labels[Path(p["init_from"]).parents[2].name if p["init_from"] else d.name], "step": probe_stats(d)["step"],
+                               **boundary_ap(probe_stats(d)), "pca2": d / "pca2.png", "between-tile variance": read_jsonl(d / "pca.json")[-1]["between_tile_variance"],
                                **{f"base {k}": sum(probe_stats(d)[f"boundary_frac_{c}"] for c in cs) / 3 for k, cs in BOUNDARY_CHANNELS.items()}}
-                              for d, p in params.items() if p["init_from"] and (d / "probe.json").is_file()])
+                              for d, p in params.items() if (d / "probe.json").is_file() and (d / "pca.json").is_file()])
     random_ap = boundary_ap(probe_stats(LINEAR_RANDOM))
-    tiles = [(f"{len(labels)}", "trunks started"), (f"{len(evals)}", "milestones probed"),
+    tiles = [(f"{len(labels)}", "trunks started"), (f"{len(evals)}", "checkpoints probed"),
              (f"{random_ap['short (+1)']:.3f} / {random_ap['long (+10)']:.3f}", "random encoder, linear probe: short / long AP")]
     sections = [("Loss trajectories", trunk_loss_curves({labels[d.name]: trunk_metrics(d) for d in params if d.name in labels},
                                                         ["loss", "inv", "sigreg", "resid_norm"]))]
@@ -47,7 +49,10 @@ def build(sweep: str = SWEEP) -> tuple:
         sections += [
             ("Probe vs trunk step", [(f"{k} boundary AP, one line per trunk (random encoder {random_ap[k]:.3f}, base rate {evals[f'base {k}'].mean():.3f})",
                                       pi.lines({t: (g.step.tolist(), g[k].tolist()) for t, g in evals.groupby("trunk")}, "trunk step", k))
-                                     for k in BOUNDARY_CHANNELS]),
+                                     for k in BOUNDARY_CHANNELS]
+                                    + [("Between-tile variance: the share of token variance that is each tile's mean token (a code of the sample)",
+                                        pi.lines({t: (g.step.tolist(), g["between-tile variance"].tolist()) for t, g in evals.groupby("trunk")},
+                                                 "trunk step", "between-tile variance"))]),
             ("PCA maps", [("Rows the trunks, columns the milestone's trunk step",
                            pi.images({t: {str(r.step): [r.pca2] if r.pca2.is_file() else [] for r in g.itertuples()} for t, g in evals.groupby("trunk")},
                                      base=page.out_path(sweep).parent))]),

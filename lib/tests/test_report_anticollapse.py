@@ -32,12 +32,34 @@ def test_report_labels_trunks_and_plots_their_probes(tmp_path, monkeypatch):
     assert "d1 stopgrad block 0.3 pull 10" in sections[0][1][0][1]
 
     write(e03 / "d2", "runs.json", {"params": {**base, "init_from": "outdir/e00/e03-anticollapse/d0/checkpoints/milestones/step_0005000.pt"}})
-    write(e03 / "d2", "probe.json", {"tbl": "probe", **{f"boundary_ap_{c}": 0.3 for c in CHANNELS}, **{f"boundary_frac_{c}": 0.02 for c in CHANNELS}})
+    probed(e03 / "d2", 5000, 0.3)
     tiles, sections = anticollapse.build()
     assert dict((label, n) for n, label in tiles)["best short AP: d0 batch block 0.3 pull 3.2 @ 5000"] == "0.300"
     assert [s for s, _ in sections] == ["Loss trajectories", "Probe vs trunk step", "PCA maps"]
     anticollapse.main()
     assert (tmp_path / "results/e00/e03-anticollapse/report.html").is_file()
+
+
+def probed(d, step, ap):
+    write(d, "probe.json", {"tbl": "probe", "step": step, **{f"boundary_ap_{c}": ap for c in CHANNELS}, **{f"boundary_frac_{c}": 0.02 for c in CHANNELS}})
+    write(d, "pca.json", {"tbl": "pca", "step": step, "between_tile_variance": 0.01})
+
+
+def test_report_reads_spec_files_and_milestone_evals_nested_in_their_trunk(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    e04 = tmp_path / "outdir/e00/e04-sigreg-both"
+    trunk = {"savedir": "outdir/e00/e04-sigreg-both/d0/", "batch_size": 32, "global_size": [96] * 3, "mask_block": 0.6,
+             "sigreg_over": "both", "stop_grad": False, "lamb": 0.1}
+    write(e04 / "d0", "train.json", trunk)
+    write(e04 / "d0", "metrics.json", {"tbl": "metrics", "idx_step": 0, "time": 0, "loss": 1.0, "inv": 0.5, "sigreg": 5.0, "resid_norm": 100.0})
+    write(e04 / "d0/step_0005000", "eval.json", {"savedir": "outdir/e00/e04-sigreg-both/d0/step_0005000/", "train": trunk,
+                                                 "init_from": "outdir/e00/e04-sigreg-both/d0/checkpoints/milestones/step_0005000.pt"})
+    probed(e04 / "d0/step_0005000", 5000, 0.2)
+    probed(e04 / "d0", 7300, 0.4)  # the trunk's own end, off a milestone
+    write(tmp_path / "outdir/e00/probe-test/d1", "probe.json", {"tbl": "probe", **{f"boundary_ap_{c}": 0.1 for c in CHANNELS}})
+    tiles = dict((label, n) for n, label in anticollapse.build("e00/e04-sigreg-both")[0])
+    assert tiles["trunks started"] == "1" and tiles["checkpoints probed"] == "2"
+    assert tiles["best short AP: d0 both block 0.6 pull 3.2 @ 7300"] == "0.400"
 
 
 def test_cell_reads_both_as_the_batch_pull():
