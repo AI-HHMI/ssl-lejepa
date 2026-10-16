@@ -4,6 +4,7 @@ mkdir -p outdir/
 # .trash/ holds resubmitted runs' old results (lib.util.trash), cluster-only. _log/ holds the cluster's
 # commands.jsonl (lib.util.log_command; older per-host commands-<host>.jsonl). Nothing local writes outdir/,
 # so --delete is safe. *.zarr/ (probe affinity artifacts, GBs each) stay on the cluster.
+# The cluster's outdir lives on /nrs (home quota); the checkout's outdir/ must be a symlink to it.
 oc-rsync -azi --no-group --delete \
   --exclude='.trash/' \
   --exclude='*.zarr/' \
@@ -18,5 +19,5 @@ oc-rsync -azi --no-group --delete \
   --prune-empty-dirs \
   --rsync-path=oc-rsync \
   -e "ssh -o ConnectTimeout=15" \
-  'login1.int.janelia.org:/groups/scicompsoft/home/broaddusc/proj/ssl-lejepa/outdir/' outdir/ \
+  'login1.int.janelia.org:/nrs/miaai/broaddusc/proj/ssl-lejepa/outdir/' outdir/ \
   | { grep -v '^[.c]d' || true; }
