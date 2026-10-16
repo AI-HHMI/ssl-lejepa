@@ -139,6 +139,7 @@ class Train:
     global_size: Tup3Int = (88, 88, 88)  # displace only
     local_size: Tup3Int = (56, 56, 56)  # unused: no local views since the masked-token objective (analysis_utils reads it)
     mask_block: float = 0.6  # the masked cube's side as a fraction of the view's token grid side (lib.models.MaskConfig.block)
+    mask_shift: int = 0  # >0: targets from a second view up to this many voxels off the context's (lib.models.MaskConfig.shift); both global_size
     # loss = prediction error + lamb x SIGReg. SIGReg's pull is lamb x its sample count (its statistic is N x an empirical-CF
     # distance) and it sees each view's N tokens: the old lamb 0.1 over 32 batch samples (a pull of 3.2) is 0.002 at 12^3 tokens.
     lamb: float = 0.002
@@ -198,43 +199,47 @@ class Rank:
         return torch.device(f"cuda:{self.local}" if torch.cuda.is_available() else "cpu")
 
 # This experiment's id (README: experiment ids): its roots are outdir/<EXPERIMENT>/d<i>/, a trunk's branches in its own dir.
-EXPERIMENT = "e00/e04-sigreg-both"
+EXPERIMENT = "e00/e05-shifted-target"
 
 def roots() -> list[Train | Eval]:
     """This experiment: the runs it starts from nothing (trunks, other training runs, evals of another experiment's weights).
     Each trunk evaluates its own milestones as it saves them (eval_milestone)."""
-    # Each SIGReg alone left the masked-token objective one shortcut: over each view's tokens (e02-maskloss-sweep), a code of
-    # position alone, shared by every sample (identical PCA lattices on every crop); over each position's batch (e03-anticollapse,
-    # its "batch" half), a code of the sample alone, one per view (between-tile variance ~1, effective rank 9-30), short AP
-    # 0.03-0.045, above the 0.02 base rate but far below a random encoder's 0.124. Both terms at once (sigreg_over="both") hold
-    # the tokens zero-mean and isotropic within every view and at every position, so neither code passes: a token must depend
-    # on its sample and its position together. Stop-gradient is set aside (e03's diverged: the targets' scale ran away while
-    # its saturated SIGReg, ~2000 of a ~2500 ceiling, could not pull it back). e03's "batch" grid, with the pull (lamb x 32, each
-    # term's) extended to 32: blocks of 4 and 7 tokens of 12 x pull 1, 3.2, 10, 32. Everything else is e03's: 2 h (~22k steps,
-    # an eval every 5k), input 128, view 96 (12^3 tokens), m (12x512), batch 32, one RTX PRO 6000, not scored.
+    # SIGReg over each view's tokens let a code of position alone pass (e02-maskloss-sweep), over each position's batch a code
+    # of the sample alone (e03-anticollapse), and both at once a code of the sample and position together (e04-sigreg-both: a
+    # lattice per tile, varying tile to tile, ignoring the membranes; short AP at best 0.079, falling with training, against
+    # a random encoder's 0.124). Every one passes because the masked tokens' targets come from the context's own view: what
+    # sits at a token position there is predictable from the visible tokens without the image. Here the targets are a second
+    # view's tokens (Train.mask_shift), cut from the same 128 input up to the shift off the context's, so its grid sits a
+    # random, fractional number of tokens away: a code of each view's own positions no longer lines up, only content does.
+    # SIGReg stays "both" (a code of the sample alone would still pass a shift). Shift 16 and 32 voxels (2 and 4 tokens) x
+    # blocks of 4 and 7 tokens of 12 x pull 3.2 and 10 (pull 10 removed e04's sample code; 1 and 32 differed in nothing).
+    # Everything else is e04's: 2 h (~20k steps, an eval every 5k), views 96 (12^3 tokens), m (12x512), batch 32, one RTX
+    # PRO 6000, not scored.
     BATCH, STEPS, HOURS = 32, 30_000, 2
     trunks = []
-    for block in [0.3, 0.6]:
-        for pull in [1, 3.2, 10, 32]:
-            p = Train()
-            p.savedir = f"outdir/{EXPERIMENT}/d{len(trunks)}/"
-            p.data = "hemibrain_wide"
-            p.views = "displace"
-            p.patch_size = (128, 128, 128)
-            p.global_size = (96, 96, 96)
-            p.mask_block = block
-            p.sigreg_over = "both"
-            p.lamb = pull / BATCH
-            p.batch_size = BATCH
-            p.steps_per_epoch = STEPS
-            p.milestone_every = 5_000
-            p.max_hours = HOURS
-            p.weight_decay = 0.05
-            p.adam_beta2 = 0.95
-            p.cudagraphs = True
-            p.n_workers = 11  # 12 cores per GPU
-            p.queue = "gpu_rtx6000"
-            trunks.append(p)
+    for shift in [16, 32]:
+        for block in [0.3, 0.6]:
+            for pull in [3.2, 10]:
+                p = Train()
+                p.savedir = f"outdir/{EXPERIMENT}/d{len(trunks)}/"
+                p.data = "hemibrain_wide"
+                p.views = "displace"
+                p.patch_size = (128, 128, 128)
+                p.global_size = (96, 96, 96)
+                p.mask_block = block
+                p.mask_shift = shift
+                p.sigreg_over = "both"
+                p.lamb = pull / BATCH
+                p.batch_size = BATCH
+                p.steps_per_epoch = STEPS
+                p.milestone_every = 5_000
+                p.max_hours = HOURS
+                p.weight_decay = 0.05
+                p.adam_beta2 = 0.95
+                p.cudagraphs = True
+                p.n_workers = 11  # 12 cores per GPU
+                p.queue = "gpu_rtx6000"
+                trunks.append(p)
     return trunks
 
 def milestone_steps(trunk: Train) -> list[int]:
@@ -290,10 +295,11 @@ def collate_images(samples):
     return torch.stack([s["img"] for s in samples])
 
 def lejepa_config(par: Train):
+    (z, y, x), s = par.global_size, par.mask_shift
     return LejepaConfig(
         encoder = EncoderConfig(depth=par.n_layers, embed_dim=par.width, num_heads=par.width // 64),
-        view = ViewConfig(views=par.views, global_size=par.global_size),
-        mask = MaskConfig(block=par.mask_block),
+        view = ViewConfig(views=par.views, global_size=(z + s, y + s, x + s)),  # both views' region
+        mask = MaskConfig(block=par.mask_block, shift=par.mask_shift),
         lamb = par.lamb,
         sigreg_over = par.sigreg_over,
         stop_grad = par.stop_grad,

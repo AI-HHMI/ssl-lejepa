@@ -5,7 +5,7 @@ import json
 import pytest
 import torch
 
-from lib.encoders import EncoderConfig, ViT3DEncoder, get_3d_sincos_pos_embed
+from lib.encoders import EncoderConfig, ViT3DEncoder, get_3d_sincos_pos_embed, sincos_at
 from lib.losses import SIGReg, SIGRegConfig, lejepa_loss
 from lib.models import Lejepa, LejepaConfig, MaskConfig, ProjectorConfig, train_flops
 from lib.views import ViewConfig, ViewMaker
@@ -146,8 +146,9 @@ def test_view_maker_displace_locals_inside_globals():
 def test_mask_block_is_one_cube_per_sample():
     model = Lejepa(TINY)
     grid = (4, 5, 6)  # round(0.6 * grid) is a 2 3 4 cube: 24 tokens
-    visible, masked = model.mask_block(grid, 16, torch.device("cpu"))
+    visible, masked, coords = model.mask_block(grid, torch.zeros(16, 3, dtype=torch.long))  # no shift: the cube's own tokens
     assert visible.shape == (16, 120 - 24) and masked.shape == (16, 24)
+    assert torch.equal(coords, torch.stack([masked // 30, masked // 6 % 5, masked % 6], dim=-1).float())
     for v, m in zip(visible, masked):
         assert sorted(torch.cat([v, m]).tolist()) == list(range(120))  # a partition of the tokens
         z, y, x = m // 30, m // 6 % 5, m % 6
@@ -158,7 +159,7 @@ def test_the_context_never_sees_the_masked_voxels():
     torch.manual_seed(0)
     model = Lejepa(TINY).eval()
     x = torch.randn(2, 1, 16, 16, 16)  # grid 4 4 4
-    visible, masked = model.mask_block((4, 4, 4), 2, torch.device("cpu"))
+    visible, masked, _ = model.mask_block((4, 4, 4), torch.zeros(2, 3, dtype=torch.long))
     x2 = x.clone()
     for b in range(2):
         for t in masked[b].tolist():
@@ -166,6 +167,48 @@ def test_the_context_never_sees_the_masked_voxels():
             x2[b, :, z * 4:z * 4 + 4, y * 4:y * 4 + 4, xx * 4:xx * 4 + 4] = torch.randn(1, 4, 4, 4)
     torch.testing.assert_close(model.encoder.forward_features(x, keep=visible), model.encoder.forward_features(x2, keep=visible))
     assert not torch.allclose(model.encoder.forward_features(x), model.encoder.forward_features(x2))  # the whole-view targets do
+
+
+def test_a_shifted_targets_centres_fall_in_the_context_cube():
+    torch.manual_seed(0)
+    model = Lejepa(TINY, view=ViewConfig(views="displace", global_size=(32, 32, 32)), mask=MaskConfig(block=0.5, shift=8))
+    grid, p = (6, 6, 6), 4  # views of 24: the region of 32 less the shift of 8
+    offset = torch.randint(-8, 9, (64, 3))  # the target view's origin less the context's, in voxels
+    visible, masked, coords = model.mask_block(grid, offset)
+    assert visible.shape == (64, 216 - 27) and masked.shape == coords.shape[:2] == (64, 27)
+    k = torch.stack([masked // 36, masked // 6 % 6, masked % 6], dim=-1)  # the target tokens, in its grid
+    assert (k.min(1).values >= 0).all() and (k.max(1).values < 6).all()
+    torch.testing.assert_close(coords, k + offset[:, None] / p)  # their positions in the context's grid
+    for v, c in zip(visible, coords):  # each target centre lies in the context's masked cube, which is the complement of visible
+        cube = sorted(set(range(216)) - set(v.tolist()))
+        lo = torch.tensor([cube[0] // 36, cube[0] // 6 % 6, cube[0] % 6])
+        assert ((c >= lo - 0.5) & (c < lo + 3 - 0.5)).all()  # token j spans [j - 1/2, j + 1/2) of the context's grid
+
+
+def test_sincos_at_integer_coords_is_the_grid_embedding():
+    coords = torch.stack(torch.meshgrid(*[torch.arange(n) for n in (3, 4, 5)], indexing="ij"), dim=-1).reshape(-1, 3)
+    torch.testing.assert_close(sincos_at(coords, 50), get_3d_sincos_pos_embed(50, (3, 4, 5))[0])
+
+
+def test_a_shifted_target_view_is_the_same_voxels_offset():
+    """With shift, the targets are encoded from a second crop of the region, offset from the context's by what the mask is told."""
+    torch.manual_seed(0)
+    model = Lejepa(TINY, view=ViewConfig(views="displace", global_size=(24, 24, 24), flip=False), mask=MaskConfig(shift=8))
+    views, offsets = [], []
+    encode, mask_block = model.encoder.forward_features, model.mask_block
+    model.encoder.forward_features = lambda x, keep=None: views.append(x) or encode(x, keep)
+    model.mask_block = lambda grid, offset: offsets.append(offset) or mask_block(grid, offset)
+    x = torch.arange(2 * 24 ** 3, dtype=torch.float32).view(2, 1, 24, 24, 24)
+    assert torch.isfinite(model(x).loss)
+    target_view, view = views
+    assert view.shape == target_view.shape == (2, 1, 16, 16, 16)  # the region of 24 less the shift of 8
+    for b in range(2):
+        origin = []
+        for v in (view, target_view):  # each a box of the input
+            z, rem = divmod(int(v[b].min()) - b * 24 ** 3, 24 ** 2)
+            origin.append(torch.tensor([z, rem // 24, rem % 24]))
+            assert torch.equal(v[b, 0], x[b, 0, z:z + 16, rem // 24:rem // 24 + 16, rem % 24:rem % 24 + 16])
+        assert torch.equal(origin[1] - origin[0], offsets[0][b])
 
 
 def test_forward_accounts_tokens_and_flops_of_both_encoder_passes():

@@ -7,6 +7,7 @@ from lib.encoders.vit3d import (
     TransformerBlock,
     ViT3DEncoder,
     get_3d_sincos_pos_embed,
+    sincos_at,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "TransformerBlock",
     "ViT3DEncoder",
     "get_3d_sincos_pos_embed",
+    "sincos_at",
 ]

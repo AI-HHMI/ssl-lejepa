@@ -10,9 +10,16 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from lib.encoders import EncoderConfig, TransformerBlock, ViT3DEncoder, get_3d_sincos_pos_embed
+from lib.encoders import EncoderConfig, TransformerBlock, ViT3DEncoder, get_3d_sincos_pos_embed, sincos_at
 from lib.losses import LejepaOutput, SIGReg, SIGRegConfig, lejepa_loss
 from lib.views import ViewConfig, ViewMaker
+
+
+def crop(x: Tensor, origin: Tensor, size: tuple[int, ...]) -> Tensor:
+    """Batch C Z Y X -> Batch C *size: each sample's box at its own origin (Batch 3), in one indexing op."""
+    iz, iy, ix = [origin[:, a, None] + torch.arange(s, device=x.device) for a, s in enumerate(size)]  # Batch s, per axis
+    b, c = torch.arange(x.shape[0], device=x.device), torch.arange(x.shape[1], device=x.device)
+    return x[b[:, None, None, None, None], c[None, :, None, None, None], iz[:, None, :, None, None], iy[:, None, None, :, None], ix[:, None, None, None, :]]
 
 
 def _norm1d(norm: str, dim: int) -> nn.Module:
@@ -70,6 +77,11 @@ class MaskConfig:
     """What the model predicts from what: one block of tokens is masked per sample."""
     block: float = 0.6  # the masked cube's side, as a fraction of the view's token grid side (~22% of the tokens)
     predictor_depth: int = 4  # transformer blocks of the predictor, at the encoder's width and heads
+    # >0: the targets are the tokens of a second view of the sample, up to this many voxels (per axis, a multiple of the patch)
+    # off the context's: both cut at random from the crop ViewMaker makes, each that much smaller (Lejepa.forward). Their token
+    # grids are then offset by a random, fractional number of tokens, so only content lines up between them, not a code of
+    # each view's own token positions (the shortcut e02-e04 took). 0: the targets are the context view's own tokens.
+    shift: int = 0
 
 
 def mask_side(mask: MaskConfig, grid: tuple[int, ...]) -> tuple[int, ...]:
@@ -130,7 +142,8 @@ class Lejepa(nn.Module):
 
     Combines a 3D Vision Transformer encoder with a multi-layer projection head, a predictor, and the masked-token
     prediction + SIGReg objective: a block of the view's tokens is hidden from the encoder, and the predictor must
-    produce those tokens' embeddings (as the encoder makes them from the whole view) from the visible tokens.
+    produce those tokens' embeddings (as the encoder makes them from the whole view) from the visible tokens. With a
+    shift (MaskConfig.shift) the targets are instead a second, offset view's tokens over the same voxels.
     """
 
     def __init__(self, config: LejepaConfig | None = None, **kwargs: Any):
@@ -142,6 +155,9 @@ class Lejepa(nn.Module):
         self.sigreg = SIGReg(c.sigreg)
         self.view_maker = ViewMaker(c.view, patch_size=self.encoder.patch_embed.patch_size) if c.view.views != "none" else None
         assert (c.view.n_global, c.view.n_local) == (1, 0), f"one view per sample, got {c.view.n_global} global and {c.view.n_local} local"
+        b1 = c.mask.shift == 0
+        b2 = c.view.views == "displace" and all(c.mask.shift % p == 0 for p in self.encoder.patch_embed.patch_size)
+        assert b1 or b2, f"a shift ({c.mask.shift}) needs displace views (got {c.view.views!r}) and a multiple of the patch {self.encoder.patch_embed.patch_size}"
 
         # For FLOP accounting in forward.
         self._n_encoder_params = sum(p.numel() for p in self.encoder.parameters())
@@ -169,14 +185,27 @@ class Lejepa(nn.Module):
         across = self.sigreg(emb.transpose(0, 1))  # N Batch D: at each position, the batch's samples
         return across if over == "batch" else across + emb.shape[0] / emb.shape[1] * self.sigreg(emb)
 
-    def mask_block(self, grid: tuple[int, ...], batch: int, device: torch.device) -> tuple[Tensor, Tensor]:
-        """Token indices (visible: Batch Nvis, masked: Batch M) of one cube per sample, at a uniformly random origin."""
-        side = mask_side(self.config.mask, grid)
-        origin = torch.stack([torch.randint(0, g - s + 1, (batch,), device=device) for g, s in zip(grid, side)], dim=1)  # Batch 3
-        coords = torch.stack(torch.meshgrid(*[torch.arange(g, device=device) for g in grid], indexing="ij"), dim=-1).reshape(-1, 3)  # N 3
-        inside = ((coords >= origin[:, None]) & (coords < origin[:, None] + torch.tensor(side, device=device))).all(dim=-1)  # Batch N
+    def mask_block(self, grid: tuple[int, ...], offset: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """One cube of the context view's tokens per sample, at a uniformly random origin among those that keep it inside the
+        target view, offset voxels (Batch 3) from the context. (visible: Batch Nvis, the context's tokens outside the cube;
+        masked: Batch M, the target view's tokens whose centres fall inside it, M the cube's; their coordinates in the
+        context's token grid, Batch M 3, off the integers by offset / patch.) offset 0: the cube's own tokens, at its own."""
+        device, s, patch = offset.device, mask_side(self.config.mask, grid), self.encoder.patch_embed.patch_size
+        assert all(n - m >= -(-self.config.mask.shift // q) for n, m, q in zip(grid, s, patch)), (
+            f"a mask cube {s} in grid {grid} does not fit both views at a shift of {self.config.mask.shift}")
+        side, g, p = [torch.tensor(t, device=device) for t in (s, grid, patch)]
+        lo = (-(-offset // p)).clamp(min=0)  # ceil(offset / p): the target's first whole token in the context's grid
+        hi = g - side + (offset // p).clamp(max=0)
+        origin = lo + (torch.rand(offset.shape, device=device) * (hi - lo + 1)).long()  # Batch 3
+        grid_coords = lambda shape: torch.stack(torch.meshgrid(*[torch.arange(n, device=device) for n in shape], indexing="ij"), dim=-1).reshape(-1, 3)
+        coords = grid_coords(grid)  # N 3
+        inside = ((coords >= origin[:, None]) & (coords < origin[:, None] + side)).all(dim=-1)  # Batch N
         order = inside.to(torch.uint8).argsort(dim=1, stable=True)  # the visible tokens, then the masked cube's
-        return order[:, :-prod(side)], order[:, -prod(side):]
+        # The target token k's centre, offset + (k + 1/2) p in the context's voxels, is in the cube [origin p, (origin + side) p)
+        # from k = ceil(origin - offset / p - 1/2) on.
+        first = -((2 * offset + p - 2 * origin * p) // (2 * p))  # Batch 3
+        k = first[:, None] + grid_coords(s)  # Batch M 3, in the cube's (Z-major) order, as order's
+        return order[:, :-prod(s)], (k * torch.tensor([grid[1] * grid[2], grid[2], 1], device=device)).sum(-1), k + offset[:, None] / p
 
     def forward(
         self,
@@ -210,16 +239,19 @@ class Lejepa(nn.Module):
         if not return_loss or self.view_maker is None:
             return self.encode_maybe_project(vol)
 
-        view = self.view_maker(vol)[0][0]  # the one crop: Batch C Z Y X
-        batch = view.shape[0]
-        grid = tuple(s // p for s, p in zip(view.shape[2:], self.encoder.patch_embed.patch_size))
+        region = self.view_maker(vol)[0][0]  # the one crop, Batch C Z Y X: both views' region (each is it, without a shift)
+        batch, shift = region.shape[0], self.config.mask.shift
+        size = tuple(s - shift for s in region.shape[2:])
+        origins = torch.randint(0, shift + 1, (2, batch, 3), device=region.device)  # context's, target's
+        view, target_view = crop(region, origins[0], size), crop(region, origins[1], size)
+        grid = tuple(s // p for s, p in zip(size, self.encoder.patch_embed.patch_size))
         gather = lambda t, i: torch.gather(t, 1, i.unsqueeze(-1).expand(-1, -1, t.shape[-1]))  # Batch N D, Batch K -> Batch K D
 
-        tokens = self.encoder.forward_features(view)  # Batch N D, from the whole view: the targets
-        visible, masked = self.mask_block(grid, batch, view.device)
+        tokens = self.encoder.forward_features(target_view)  # Batch N D, from the whole view: the targets
+        visible, masked, masked_coords = self.mask_block(grid, origins[1] - origins[0])
         context = self.encoder.forward_features(view, keep=visible)  # Batch Nvis D, never having seen the masked cube
         pos = get_3d_sincos_pos_embed(tokens.shape[-1], grid, device=view.device, dtype=tokens.dtype).expand(batch, -1, -1)
-        pred = self.project(self.predictor(context, gather(pos, visible), gather(pos, masked)))  # Batch M Dproj
+        pred = self.project(self.predictor(context, gather(pos, visible), sincos_at(masked_coords, tokens.shape[-1]).to(tokens.dtype)))  # Batch M Dproj
         emb = self.project(tokens)  # Batch N Dproj
         target = gather(emb.detach() if self.config.stop_grad else emb, masked)  # Batch M Dproj
 

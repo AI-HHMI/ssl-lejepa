@@ -32,17 +32,7 @@ def get_3d_sincos_pos_embed(
         Tensor of shape (1, G_z * G_y * G_x, embed_dim).
     """
     gz, gy, gx = grid_size
-    dim_z = embed_dim // 3
-    dim_y = embed_dim // 3
-    dim_x = embed_dim - dim_z - dim_y
-
-    # Ensure even dims for sin/cos pairs
-    if dim_z % 2 != 0:
-        dim_z -= 1
-        dim_x += 1
-    if dim_y % 2 != 0:
-        dim_y -= 1
-        dim_x += 1
+    dim_z, dim_y, dim_x = sincos_dims(embed_dim)
 
     def get_1d_sincos(dim: int, length: int) -> Tensor:
         omega = 1.0 / (10000.0 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
@@ -63,6 +53,21 @@ def get_3d_sincos_pos_embed(
     if device is not None:
         pos_embed = pos_embed.to(device=device, dtype=dtype)
     return pos_embed
+
+
+def sincos_dims(embed_dim: int) -> tuple[int, int, int]:
+    """The embedding dims of Z, Y and X in get_3d_sincos_pos_embed: a third each, Z's and Y's even (sin/cos pairs)."""
+    dim_z = dim_y = embed_dim // 3 // 2 * 2
+    return dim_z, dim_y, embed_dim - dim_z - dim_y
+
+
+def sincos_at(coords: Tensor, embed_dim: int) -> Tensor:
+    """get_3d_sincos_pos_embed's embedding at any token coordinates, fractional too: ... 3 (Z Y X, in tokens) -> ... embed_dim."""
+    out = []
+    for dim, c in zip(sincos_dims(embed_dim), coords.float().unbind(-1)):
+        omega = 1.0 / (10000.0 ** (torch.arange(0, dim, 2, dtype=torch.float32, device=coords.device) / dim))
+        out += [torch.sin(c[..., None] * omega), torch.cos(c[..., None] * omega)]
+    return torch.cat(out, dim=-1)
 
 
 class PatchEmbed3d(nn.Module):
