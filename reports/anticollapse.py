@@ -18,11 +18,13 @@ TOKEN_SIDE = 8  # the encoder's patch side (lib.encoders.EncoderConfig's default
 
 
 def cell(p: dict) -> str:
-    """A trunk's cell: its fix (stopgrad, or SIGReg's samples), mask block and SIGReg pull (lamb x SIGReg's sample count: the
-    batch, or the view's tokens; "both" scales its view term to the batch's pull, lib.models.Lejepa.sigreg_term)."""
+    """A trunk's cell: its fix (stopgrad, or SIGReg's samples), mask block, SIGReg pull (lamb x SIGReg's sample count: the
+    batch, or the view's tokens; "both" scales its view term to the batch's pull, lib.models.Lejepa.sigreg_term) and, since
+    e05, the target view's shift."""
     over = p["sigreg_over"]
     n = (p["global_size"][0] // TOKEN_SIDE) ** 3 if over == "view" else p["batch_size"]
-    return f"{'stopgrad' if p['stop_grad'] else over} block {p['mask_block']} pull {p['lamb'] * n:.3g}"
+    shift = f" shift {p['mask_shift']}" if p.get("mask_shift") else ""
+    return f"{'stopgrad' if p['stop_grad'] else over} block {p['mask_block']} pull {p['lamb'] * n:.3g}{shift}"
 
 
 def build(sweep: str = SWEEP) -> tuple:

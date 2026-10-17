@@ -65,3 +65,4 @@ def test_report_reads_spec_files_and_milestone_evals_nested_in_their_trunk(tmp_p
 def test_cell_reads_both_as_the_batch_pull():
     p = {"sigreg_over": "both", "stop_grad": False, "batch_size": 32, "global_size": [96] * 3, "mask_block": 0.6, "lamb": 0.1}
     assert anticollapse.cell(p) == "both block 0.6 pull 3.2"
+    assert anticollapse.cell({**p, "mask_shift": 32}) == "both block 0.6 pull 3.2 shift 32"
