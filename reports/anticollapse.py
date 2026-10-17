@@ -10,7 +10,7 @@ import pandas
 
 import plots_interactive as pi
 from analysis_plots import LINEAR_RANDOM, trunk_loss_curves
-from analysis_utils import BOUNDARY_CHANNELS, boundary_ap, probe_stats, read_jsonl, run_dirs, run_params, trunk_metrics
+from analysis_utils import BOUNDARY_CHANNELS, boundary_ap, probe_stats, read_jsonl, run_dirs, run_params, tflop_per_step, trunk_metrics
 from reports import page
 
 SWEEP = "e00/e03-anticollapse"
@@ -27,14 +27,18 @@ def cell(p: dict) -> str:
     return f"{'stopgrad' if p['stop_grad'] else over} block {p['mask_block']} pull {p['lamb'] * n:.3g}{shift}"
 
 
-def build(sweep: str = SWEEP) -> tuple:
-    """Return (tiles, sections) for page.write: of this sweep, or another of the same shape (reports/sigreg_both.py)."""
+def build(sweep: str = SWEEP, label=cell) -> tuple:
+    """Return (tiles, sections) for page.write: of this sweep, or another of the same shape (reports/sigreg_both.py), its
+    trunks named by label(params) (cell's names for e03-e05's masked-token grids)."""
     # Since e04 a trunk's milestone evals nest in it (<trunk>/step_*/); before, they were sibling dN/ dirs.
     params = {e: run_params(e) for d in run_dirs(sweep) for e in [d, *sorted(d.glob("step_*/"))]}
     params = {d: p for d, p in params.items() if p}  # a dir with no runs.json is a job that hasn't started
-    labels = {d.name: f"{d.name} {cell(p)}" for d, p in params.items() if not p["init_from"]}
-    # Every probe of a trunk's weights: its milestones', and its own end's if it stopped off one (max_hours).
-    evals = pandas.DataFrame([{"trunk": labels[Path(p["init_from"]).parents[2].name if p["init_from"] else d.name], "step": probe_stats(d)["step"],
+    labels = {d.name: f"{d.name} {label(p)}" for d, p in params.items() if not p["init_from"]}
+    trunk = lambda d, p: Path(p["init_from"]).parents[2] if p["init_from"] else d  # a milestone's: outdir/<sweep>/dN/checkpoints/milestones/
+    # Every probe of a trunk's weights: its milestones', and its own end's if it stopped off one (max_hours). Its training
+    # compute is the trunk's FLOPs per step (performance.json's benchmark window) x the step.
+    evals = pandas.DataFrame([{"trunk": labels[trunk(d, p).name], "step": probe_stats(d)["step"],
+                               "PFLOP": probe_stats(d)["step"] * tflop_per_step(trunk(d, p)) / 1e3,
                                **boundary_ap(probe_stats(d)), "pca2": d / "pca2.png", "between-tile variance": read_jsonl(d / "pca.json")[-1]["between_tile_variance"],
                                **{f"base {k}": sum(probe_stats(d)[f"boundary_frac_{c}"] for c in cs) / 3 for k, cs in BOUNDARY_CHANNELS.items()}}
                               for d, p in params.items() if (d / "probe.json").is_file() and (d / "pca.json").is_file()])
@@ -52,6 +56,9 @@ def build(sweep: str = SWEEP) -> tuple:
             ("Probe vs trunk step", [(f"{k} boundary AP, one line per trunk (random encoder {random_ap[k]:.3f}, base rate {evals[f'base {k}'].mean():.3f})",
                                       pi.lines({t: (g.step.tolist(), g[k].tolist()) for t, g in evals.groupby("trunk")}, "trunk step", k))
                                      for k in BOUNDARY_CHANNELS]
+                                    + [(f"{k} boundary AP vs training compute (trunks differ in FLOPs per step), one line per trunk",
+                                        pi.lines({t: (g.PFLOP.tolist(), g[k].tolist()) for t, g in evals.groupby("trunk")}, "training PFLOP", k, logx=True))
+                                       for k in BOUNDARY_CHANNELS]
                                     + [("Between-tile variance: the share of token variance that is each tile's mean token (a code of the sample)",
                                         pi.lines({t: (g.step.tolist(), g["between-tile variance"].tolist()) for t, g in evals.groupby("trunk")},
                                                  "trunk step", "between-tile variance"))]),
