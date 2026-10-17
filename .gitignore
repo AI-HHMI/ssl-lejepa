@@ -1,6 +1,8 @@
 # Per-sweep code snapshots written by experiment.runlsf (see SNAPSHOT_PATHS); machine-local.
 .tmpcode/
-outdir/
+# No trailing slash: on the cluster outdir is a symlink to /nrs, which "outdir/" (directories only) wouldn't match, so jj
+# would snapshot it and then delete it on the next `jj new` (jrun.sh), leaving submitall to recreate a real outdir/ in home.
+outdir
 # Local analysis output (figures, tables, summaries), written by reports/; not committed.
 # results/perf_journey.html stays tracked: it's the hand-written page perf_journey() fills in.
 results/
