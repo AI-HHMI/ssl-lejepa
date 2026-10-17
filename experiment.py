@@ -204,32 +204,33 @@ class Rank:
         return torch.device(f"cuda:{self.local}" if torch.cuda.is_available() else "cpu")
 
 # This experiment's id (README: experiment ids): its roots are outdir/<EXPERIMENT>/d<i>/, a trunk's branches in its own dir.
-EXPERIMENT = "e00/e06-viewsize-vs-baselines"
+EXPERIMENT = "e00/e07-mask-side"
 
 def roots() -> list[Train | Eval]:
     """This experiment: the runs it starts from nothing (trunks, other training runs, evals of another experiment's weights).
     Each trunk evaluates its own milestones as it saves them (eval_milestone)."""
-    # e05-shifted-target's best cell (masked tokens, targets from a second view shifted 32 voxels, block 0.6, pull 10, SIGReg
-    # "both") was the first masked-token encoder above a random one (short / long AP 0.146 / 0.679 against 0.124 / 0.481), and
-    # still rising at 2 h. How does it depend on how much each token sees? View 64, 96, 128 and 160 (8^3 to 20^3 tokens), the
-    # input the view plus the shift (the region both views are cut from). At view 64 a 5-token cube leaves room for a 3-token
-    # shift only: 24 voxels there. Beside it, on the same budget and data, the two references: an MAE (lib.models.Mae: the
-    # pixel-space baseline, view 96 of input 128 as the middle cell) and LeJEPA's own multi-view invariance at the best view
-    # sizes so far, input 128 / globals 96 / locals 96 (viewsizes-v2: short AP 0.180 and 0.173 over two repeats; 2 globals, 4
-    # locals, lamb 0.1 as then, a pull of 3.2 at batch 32). All 8 h (the invariance runs' budget) of m (12x512), batch 32,
-    # one B300 each, so the same wall-clock compute, not scored. Training FLOPs per sample span ~100x (MAE 0.14 T, masked view
-    # 64 0.30 T to view 160 13.4 T, invariance 3.7 T), so the steps they reach do too: evals at doubling steps from 5k (at most
-    # 10 each, log-spaced for the curves vs compute). Masked view 160 is ~170 GB of the B300's 288 by e05's 36.6 GB at view 96
-    # (memory ~ tokens); view 192 would be ~290 GB at this batch.
-    BATCH, STEPS, HOURS = 32, 2_560_000, 8
-
-    def trunk(objective: Literal["views", "mask", "mae"], input_size: int, view: int) -> Train:
+    # How big should the masked cube be? e05-shifted-target's cube of 7 tokens of 12 beat 4 in all four of its pairs; here
+    # its best cell (view 96, shift 32, pull 10, SIGReg "both") with the cube's side swept over every size from 1 to 11 tokens
+    # (0.06% to 77% of the view's tokens). A small cube's targets sit beside visible tokens of nearly the same content, so
+    # interpolation may be enough to predict them; a big one leaves little context. The cube must fit both views, which a
+    # shift of s tokens allows up to a side of 12 - s: sides 9, 10 and 11 get shifts of 3, 2 and 1 token (24, 16, 8 voxels)
+    # instead of 4, so they also differ in the shift (e05: shift 32 over 16 by 0.004-0.016 short AP). The input is the view
+    # plus the shift (the region both views are cut from). 2 h (e05's budget, now on a B300) of m (12x512), batch 32,
+    # evals at doubling steps from 5k, not scored. Side 7 is e05's d7 on another GPU: the link between the two.
+    BATCH, STEPS, HOURS, VIEW, GRID = 32, 2_560_000, 2, 96, 12
+    runs = []
+    for side in range(1, 12):
+        shift = 8 * min(4, GRID - side)
         p = Train()
-        p.objective = objective
+        p.savedir = f"outdir/{EXPERIMENT}/d{len(runs)}/"
         p.data = "hemibrain_wide"
         p.views = "displace"
-        p.patch_size = (input_size, input_size, input_size)
-        p.global_size = (view, view, view)
+        p.patch_size = (VIEW + shift, VIEW + shift, VIEW + shift)
+        p.global_size = (VIEW, VIEW, VIEW)
+        p.mask_block = side / GRID  # lib.models.lejepa.mask_side rounds block x grid back to side
+        p.mask_shift = shift
+        p.sigreg_over = "both"
+        p.lamb = 10 / BATCH
         p.batch_size = BATCH
         p.steps_per_epoch = STEPS
         p.milestone_every = 5_000
@@ -240,24 +241,7 @@ def roots() -> list[Train | Eval]:
         p.cudagraphs = True
         p.n_workers = 11  # 12 cores per GPU
         p.queue = "gpu_b300"
-        return p
-
-    runs = []
-    for view, shift in [(64, 24), (96, 32), (128, 32), (160, 32)]:
-        p = trunk("mask", view + shift, view)
-        p.mask_block = 0.6
-        p.mask_shift = shift
-        p.sigreg_over = "both"
-        p.lamb = 10 / BATCH
         runs.append(p)
-    runs.append(trunk("mae", 128, 96))
-    p = trunk("views", 128, 96)
-    p.local_size = (96, 96, 96)
-    p.batch_views = True
-    p.lamb = 0.1
-    runs.append(p)
-    for i, p in enumerate(runs):
-        p.savedir = f"outdir/{EXPERIMENT}/d{i}/"
     return runs
 
 def milestone_steps(trunk: Train) -> list[int]:
