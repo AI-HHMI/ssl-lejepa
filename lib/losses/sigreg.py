@@ -107,12 +107,14 @@ def lejepa_loss(
     sig: Tensor,
     lamb: float = 0.02,
 ) -> LejepaOutput:
-    """Compute the masked-token prediction + SIGReg loss.
+    """Compute the prediction (or invariance) + SIGReg loss, of either Lejepa objective.
 
     Args:
-        pred: Predicted embeddings of the masked tokens, shape (B, M, D).
-        target: The same tokens' embeddings from the encoder seen the whole view, shape (B, M, D).
-        sig: The SIGReg statistic of the tokens, over the samples LejepaConfig.sigreg_over picks (Lejepa.sigreg_term).
+        pred: Predicted embeddings of the masked tokens, shape (B, M, D); "views": the mean of the globals' embeddings,
+            shape (View, B, D), broadcast over the views.
+        target: The same tokens' embeddings from the encoder seen the whole view, shape (B, M, D); "views": every view's.
+        sig: The SIGReg statistic of the embeddings, over the samples LejepaConfig.sigreg_over picks (Lejepa.sigreg_term);
+            "views": over each view's batch.
         lamb: Weight for the SIGReg regularization term.
 
     Returns:

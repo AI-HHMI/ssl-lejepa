@@ -109,15 +109,18 @@ class PatchEmbed3d(nn.Module):
             tokens: (B, N, embed_dim) where N = G_z * G_y * G_x
             grid_size: (G_z, G_y, G_x)
         """
+        (pz, py, px), (Z, Y, X) = self.patch_size, x.shape[2:]
+        return self.proj(self.patchify(x)), (Z // pz, Y // py, X // px)
+
+    def patchify(self, x: Tensor) -> Tensor:
+        """Batch C Z Y X -> Batch (Gz Gy Gx) (C pz py px): each token's voxels, in token order, matching the Conv3d weight layout."""
         assert all(s % p == 0 for s, p in zip(x.shape[2:], self.patch_size)), (
             f"input {tuple(x.shape)} must be a multiple of patch size {self.patch_size}"
         )
         B, C, Z, Y, X = x.shape
         pz, py, px = self.patch_size
         gz, gy, gx = Z // pz, Y // py, X // px
-        # Batch C Z Y X -> Batch (Gz Gy Gx) (C pz py px), matching the Conv3d weight layout
-        patches = x.reshape(B, C, gz, pz, gy, py, gx, px).permute(0, 2, 4, 6, 1, 3, 5, 7).reshape(B, gz * gy * gx, -1)
-        return self.proj(patches), (gz, gy, gx)
+        return x.reshape(B, C, gz, pz, gy, py, gx, px).permute(0, 2, 4, 6, 1, 3, 5, 7).reshape(B, gz * gy * gx, -1)
 
 
 class Attention(nn.Module):

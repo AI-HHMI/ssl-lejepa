@@ -13,7 +13,8 @@ import experiment
 from lib.losses import LejepaOutput
 from lib.encoders import EncoderConfig
 from lib.losses import SIGRegConfig
-from lib.models import Lejepa, LejepaConfig, ProjectorConfig
+from lib.models import Lejepa, LejepaConfig, MaeConfig, ProjectorConfig
+from lib.views import ViewConfig
 
 
 class SyntheticDataset:
@@ -62,13 +63,16 @@ def patch_experiment(monkeypatch, tmp_path, params):
         "commit_id": "test-commit", "subject": "test", "dirty": False, "diff_hash": "test-diff",
     })
 
-    def small_model_config(par):
+    def small_model_config(par):  # par's objective, tiny
+        encoder = EncoderConfig(depth=1, embed_dim=16, num_heads=2, patch_size=(4, 4, 4))
+        if par.objective == "mae":
+            return MaeConfig(encoder=encoder, decoder_dim=8, decoder_heads=2, decoder_depth=1)
         return LejepaConfig(
-            encoder=EncoderConfig(depth=1, embed_dim=16, num_heads=2, patch_size=(4, 4, 4)),
+            encoder=encoder, objective=par.objective, view=ViewConfig(n_global=2, n_local=1) if par.objective == "views" else ViewConfig(),
             projector=ProjectorConfig(dim=8, hidden=16), sigreg=SIGRegConfig(num_slices=4, knots=3),
         )
 
-    monkeypatch.setattr(experiment, "lejepa_config", small_model_config)
+    monkeypatch.setattr(experiment, "model_config", small_model_config)
     for fn in ("pca", "probe"):  # a trunk's milestone evals (eval_milestone) need the real volumes
         monkeypatch.setattr(experiment, fn, lambda job: None)
 
@@ -124,6 +128,22 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
         summary = json.loads((tmp_path / "trace_summary.json").read_text())
         assert summary["step_ms"] > 0 and summary["gpu_busy"] == 0  # CPU run: no GPU kernels.
         assert summary["04_FORWARD_AND_LOSS_ms"] > 0
+
+
+@pytest.mark.parametrize("objective", ["views", "mae"])
+def test_each_objective_trains_logs_its_terms_and_reloads_for_eval(tmp_path, monkeypatch, objective):
+    params = experiment.Train(savedir=str(tmp_path), objective=objective, patch_size=(8, 8, 8), batch_size=2, steps_per_epoch=3,
+                              warmup_steps=1, benchmark_steps=1, profile_steps=0, n_workers=1, defer_image_ops=False)
+    patch_experiment(monkeypatch, tmp_path, params)
+    experiment.train(params)
+    metrics = [json.loads(line) for line in (tmp_path / "metrics.json").read_text().splitlines()]
+    assert metrics[-1]["idx_step"] == 2 and all(torch.isfinite(torch.tensor(row["loss"])) for row in metrics)
+    if objective == "views":  # LeJEPA's two terms, logged apart
+        assert all(row["loss"] == pytest.approx(row["inv"] + LejepaConfig().lamb * row["sigreg"], rel=1e-5) for row in metrics)
+    else:  # an MAE's reconstruction error alone
+        assert not {"inv", "sigreg"} & set(metrics[-1])
+    model, step = experiment.load_checkpoint(experiment.own_eval(params))  # strict: the saved weights fit the objective's model
+    assert step == 3 and type(model).__name__ == {"views": "Lejepa", "mae": "Mae"}[objective]
 
 
 def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):

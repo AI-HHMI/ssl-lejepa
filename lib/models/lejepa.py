@@ -22,6 +22,14 @@ def crop(x: Tensor, origin: Tensor, size: tuple[int, ...]) -> Tensor:
     return x[b[:, None, None, None, None], c[None, :, None, None, None], iz[:, None, :, None, None], iy[:, None, None, :, None], ix[:, None, None, None, :]]
 
 
+def as_volume(x: Union[Tensor, dict[str, Any]], model: nn.Module) -> Tensor:
+    """A model's input as Batch C Z Y X on its device: a tensor of 3 to 5 dims, or a Miao VolumeDataset sample (e.g. dl[0])."""
+    vol = x["img"] if isinstance(x, dict) else x
+    assert 3 <= vol.dim() <= 5, f"Expected 3D, 4D, or 5D input, got tensor with shape {tuple(vol.shape)}"
+    vol = vol.reshape((1,) * (5 - vol.dim()) + tuple(vol.shape))
+    return vol.to(next(model.parameters()).device)
+
+
 def _norm1d(norm: str, dim: int) -> nn.Module:
     if norm == "bn":
         return SafeBatchNorm1d(dim)
@@ -126,8 +134,12 @@ class LejepaConfig:
     """Hyperparameters for LeJEPA: each part's own config, whole, plus how they combine."""
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
     projector: ProjectorConfig | None = field(default_factory=ProjectorConfig)  # None: tokens embed as the encoder's output
-    view: ViewConfig = field(default_factory=ViewConfig)  # the one crop each sample trains on (n_global=1, n_local=0)
-    mask: MaskConfig = field(default_factory=MaskConfig)
+    # "views" (LeJEPA's own, all runs before e02): each view's tokens pooled to one embedding, every view of a sample pulled
+    # to the mean of its globals, SIGReg over the batch. "mask": masked-token prediction (Lejepa.mask_loss, from e02 on).
+    objective: Literal["views", "mask"] = "mask"
+    view: ViewConfig = field(default_factory=ViewConfig)  # "mask": the one crop each sample trains on (n_global=1, n_local=0)
+    batch_views: bool = False  # "views": one encoder call per group of same-shape views (projector BN then pools the group)
+    mask: MaskConfig = field(default_factory=MaskConfig)  # "mask" only
     sigreg: SIGRegConfig = field(default_factory=SIGRegConfig)
     lamb: float = 0.02  # loss = inv + lamb * sigreg
     # SIGReg's samples: "view", each view's N tokens (a code of position alone passes it: e02-maskloss-sweep collapsed so);
@@ -140,8 +152,9 @@ class LejepaConfig:
 class Lejepa(nn.Module):
     """LeJEPA: Self-supervised representation learning for volumetric data.
 
-    Combines a 3D Vision Transformer encoder with a multi-layer projection head, a predictor, and the masked-token
-    prediction + SIGReg objective: a block of the view's tokens is hidden from the encoder, and the predictor must
+    Combines a 3D Vision Transformer encoder with a multi-layer projection head and SIGReg, under one of two objectives
+    (LejepaConfig.objective). "views": multi-view invariance of each view's pooled embedding. "mask": masked-token
+    prediction, with a predictor: a block of the view's tokens is hidden from the encoder, and the predictor must
     produce those tokens' embeddings (as the encoder makes them from the whole view) from the visible tokens. With a
     shift (MaskConfig.shift) the targets are instead a second, offset view's tokens over the same voxels.
     """
@@ -151,17 +164,20 @@ class Lejepa(nn.Module):
         self.config = c = replace(config or LejepaConfig(), **kwargs)
         self.encoder = ViT3DEncoder(c.encoder)
         self.projector = ProjectorMLP(c.encoder.embed_dim, c.projector) if c.projector else None
-        self.predictor = Predictor(c.encoder.embed_dim, c.encoder.num_heads, c.mask.predictor_depth)
+        # Only "mask" has a predictor, so the two objectives' checkpoints have different keys (a strict load tells them apart).
+        self.predictor = Predictor(c.encoder.embed_dim, c.encoder.num_heads, c.mask.predictor_depth) if c.objective == "mask" else None
         self.sigreg = SIGReg(c.sigreg)
         self.view_maker = ViewMaker(c.view, patch_size=self.encoder.patch_embed.patch_size) if c.view.views != "none" else None
-        assert (c.view.n_global, c.view.n_local) == (1, 0), f"one view per sample, got {c.view.n_global} global and {c.view.n_local} local"
-        b1 = c.mask.shift == 0
-        b2 = c.view.views == "displace" and all(c.mask.shift % p == 0 for p in self.encoder.patch_embed.patch_size)
-        assert b1 or b2, f"a shift ({c.mask.shift}) needs displace views (got {c.view.views!r}) and a multiple of the patch {self.encoder.patch_embed.patch_size}"
+        b1 = c.objective == "views"
+        b2 = (c.view.n_global, c.view.n_local) == (1, 0)
+        assert b1 or b2, f"masked tokens: one view per sample, got {c.view.n_global} global and {c.view.n_local} local"
+        b3 = c.mask.shift == 0
+        b4 = c.objective == "mask" and c.view.views == "displace" and all(c.mask.shift % p == 0 for p in self.encoder.patch_embed.patch_size)
+        assert b3 or b4, f"a shift ({c.mask.shift}) needs masked tokens, displace views (got {c.view.views!r}) and a multiple of the patch {self.encoder.patch_embed.patch_size}"
 
         # For FLOP accounting in forward.
         self._n_encoder_params = sum(p.numel() for p in self.encoder.parameters())
-        self._n_predictor_params = sum(p.numel() for p in self.predictor.parameters())
+        self._n_predictor_params = sum(p.numel() for p in self.predictor.parameters()) if self.predictor is not None else 0
         self._n_projector_params = sum(p.numel() for p in self.projector.parameters()) if self.projector is not None else 0
 
     def encode_maybe_project(self, x: Tensor) -> Tensor:
@@ -170,6 +186,23 @@ class Lejepa(nn.Module):
         if self.projector:
             return self.projector(emb)
         return emb
+
+    def encode_views(self, views: list[Tensor]) -> Tensor:
+        """Encode and project each view (each Batch C Z Y X) -> View Batch D.
+
+        With config.batch_views, same-shape views are concatenated along Batch into one encoder call.
+        """
+        if not self.config.batch_views:
+            return torch.stack([self.encode_maybe_project(v) for v in views])
+        groups: dict[tuple[int, ...], list[int]] = {}
+        for i, v in enumerate(views):
+            groups.setdefault(tuple(v.shape), []).append(i)
+        out: list[Tensor] = [views[0]] * len(views)  # placeholders, all overwritten below
+        for idx in groups.values():
+            z = self.encode_maybe_project(torch.cat([views[i] for i in idx]))  # (len(idx)·Batch) D
+            for i, zi in zip(idx, z.chunk(len(idx))):
+                out[i] = zi
+        return torch.stack(out)
 
     def project(self, tokens: Tensor) -> Tensor:
         """Batch N D -> Batch N Dproj: the projector per token (its BatchNorm pools every token of the batch)."""
@@ -213,32 +246,40 @@ class Lejepa(nn.Module):
         return_loss: bool = True,
         **kwargs: Any,
     ) -> Union[Tensor, LejepaOutput]:
-        # Handle dict input from Miao VolumeDataset (e.g. dl[0])
-        if isinstance(x, dict):
-            vol = x["img"]
-        else:
-            vol = x
-
-        # Ensure 5D tensor: (B, C, Z, Y, X)
-        if vol.dim() == 3:
-            vol = vol.unsqueeze(0).unsqueeze(0)
-        elif vol.dim() == 4:
-            vol = vol.unsqueeze(0)
-        elif vol.dim() != 5:
-            raise ValueError(f"Expected 3D, 4D, or 5D input, got tensor with shape {tuple(vol.shape)}")
-
-        # Ensure volume is on the same device as model parameters
-        try:
-            param_device = next(self.parameters()).device
-            if vol.device != param_device:
-                vol = vol.to(param_device)
-        except StopIteration:
-            pass
-
+        vol = as_volume(x, self)
         # If views are disabled or inference mode requested, return embeddings directly
         if not return_loss or self.view_maker is None:
             return self.encode_maybe_project(vol)
+        return self.views_loss(vol) if self.config.objective == "views" else self.mask_loss(vol)
 
+    def views_loss(self, vol: Tensor) -> LejepaOutput:
+        """The "views" objective on vol (Batch C Z Y X): every view's pooled embedding pulled to the mean of its sample's
+        globals (inv), SIGReg over the batch of each view."""
+        assert self.view_maker is not None
+        g_views, l_views = self.view_maker(vol)
+        proj_globals = self.encode_views(g_views)  # Global Batch D
+        proj_all = torch.cat([proj_globals, self.encode_views(l_views)]) if l_views else proj_globals  # View Batch D
+        # SIGReg's cos/sin statistics are precision sensitive, so keep the loss in fp32 under autocast.
+        with torch.autocast(vol.device.type, enabled=False):
+            emb = proj_all.float()
+            out = lejepa_loss(pred=proj_globals.float().mean(dim=0, keepdim=True).expand_as(emb), target=emb, sig=self.sigreg(emb), lamb=self.config.lamb)
+        # Encoder tokens this step, summed over views and batch (python int, no device sync).
+        patch_vol = prod(self.encoder.patch_embed.patch_size)
+        out.n_tokens = sum(v.shape[0] * prod(v.shape[2:]) // patch_vol for v in [*g_views, *l_views])
+        # Per token, 6 x encoder params for the weights plus 12 x depth x width x N for attention over its N-token view;
+        # per sample, 6 x projector params (as train_flops).
+        enc = self.config.encoder
+        out.n_flops = sum(
+            v.shape[0] * (n * (6 * self._n_encoder_params + 12 * enc.depth * enc.embed_dim * n) + 6 * self._n_projector_params)
+            for v in [*g_views, *l_views]
+            for n in [prod(v.shape[2:]) // patch_vol]
+        )
+        return out
+
+    def mask_loss(self, vol: Tensor) -> LejepaOutput:
+        """The "mask" objective on vol (Batch C Z Y X): the masked tokens' embeddings predicted from the visible ones (inv),
+        SIGReg over config.sigreg_over's samples."""
+        assert self.predictor is not None and self.view_maker is not None
         region = self.view_maker(vol)[0][0]  # the one crop, Batch C Z Y X: both views' region (each is it, without a shift)
         batch, shift = region.shape[0], self.config.mask.shift
         size = tuple(s - shift for s in region.shape[2:])

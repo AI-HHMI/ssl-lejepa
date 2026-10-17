@@ -7,7 +7,7 @@ import torch
 
 from lib.encoders import EncoderConfig, ViT3DEncoder, get_3d_sincos_pos_embed, sincos_at
 from lib.losses import SIGReg, SIGRegConfig, lejepa_loss
-from lib.models import Lejepa, LejepaConfig, MaskConfig, ProjectorConfig, train_flops
+from lib.models import Lejepa, LejepaConfig, Mae, MaeConfig, MaskConfig, ProjectorConfig, train_flops
 from lib.views import ViewConfig, ViewMaker
 
 TINY = LejepaConfig(encoder=EncoderConfig(depth=1, embed_dim=32, num_heads=2, patch_size=(4, 4, 4)),
@@ -22,7 +22,7 @@ def test_each_part_keeps_its_config_whole():
     assert model.view_maker.config == cfg.view and model.projector is None
     # Old checkpoints load: the parts keep their module names, so state-dict keys are unchanged.
     assert {k.split(".")[0] for k in Lejepa(TINY).state_dict()} == {"encoder", "projector", "predictor", "sigreg"}
-    assert len(model.predictor.blocks) == 1
+    assert model.predictor is not None and len(model.predictor.blocks) == 1
     assert Lejepa(TINY, view=ViewConfig(views="none")).view_maker is None
 
 
@@ -209,6 +209,75 @@ def test_a_shifted_target_view_is_the_same_voxels_offset():
             origin.append(torch.tensor([z, rem // 24, rem % 24]))
             assert torch.equal(v[b, 0], x[b, 0, z:z + 16, rem // 24:rem // 24 + 16, rem % 24:rem % 24 + 16])
         assert torch.equal(origin[1] - origin[0], offsets[0][b])
+
+
+def test_views_objective_is_lejepas_invariance_to_the_globals_mean():
+    """As before e02: every view's pooled, projected embedding pulled to the mean of its sample's globals, SIGReg over the batch."""
+    view = ViewConfig(views="displace", n_global=2, n_local=2, global_size=(16, 16, 16), local_size=(8, 8, 8))
+    model = Lejepa(TINY, objective="views", view=view, lamb=0.1)
+    assert model.predictor is None and "predictor" not in {k.split(".")[0] for k in model.state_dict()}
+    x = torch.randn(3, 1, 24, 24, 24)
+    torch.manual_seed(0)
+    out = model(x)
+    torch.manual_seed(0)  # the same crops and SIGReg slices, by hand
+    assert model.view_maker is not None
+    g, l = model.view_maker(x)
+    proj_g, proj_l = model.encode_views(g), model.encode_views(l)
+    proj = torch.cat([proj_g, proj_l])  # View Batch D
+    inv = (proj_g.mean(dim=0, keepdim=True) - proj).square().mean()
+    torch.testing.assert_close(out.inv, inv)
+    torch.testing.assert_close(out.sigreg, model.sigreg(proj))
+    torch.testing.assert_close(out.loss, inv + 0.1 * out.sigreg)
+    assert out.n_tokens == 3 * (2 * 64 + 2 * 8)
+    out.loss.backward()
+    assert all(p.grad is not None for p in model.encoder.parameters() if p.requires_grad)
+
+
+def test_masked_tokens_want_one_view_per_sample():
+    with pytest.raises(AssertionError, match="one view per sample"):
+        Lejepa(TINY, view=ViewConfig(n_global=2))
+    with pytest.raises(AssertionError, match="needs masked tokens"):
+        Lejepa(TINY, objective="views", view=ViewConfig(views="displace"), mask=MaskConfig(shift=4))
+
+
+def test_patchify_is_each_tokens_voxels_in_token_order():
+    pe = ViT3DEncoder(TINY.encoder).patch_embed  # patches of 4
+    x = torch.randn(2, 1, 8, 12, 16)
+    patches = pe.patchify(x)  # grid 2 3 4
+    assert patches.shape == (2, 24, 64)
+    for t, (z, y, xx) in enumerate([(z, y, xx) for z in range(2) for y in range(3) for xx in range(4)]):
+        torch.testing.assert_close(patches[:, t], x[:, :, 4 * z:4 * z + 4, 4 * y:4 * y + 4, 4 * xx:4 * xx + 4].reshape(2, -1))
+    torch.testing.assert_close(pe(x)[0], pe.proj(patches))
+
+
+def test_mae_reconstructs_only_the_hidden_patches():
+    torch.manual_seed(0)
+    model = Mae(encoder=TINY.encoder, view=ViewConfig(views="displace", global_size=(16, 16, 16), flip=False), norm_pix=False,
+                decoder_dim=8, decoder_heads=2, decoder_depth=1)
+    assert isinstance(model.config, MaeConfig) and {k.split(".")[0] for k in model.state_dict()} >= {"encoder", "decoder_head"}
+    for p in model.decoder_head.parameters():  # it predicts 0 everywhere
+        torch.nn.init.zeros_(p)
+    kept = []
+    encode = model.encoder.forward_features
+    model.encoder.forward_features = lambda x, keep=None: kept.append(keep) or encode(x, keep)
+    x = torch.randn(3, 1, 16, 16, 16)  # the view is the whole input: grid 4 4 4, 16 of 64 tokens visible
+    out = model(x)
+    assert kept[0].shape == (3, 16) and out.n_tokens == 3 * 16
+    hidden = torch.ones(3, 64, dtype=torch.bool).scatter_(1, kept[0], False)
+    torch.testing.assert_close(out.loss, model.encoder.patch_embed.patchify(x)[hidden].square().mean())  # the error of 0, there only
+    out.loss.backward()
+    assert model.mask_token.grad is not None and all(p.grad is not None for p in model.encoder.blocks.parameters())
+
+
+def test_mae_normalizes_each_target_patch():
+    torch.manual_seed(0)
+    model = Mae(encoder=TINY.encoder, view=ViewConfig(views="displace", global_size=(16, 16, 16)), decoder_dim=8, decoder_heads=2, decoder_depth=1)
+    for p in model.decoder_head.parameters():
+        torch.nn.init.zeros_(p)
+    x = torch.randn(3, 1, 16, 16, 16)
+    loss = model(x).loss
+    torch.testing.assert_close(model(1000 * x + 7).loss, loss, rtol=1e-3, atol=1e-3)  # blind to each patch's offset and scale
+    assert loss.item() == pytest.approx(63 / 64, rel=0.01)  # a zero prediction's error: each patch's (biased) variance / unbiased one
 
 
 def test_forward_accounts_tokens_and_flops_of_both_encoder_passes():

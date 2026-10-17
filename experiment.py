@@ -25,7 +25,7 @@ from lib.data import HEMIBRAIN_EB, HEMIBRAIN_EB_LABELS, HEMIBRAIN_EB_PROBE_ANNOT
 from lib.benchmark import Benchmark
 from lib.losses import LejepaOutput
 from lib.encoders import EncoderConfig
-from lib.models import Lejepa, LejepaConfig, MaskConfig, train_flops
+from lib.models import Lejepa, LejepaConfig, Mae, MaeConfig, MaskConfig, train_flops
 from lib.views import ViewConfig, ViewMaker
 from lib.util import *
 from lib.types import *
@@ -135,9 +135,13 @@ class Train:
     n_layers: int = 12
     width: int = 512  # encoder width; heads = width // 64
     lr: float = 1e-4  # run(): linear warmup, then held at this lr (no decay; see anneal_from)
-    views: Views = "basic"  # the one crop each sample trains on: 'basic' (a random scale) or 'displace' (global_size)
+    # The pre-training objective: LeJEPA's multi-view invariance ("views", every run before e02), its masked-token prediction
+    # ("mask", e02-e05), or a masked autoencoder ("mae", the pixel-space baseline: lib.models.Mae). See model_config.
+    objective: Literal["views", "mask", "mae"] = "mask"
+    views: Views = "basic"  # the crops: 'basic' (random scales) or 'displace' (global_size; "views": locals of local_size inside them)
     global_size: Tup3Int = (88, 88, 88)  # displace only
-    local_size: Tup3Int = (56, 56, 56)  # unused: no local views since the masked-token objective (analysis_utils reads it)
+    local_size: Tup3Int = (56, 56, 56)  # displace, "views" only (analysis_utils reads it)
+    batch_views: bool = False  # "views": one encoder call per group of same-shape views (2 per step with displace)
     mask_block: float = 0.6  # the masked cube's side as a fraction of the view's token grid side (lib.models.MaskConfig.block)
     mask_shift: int = 0  # >0: targets from a second view up to this many voxels off the context's (lib.models.MaskConfig.shift); both global_size
     # loss = prediction error + lamb x SIGReg. SIGReg's pull is lamb x its sample count (its statistic is N x an empirical-CF
@@ -294,18 +298,35 @@ def collate_images(samples):
     import torch
     return torch.stack([s["img"] for s in samples])
 
-def lejepa_config(par: Train):
+def lejepa_config(par: Train) -> LejepaConfig:
+    """par's Lejepa: "views" (all runs before e02, which kept lamb 0.1 in the model; set it in par) or "mask"."""
+    assert par.objective != "mae", f"{par.savedir} trains an MAE: model_config"
     (z, y, x), s = par.global_size, par.mask_shift
+    n_global, n_local = (2, 4) if par.objective == "views" else (1, 0)  # "views": ViewConfig's defaults before e02
     return LejepaConfig(
         encoder = EncoderConfig(depth=par.n_layers, embed_dim=par.width, num_heads=par.width // 64),
-        view = ViewConfig(views=par.views, global_size=(z + s, y + s, x + s)),  # both views' region
+        objective = par.objective,
+        view = ViewConfig(views=par.views, n_global=n_global, n_local=n_local, global_size=(z + s, y + s, x + s), local_size=par.local_size),  # "mask": both views' region
+        batch_views = par.batch_views,
         mask = MaskConfig(block=par.mask_block, shift=par.mask_shift),
         lamb = par.lamb,
         sigreg_over = par.sigreg_over,
         stop_grad = par.stop_grad,
     )
 
-def compile_model(model: Lejepa, par: Train):
+def model_config(par: Train) -> LejepaConfig | MaeConfig:
+    """par's model's config: an MAE on the same encoder and view, or lejepa_config."""
+    if par.objective != "mae":
+        return lejepa_config(par)
+    return MaeConfig(encoder=EncoderConfig(depth=par.n_layers, embed_dim=par.width, num_heads=par.width // 64),
+                     view=ViewConfig(views=par.views, global_size=par.global_size))
+
+def make_model(par: Train) -> Lejepa | Mae:
+    """par's model, untrained."""
+    c = model_config(par)
+    return Mae(c) if isinstance(c, MaeConfig) else Lejepa(c)
+
+def compile_model(model: Lejepa | Mae, par: Train):
     """torch.compile the encoder in place, as par says (no-op unless par.compile)."""
     import torch
     assert par.compile or not (par.cudagraphs or par.compile_blocks), "cudagraphs / compile_blocks require compile"
@@ -334,7 +355,7 @@ def save_view_pngs(par: Train, dataset, n_samples: int = 3):
     """Save what the model sees: for n_samples fresh samples, the input and each of its views, as
     center-z slices at native voxel size, left to right (input | globals | locals) -> savedir/views_{i}.png."""
     from PIL import Image
-    cfg = lejepa_config(par)
+    cfg = model_config(par)
     p = cfg.encoder.patch_size
     maker = ViewMaker(cfg.view, patch_size=(p, p, p) if isinstance(p, int) else p)
     samples = [dataset[i] for i in range(n_samples)]
@@ -409,7 +430,7 @@ def build(par: Train, r: Rank):
     """(model to step: compiled, and DDP-wrapped across ranks; the bare Lejepa, for checkpoints and logging; AdamW; its lr
     schedule) for training par: fresh, or from par.anneal_from's weights and Adam moments."""
     import torch
-    model = Lejepa(lejepa_config(par))
+    model = make_model(par)
     ckpt = torch.load(par.anneal_from, map_location="cpu", weights_only=False) if par.anneal_from else None
     if ckpt is not None:
         model.load_state_dict(ckpt["model"])  # strict: architecture drift fails loudly
@@ -535,11 +556,11 @@ def log_metrics(f, par: Train, lejepa, x, out, grad_norm, sched, step: int, n_sk
     g = par.global_size
     with torch.no_grad(), torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=par.amp):
         resid = lejepa.encoder.forward_residual(x[:4, :, :g[0], :g[1], :g[2]])
-    # loss = inv + lamb * sigreg, logged apart: sigreg is ~1.05 for exactly Gaussian projections
+    # LeJEPA's loss = inv + lamb * sigreg, logged apart: sigreg is ~1.05 for exactly Gaussian projections
     # (its floor), and its pull scales with the per-GPU batch, so the total alone mixes invariance
-    # with how Gaussian the projections are.
+    # with how Gaussian the projections are. An MAE's loss is its reconstruction error alone.
     f.write(json.dumps({"tbl": "metrics", "idx_step": step, "time": seconds, "loss": loss,
-                        "inv": out.inv.detach().item(), "sigreg": out.sigreg.detach().item(),
+                        **{k: out[k].detach().item() for k in ("inv", "sigreg") if k in out},
                         "grad_norm": grad_norm.item(), "lr": sched.get_last_lr()[0],
                         "resid_norm": resid.float().norm(dim=-1).median().item(), "skipped": n_skipped}) + "\n")
     f.flush()
@@ -693,7 +714,7 @@ def replay_bad_batch(path: str):
     x = dump["x_uint8"].to(device).float() / 255  # Batch C Z Y X, exactly the training input
 
     def step(label: str, compiled: bool, backend: SDPBackend | None = None) -> tuple[float, int]:
-        model = Lejepa(lejepa_config(par))  # this commit's own experiment (asserted above), so its own architecture
+        model = make_model(par)  # this commit's own experiment (asserted above), so its own architecture
         model.load_state_dict(dump["model"])  # the pre-step weights
         model.to(device).train()
         if compiled:
@@ -739,11 +760,11 @@ def load_checkpoint(e: Eval):
     "random": untrained weights, seeded (the baseline every trained encoder must beat). Step 0.
     """
     import torch
-    model = Lejepa(lejepa_config(e.train))
+    model = make_model(e.train)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if e.init_from == "random":
         torch.manual_seed(0)
-        return Lejepa(lejepa_config(e.train)).to(device).eval(), 0
+        return make_model(e.train).to(device).eval(), 0
     src = Path(e.init_from or e.train.savedir)
     paths = [src] if src.suffix == ".pt" else sorted((src / "checkpoints").glob("step_*.pt")) or sorted(src.glob("checkpoint.pt"))
     assert paths, f"no checkpoints in {src}"
