@@ -72,6 +72,7 @@ LR_WARMUP, LR_FLOOR, GRAD_CLIP = 1000, 0.01, 1.0
 CHECKPOINT_EVERY, CHECKPOINT_KEEP = 2000, 1
 MAX_SKIPPED, BAD_BATCHES_KEPT = 100, 2
 N_PARAMS_CACHE = Path(".cache/lejepa_n_params.json")  # machine-local (gitignored): see lejepa_n_params
+TEST_TILES = (16, 32, 64, 128, 256, 512)  # pca_sizes: the tile sides an encoder is run at, test time (2^3 to 64^3 tokens)
 # Model sizes and compute budgets of e00/scaling-law's IsoFLOP grid (scaling_budgets), for designing size x budget sweeps.
 SIZES = {"xs": (4, 256), "s": (6, 384), "m": (12, 512), "l": (16, 768), "xl": (24, 1024)}  # (n_layers, width); m = Train' default
 SCALING_BATCH = 64  # per GPU, fixed across sizes (== gpu_b300's validated default at m); xl OOMs at it on one B300
@@ -187,6 +188,7 @@ class Eval:
     unetr_steps: int = 3000  # decoder="unetr": fit_unetr training steps (fit_probe's STEPS, for comparison)
     unetr_freeze_encoder: bool = True  # decoder="unetr": keep the encoder frozen while fitting it (fair vs. the linear probe)
     score: bool = False  # probe() also writes the affinity artifacts `score` reads (probe/{fit,test}, GBs each; score deletes them after)
+    jobs: tuple[str, ...] = ("pca", "probe")  # the entrypoints start() submits for it
 
 @dataclass(slots=True)
 class Rank:
@@ -204,45 +206,31 @@ class Rank:
         return torch.device(f"cuda:{self.local}" if torch.cuda.is_available() else "cpu")
 
 # This experiment's id (README: experiment ids): its roots are outdir/<EXPERIMENT>/d<i>/, a trunk's branches in its own dir.
-EXPERIMENT = "e00/e07-mask-side"
+EXPERIMENT = "e00/e06-01-test-tile-size"
 
 def roots() -> list[Train | Eval]:
     """This experiment: the runs it starts from nothing (trunks, other training runs, evals of another experiment's weights).
     Each trunk evaluates its own milestones as it saves them (eval_milestone)."""
-    # How big should the masked cube be? e05-shifted-target's cube of 7 tokens of 12 beat 4 in all four of its pairs; here
-    # its best cell (view 96, shift 32, pull 10, SIGReg "both") with the cube's side swept over every size from 1 to 11 tokens
-    # (0.06% to 77% of the view's tokens). A small cube's targets sit beside visible tokens of nearly the same content, so
-    # interpolation may be enough to predict them; a big one leaves little context. The cube must fit both views, which a
-    # shift of s tokens allows up to a side of 12 - s: sides 9, 10 and 11 get shifts of 3, 2 and 1 token (24, 16, 8 voxels)
-    # instead of 4, so they also differ in the shift (e05: shift 32 over 16 by 0.004-0.016 short AP). The input is the view
-    # plus the shift (the region both views are cut from). 2 h (e05's budget, now on a B300) of m (12x512), batch 32,
-    # evals at doubling steps from 5k, not scored. Side 7 is e05's d7 on another GPU: the link between the two.
-    BATCH, STEPS, HOURS, VIEW, GRID = 32, 2_560_000, 2, 96, 12
-    runs = []
-    for side in range(1, 12):
-        shift = 8 * min(4, GRID - side)
-        p = Train()
-        p.savedir = f"outdir/{EXPERIMENT}/d{len(runs)}/"
-        p.data = "hemibrain_wide"
-        p.views = "displace"
-        p.patch_size = (VIEW + shift, VIEW + shift, VIEW + shift)
-        p.global_size = (VIEW, VIEW, VIEW)
-        p.mask_block = side / GRID  # lib.models.lejepa.mask_side rounds block x grid back to side
-        p.mask_shift = shift
-        p.sigreg_over = "both"
-        p.lamb = 10 / BATCH
-        p.batch_size = BATCH
-        p.steps_per_epoch = STEPS
-        p.milestone_every = 5_000
-        p.milestone_doubling = True
-        p.max_hours = HOURS
-        p.weight_decay = 0.05
-        p.adam_beta2 = 0.95
-        p.cudagraphs = True
-        p.n_workers = 11  # 12 cores per GPU
-        p.queue = "gpu_b300"
-        runs.append(p)
-    return runs
+    # Every eval so far ran an encoder in tiles of its own training view. How do its tokens change with the input size at
+    # test time? The best encoder so far, e06-viewsize-vs-baselines' d0 (masked tokens, view 64 = 8^3 tokens, shift 24, at
+    # its last checkpoint, 133.6k steps: short / long AP 0.205 / 0.847), run on one held-out EB val crop in cubic tiles of
+    # 16 to 512 voxels (2^3 to 64^3 tokens; pca_sizes), 4 tiles of the largest and 131072 of the smallest. Its position
+    # embedding has only seen 0-7 per axis. PCA maps only: the probe's context around its test block leaves the EB crop
+    # at tiles of 256 and up.
+    trunk = Train()
+    trunk.savedir = "outdir/e00/e06-viewsize-vs-baselines/d0/"  # its architecture, for load_checkpoint's strict load
+    trunk.objective = "mask"
+    trunk.data = "hemibrain_wide"
+    trunk.views = "displace"
+    trunk.patch_size = (88, 88, 88)
+    trunk.global_size = (64, 64, 64)
+    trunk.mask_block = 0.6
+    trunk.mask_shift = 24
+    trunk.sigreg_over = "both"
+    trunk.lamb = 10 / 32
+    trunk.batch_size = 32
+    trunk.queue = "gpu_b300"
+    return [Eval(savedir=f"outdir/{EXPERIMENT}/d0/", train=trunk, init_from=trunk.savedir, jobs=("pca_sizes",))]
 
 def milestone_steps(trunk: Train) -> list[int]:
     """The steps whose checkpoints train() keeps in checkpoints/milestones/: every milestone_every steps up to steps_per_epoch,
@@ -793,6 +781,30 @@ def pca(job: Eval | str):
     pca_maps(model.encoder, e.train, Path(e.savedir), step)
     release_milestone(e)
 
+def eb_val_crop(shape: tuple[int, ...]):
+    """A shape (Z Y X) window of EB at (3400, 2000, 2000) z y x, inside its val slab (EB z 3000-4000), held out from
+    training: 1 Z Y X in [0, 1], through miao (training's data path and normalization). miao needs the box strictly larger
+    than the patch: one extra voxel per axis leaves exactly one window."""
+    origin = (3400, 2000, 2000)
+    assert origin[0] + shape[0] <= 4000, f"crop {shape} leaves EB's val slab"
+    vol = lmd.get(HEMIBRAIN_EB).to_miao(bounding_box=[[o, o + s + 1] for o, s in zip(origin, shape)])
+    mcfg = MiaoConfig(volumes=[vol], patch_size=list(shape), resolutions=[[8.0, 8.0, 8.0]],
+                      samples_per_epoch=1, sampling="random", output_axes="lzyx")
+    return VolumeDataset(mcfg)[0]["img"]
+
+def pca_rgb(f, size):
+    """N D tokens of a size (... ) box -> (... 3 uint8: the top 3 principal components, each scaled 1st-99th percentile;
+    effective rank, ~1 a collapse; top-10 explained variance)."""
+    import torch
+    f = f - f.mean(0)
+    _, sv, vh = torch.linalg.svd(f, full_matrices=False)
+    p = sv / sv.sum()
+    erank = float(torch.exp(-(p * p.clamp_min(1e-12).log()).sum()))
+    pcs = (f @ vh[:3].T).reshape(*size, 3)
+    lo, hi = torch.quantile(pcs.reshape(-1, 3), torch.tensor([0.01, 0.99], device=f.device), dim=0)
+    rgb = ((pcs - lo) / (hi - lo)).clamp(0, 1).mul(255).byte().cpu().numpy()
+    return rgb, erank, (sv ** 2 / (sv ** 2).sum())[:10].tolist()
+
 def pca_maps(encoder, par: Train, savedir: Path, step: int):
     """PCA maps of patch-token embeddings on a held-out EB val crop -> savedir/pca2.png, pca.json.
 
@@ -806,14 +818,9 @@ def pca_maps(encoder, par: Train, savedir: Path, step: int):
     device = next(encoder.parameters()).device
     encoder.eval()
 
-    # One (3g, 4g, 4g) window (z y x, g = global view size, so it tiles exactly) inside EB's val slab
-    # (EB z 3000-4000), held out from training. 3 tiles deep in z so each row of pca2.png is a different tile.
-    # miao needs the box strictly larger than the patch: one extra voxel per axis leaves exactly one window.
-    shape, z0, y0, x0 = (3 * par.global_size[0], 4 * par.global_size[1], 4 * par.global_size[2]), 3400, 2000, 2000
-    vol = lmd.get(HEMIBRAIN_EB).to_miao(bounding_box=[[o, o + s + 1] for o, s in zip((z0, y0, x0), shape)])
-    mcfg = MiaoConfig(volumes=[vol], patch_size=list(shape), resolutions=[[8.0, 8.0, 8.0]],
-                      samples_per_epoch=1, sampling="random", output_axes="lzyx")
-    img = VolumeDataset(mcfg)[0]["img"]  # 1 Z Y X in [0, 1]
+    # 3 tiles deep in z so each row of pca2.png is a different tile.
+    shape = (3 * par.global_size[0], 4 * par.global_size[1], 4 * par.global_size[2])
+    img = eb_val_crop(shape)
 
     # Tokens from non-overlapping tiles at the training global-view size, stitched into one grid.
     tile, patch = par.global_size, encoder.patch_embed.patch_size
@@ -829,16 +836,6 @@ def pca_maps(encoder, par: Train, savedir: Path, step: int):
             gz, gy, gx = (t_ // p for t_, p in zip(tile, patch))
             feats[tz:tz + gz, ty:ty + gy, tx:tx + gx] = t[0].float().reshape(gz, gy, gx, -1).cpu()
             norms[tz:tz + gz, ty:ty + gy, tx:tx + gx] = r[0].float().norm(dim=-1).reshape(gz, gy, gx).cpu()
-
-    def pca_rgb(f, size):  # N D tokens of a size (Z Y X) box -> (Z Y X 3 uint8 top-3 PCs, effective rank, top-10 explained variance)
-        f = f - f.mean(0)
-        _, sv, vh = torch.linalg.svd(f, full_matrices=False)
-        p = sv / sv.sum()
-        erank = float(torch.exp(-(p * p.clamp_min(1e-12).log()).sum()))  # effective rank; ~1 means collapse
-        pcs = (f @ vh[:3].T).reshape(*size, 3)
-        lo, hi = torch.quantile(pcs.reshape(-1, 3), torch.tensor([0.01, 0.99]), dim=0)
-        rgb = ((pcs - lo) / (hi - lo)).clamp(0, 1).mul(255).byte().numpy()
-        return rgb, erank, (sv ** 2 / (sv ** 2).sum())[:10].tolist()
 
     # Tile-centered tokens: subtract each tile's mean token, removing the per-view code and keeping within-view structure.
     g = [t_ // p for t_, p in zip(tile, patch)]  # tokens per tile side
@@ -877,6 +874,49 @@ def pca_maps(encoder, par: Train, savedir: Path, step: int):
     (savedir / "pca.json").write_text(json.dumps(stats) + "\n")
     print(f"{savedir}: step {step}, effective rank {erank:.1f}, top-3 variance {sum(var[:3]):.2f}, "
           f"between-tile variance {between_tile:.2f}, norm outliers (>2x median) {stats['norm_outliers']}/{norms.numel()}; wrote pca2.png")
+
+def pca_sizes(job: Eval | str):
+    """The input size at test time: the spec job's encoder run on one held-out EB val crop in non-overlapping cubic tiles
+    of each TEST_TILES side, the crop 2 x 2 tiles of the largest in y x and one deep (so the smallest are many), ->
+    savedir/pca_tile_<side>.png and a pca_sizes.json row per side. Each png is one z-slice, the same voxels at every side:
+    EM | PCA of its tokens | PCA after subtracting each tile's mean token, fitted on that slice. The row's effective rank
+    and explained variance are of 65536 tokens drawn from the whole crop, its between-tile variance (the share of token
+    variance that is each tile's mean) of all of them."""
+    import time
+    import torch
+    from PIL import Image
+    e = load(job, Eval)
+    model, step = load_checkpoint(e)
+    record(e, "pca_sizes")
+    encoder, device = model.encoder, next(model.parameters()).device
+    p = encoder.patch_embed.patch_size
+    big = max(TEST_TILES)
+    shape = (big, 2 * big, 2 * big)
+    img = eb_val_crop(shape)[0].to(device)  # Z Y X
+    zt = shape[0] // 2 // p[0]  # the slice shown: the middle of a token row near the crop's middle
+    em = np.repeat((img[zt * p[0] + p[0] // 2].cpu().numpy() * 255).astype(np.uint8)[..., None], 3, axis=2)
+    up = lambda a: a[0].repeat(p[1], axis=0).repeat(p[2], axis=1)  # 1 Gy Gx 3 tokens -> Y X 3 voxels
+    vgap = np.full((shape[1], 8, 3), 255, np.uint8)
+    (Path(e.savedir) / "pca_sizes.json").write_text("")  # a redo (lsf pca_sizes) starts over
+    for side in TEST_TILES:
+        t0 = time.time()
+        feats = tile_features(encoder, img, (side, side, side)).float()  # Gz Gy Gx D
+        grid, d = feats.shape[:3], feats.shape[-1]
+        g = side // p[0]  # tokens per tile side
+        tiled = feats.reshape(grid[0] // g, g, grid[1] // g, g, grid[2] // g, g, d)
+        centered = (tiled - tiled.mean(dim=(1, 3, 5), keepdim=True)).reshape(*grid, d)
+        between = 1 - float(centered.var(dim=(0, 1, 2)).sum() / feats.var(dim=(0, 1, 2)).sum())
+        sample = feats.reshape(-1, d)[torch.randperm(feats[..., 0].numel(), device=device, generator=torch.Generator(device).manual_seed(0))[:65536]]
+        _, erank, var = pca_rgb(sample, (len(sample),))
+        rgb, rgb_c = pca_rgb(feats[zt].reshape(-1, d), (1, *grid[1:]))[0], pca_rgb(centered[zt].reshape(-1, d), (1, *grid[1:]))[0]
+        Image.fromarray(np.concatenate([em, vgap, up(rgb), vgap, up(rgb_c)], axis=1)).save(Path(e.savedir) / f"pca_tile_{side:03d}.png")
+        row = {"tbl": "pca_sizes", "step": step, "tile": side, "tiles": (shape[0] // side) * (shape[1] // side) * (shape[2] // side),
+               "effective_rank": erank, "explained_variance": var, "between_tile_variance": between, "seconds": time.time() - t0}
+        with open(Path(e.savedir) / "pca_sizes.json", "a") as f:
+            f.write(json.dumps(row) + "\n")
+        print(f"tile {side}: {row['tiles']} tiles, effective rank {erank:.1f}, between-tile variance {between:.3f}, {row['seconds']:.0f} s", flush=True)
+        del feats, tiled, centered
+        torch.cuda.empty_cache()
 
 def score(job: Eval | str):
     """Score probe(job)'s affinities as mia-evals' neuron-instance task (SCORE_CONFIG: mutex watershed + size filter,
@@ -1112,11 +1152,12 @@ def bsub(savedir: str, job: str, minutes: int, n_gpus: int, queue: str, cmd: str
 def submit(fn: str, job: Train | Eval):
     """Run the entrypoint fn on the spec job as an LSF job: job written to its savedir (dump: train.json or eval.json), and
     `experiment.py <fn> <that file>` submitted (bsub), which loads it. Resources by fn: run and benchmark, a training job on
-    job's queue and GPUs (torchrun); pca and probe, one GPU on the trained run's queue; score, a CPU job on SCORE_QUEUE. No
-    commit check: callers from the shared checkout (submitall, lsf) assert_committed() first; a job submitting one is committed code."""
+    job's queue and GPUs (torchrun); pca, pca_sizes and probe, one GPU on the trained run's queue; score, a CPU job on
+    SCORE_QUEUE. No commit check: callers from the shared checkout (submitall, lsf) assert_committed() first; a job submitting
+    one is committed code."""
     b1 = fn in ("run", "benchmark") and isinstance(job, Train)
-    b2 = fn in ("pca", "probe", "score") and isinstance(job, Eval)
-    assert b1 or b2, f"{job.savedir}: no LSF job {fn!r} for a {type(job).__name__} (run and benchmark take a Train; pca, probe and score an Eval)"
+    b2 = fn in ("pca", "pca_sizes", "probe", "score") and isinstance(job, Eval)
+    assert b1 or b2, f"{job.savedir}: no LSF job {fn!r} for a {type(job).__name__} (run and benchmark take a Train; pca, pca_sizes, probe and score an Eval)"
     assert not isinstance(job, Train) or job.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={job.n_workers} leaves no core for the training process"
     spec = dump(job)
     if isinstance(job, Train):
@@ -1126,13 +1167,13 @@ def submit(fn: str, job: Train | Eval):
     elif fn == "score":
         bsub(job.savedir, fn, SCORE_MINUTES, 0, SCORE_QUEUE, f"python {{code}}/experiment.py score {spec}", slots=SCORE_SLOTS)
     else:
-        bsub(job.savedir, fn, {"pca": 30, "probe": 60}[fn], 1, job.train.queue, f"python {{code}}/experiment.py {fn} {spec}")
+        bsub(job.savedir, fn, {"pca": 30, "pca_sizes": 60, "probe": 60}[fn], 1, job.train.queue, f"python {{code}}/experiment.py {fn} {spec}")
 
 def start(p: Train | Eval):
     """Submit p fresh: its savedir emptied (old contents -> outdir/.trash/), then its jobs: a training run (which evals itself
-    after), or an eval's pca and probe."""
+    after), or an eval's jobs (Eval.jobs: pca and probe, unless it says otherwise)."""
     trash(p.savedir)
-    for fn in ["run"] if isinstance(p, Train) else ["pca", "probe"]:
+    for fn in ["run"] if isinstance(p, Train) else p.jobs:
         submit(fn, p)
 
 def lsf(fn: str, target: int | str):

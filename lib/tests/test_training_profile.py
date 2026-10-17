@@ -288,6 +288,36 @@ def test_pca_releases_its_milestone(tmp_path, monkeypatch):
     assert not milestone.exists()
 
 
+def test_pca_sizes_maps_one_crop_at_each_test_tile(tmp_path, monkeypatch):
+    """Every tile side runs over the same crop, 2 x 2 tiles of the largest in y x and one deep; one png and json row per side."""
+    from PIL import Image
+    from lib.util import dump, load
+    torch.manual_seed(0)
+    model = Lejepa(LejepaConfig(encoder=EncoderConfig(depth=1, embed_dim=16, num_heads=2, patch_size=(4, 4, 4)), projector=ProjectorConfig(dim=8, hidden=16))).eval()
+    monkeypatch.setattr(experiment, "TEST_TILES", (8, 16))
+    monkeypatch.setattr(experiment, "eb_val_crop", lambda shape: torch.rand(1, *shape))
+    monkeypatch.setattr(experiment, "load_checkpoint", lambda e: (model, 7))
+    monkeypatch.setattr(experiment, "record", lambda *a: None)
+    e = experiment.Eval(savedir=f"{tmp_path}/", train=experiment.Train(), init_from="outdir/e00/x/d0", jobs=("pca_sizes",))
+    assert load(str(dump(e)), experiment.Eval) == e  # the spec round-trips, jobs and all
+    experiment.pca_sizes(e)
+    rows = [json.loads(line) for line in (tmp_path / "pca_sizes.json").read_text().splitlines()]
+    assert [(r["tile"], r["tiles"], r["step"]) for r in rows] == [(8, 2 * 4 * 4, 7), (16, 4, 7)]  # a 16 x 32 x 32 crop
+    assert all(0 <= r["between_tile_variance"] <= 1 and r["effective_rank"] > 1 for r in rows)
+    for side in (8, 16):  # EM | PCA | tile-centered PCA, at voxel size
+        assert Image.open(tmp_path / f"pca_tile_{side:03d}.png").size == (3 * 32 + 2 * 8, 32)
+
+
+def test_start_submits_an_evals_own_jobs(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    submitted = []
+    monkeypatch.setattr(experiment, "submit", lambda fn, p: submitted.append(fn))
+    monkeypatch.setattr(experiment, "trash", lambda savedir: None)
+    experiment.start(experiment.Eval(savedir="outdir/e00/x/d0/", train=experiment.Train()))
+    experiment.start(experiment.Eval(savedir="outdir/e00/x/d1/", train=experiment.Train(), jobs=("pca_sizes",)))
+    assert submitted == ["pca", "probe", "pca_sizes"]
+
+
 def test_load_checkpoint_reads_a_milestone_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     par = experiment.Train(patch_size=(8, 8, 8), views="displace", global_size=(8, 8, 8))
@@ -303,11 +333,14 @@ def test_load_checkpoint_reads_a_milestone_file(tmp_path, monkeypatch):
 def test_submitall_starts_each_root_not_submitted_before(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     started = []
+    roots = [experiment.Train(savedir=f"outdir/e00/e01-test/d{i}/") for i in range(3)]
+    monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")
+    monkeypatch.setattr(experiment, "roots", lambda: roots)
     monkeypatch.setattr(experiment, "assert_committed", lambda: None)
     monkeypatch.setattr(experiment, "start", started.append)
-    experiment.dump(experiment.roots()[1])  # submitted before
+    experiment.dump(roots[1])  # submitted before
     experiment.submitall()
-    assert started == experiment.roots()[:1] + experiment.roots()[2:]
+    assert started == [roots[0], roots[2]]
 
 
 def test_lejepa_config_takes_the_mask_block_and_lamb_from_params():
@@ -317,11 +350,13 @@ def test_lejepa_config_takes_the_mask_block_and_lamb_from_params():
 
 def test_roots_are_the_trunks_and_their_milestone_evals_nest_in_them(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    trunks = experiment.roots()
-    assert [t.savedir for t in trunks] == [f"outdir/{experiment.EXPERIMENT}/d{j}/" for j in range(len(trunks))]
+    roots = experiment.roots()
+    assert [t.savedir for t in roots] == [f"outdir/{experiment.EXPERIMENT}/d{j}/" for j in range(len(roots))]
+    for p in roots:  # the sweeps it builds on, which check_experiment looks for in outdir/
+        if experiment.source(p).startswith("outdir/"):
+            Path(*Path(experiment.source(p)).parts[:3]).mkdir(parents=True, exist_ok=True)
     experiment.check_experiment()
-    for t in trunks:
-        assert isinstance(t, experiment.Train)
+    for t in [p for p in roots if isinstance(p, experiment.Train)]:  # an experiment may also be evals of others' weights
         for s in experiment.milestone_steps(t):
             e = experiment.eval_params(t, s)
             assert e.savedir == f"{t.savedir}step_{s:07d}/" and experiment.milestone_of(e) == f"{t.savedir}checkpoints/milestones/step_{s:07d}.pt"
