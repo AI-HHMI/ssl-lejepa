@@ -357,6 +357,9 @@ def test_benchmark_times_and_profiles_the_training_step_only(tmp_path, monkeypat
 def test_milestones_are_every_n_steps_or_every_tenth():
     assert experiment.milestone_steps(experiment.Train(steps_per_epoch=1300)) == list(range(130, 1301, 130))
     assert experiment.milestone_steps(experiment.Train(steps_per_epoch=100, milestone_every=30)) == [30, 60, 90]  # the cap lists them
+    doubling = experiment.Train(steps_per_epoch=100, milestone_every=10, milestone_doubling=True)
+    assert experiment.milestone_steps(doubling) == [10, 20, 40, 80]
+    assert experiment.milestone_steps(replace(doubling, steps_per_epoch=80)) == [10, 20, 40, 80]  # the cap itself, if on the doubling
 
 
 @pytest.mark.parametrize("final_step,evals", [(1000, False), (1234, True)])  # a trunk stopped on a milestone, or off one (max_hours)

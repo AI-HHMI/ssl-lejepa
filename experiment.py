@@ -132,6 +132,7 @@ class Train:
     # Training runs set it to the expected step count: milestone checkpoints are every 10% of it.
     max_hours: float = 0.0  # >0: stop after this many hours (steps_per_epoch is then an upper bound); sets LSF walltime
     milestone_every: int = 0  # steps between a trunk's milestone checkpoints (milestone_steps); 0: every 10% of steps_per_epoch
+    milestone_doubling: bool = False  # milestones at milestone_every x 1, 2, 4, ...: log-spaced, a few evals however fast it steps
     n_layers: int = 12
     width: int = 512  # encoder width; heads = width // 64
     lr: float = 1e-4  # run(): linear warmup, then held at this lr (no decay; see anneal_from)
@@ -203,53 +204,70 @@ class Rank:
         return torch.device(f"cuda:{self.local}" if torch.cuda.is_available() else "cpu")
 
 # This experiment's id (README: experiment ids): its roots are outdir/<EXPERIMENT>/d<i>/, a trunk's branches in its own dir.
-EXPERIMENT = "e00/e05-shifted-target"
+EXPERIMENT = "e00/e06-viewsize-vs-baselines"
 
 def roots() -> list[Train | Eval]:
     """This experiment: the runs it starts from nothing (trunks, other training runs, evals of another experiment's weights).
     Each trunk evaluates its own milestones as it saves them (eval_milestone)."""
-    # SIGReg over each view's tokens let a code of position alone pass (e02-maskloss-sweep), over each position's batch a code
-    # of the sample alone (e03-anticollapse), and both at once a code of the sample and position together (e04-sigreg-both: a
-    # lattice per tile, varying tile to tile, ignoring the membranes; short AP at best 0.079, falling with training, against
-    # a random encoder's 0.124). Every one passes because the masked tokens' targets come from the context's own view: what
-    # sits at a token position there is predictable from the visible tokens without the image. Here the targets are a second
-    # view's tokens (Train.mask_shift), cut from the same 128 input up to the shift off the context's, so its grid sits a
-    # random, fractional number of tokens away: a code of each view's own positions no longer lines up, only content does.
-    # SIGReg stays "both" (a code of the sample alone would still pass a shift). Shift 16 and 32 voxels (2 and 4 tokens) x
-    # blocks of 4 and 7 tokens of 12 x pull 3.2 and 10 (pull 10 removed e04's sample code; 1 and 32 differed in nothing).
-    # Everything else is e04's: 2 h (~20k steps, an eval every 5k), views 96 (12^3 tokens), m (12x512), batch 32, one RTX
-    # PRO 6000, not scored.
-    BATCH, STEPS, HOURS = 32, 30_000, 2
-    trunks = []
-    for shift in [16, 32]:
-        for block in [0.3, 0.6]:
-            for pull in [3.2, 10]:
-                p = Train()
-                p.savedir = f"outdir/{EXPERIMENT}/d{len(trunks)}/"
-                p.data = "hemibrain_wide"
-                p.views = "displace"
-                p.patch_size = (128, 128, 128)
-                p.global_size = (96, 96, 96)
-                p.mask_block = block
-                p.mask_shift = shift
-                p.sigreg_over = "both"
-                p.lamb = pull / BATCH
-                p.batch_size = BATCH
-                p.steps_per_epoch = STEPS
-                p.milestone_every = 5_000
-                p.max_hours = HOURS
-                p.weight_decay = 0.05
-                p.adam_beta2 = 0.95
-                p.cudagraphs = True
-                p.n_workers = 11  # 12 cores per GPU
-                p.queue = "gpu_rtx6000"
-                trunks.append(p)
-    return trunks
+    # e05-shifted-target's best cell (masked tokens, targets from a second view shifted 32 voxels, block 0.6, pull 10, SIGReg
+    # "both") was the first masked-token encoder above a random one (short / long AP 0.146 / 0.679 against 0.124 / 0.481), and
+    # still rising at 2 h. How does it depend on how much each token sees? View 64, 96, 128 and 160 (8^3 to 20^3 tokens), the
+    # input the view plus the shift (the region both views are cut from). At view 64 a 5-token cube leaves room for a 3-token
+    # shift only: 24 voxels there. Beside it, on the same budget and data, the two references: an MAE (lib.models.Mae: the
+    # pixel-space baseline, view 96 of input 128 as the middle cell) and LeJEPA's own multi-view invariance at the best view
+    # sizes so far, input 128 / globals 96 / locals 96 (viewsizes-v2: short AP 0.180 and 0.173 over two repeats; 2 globals, 4
+    # locals, lamb 0.1 as then, a pull of 3.2 at batch 32). All 8 h (the invariance runs' budget) of m (12x512), batch 32,
+    # one B300 each, so the same wall-clock compute, not scored. Training FLOPs per sample span ~100x (MAE 0.14 T, masked view
+    # 64 0.30 T to view 160 13.4 T, invariance 3.7 T), so the steps they reach do too: evals at doubling steps from 5k (at most
+    # 10 each, log-spaced for the curves vs compute). Masked view 160 is ~170 GB of the B300's 288 by e05's 36.6 GB at view 96
+    # (memory ~ tokens); view 192 would be ~290 GB at this batch.
+    BATCH, STEPS, HOURS = 32, 2_560_000, 8
+
+    def trunk(objective: Literal["views", "mask", "mae"], input_size: int, view: int) -> Train:
+        p = Train()
+        p.objective = objective
+        p.data = "hemibrain_wide"
+        p.views = "displace"
+        p.patch_size = (input_size, input_size, input_size)
+        p.global_size = (view, view, view)
+        p.batch_size = BATCH
+        p.steps_per_epoch = STEPS
+        p.milestone_every = 5_000
+        p.milestone_doubling = True
+        p.max_hours = HOURS
+        p.weight_decay = 0.05
+        p.adam_beta2 = 0.95
+        p.cudagraphs = True
+        p.n_workers = 11  # 12 cores per GPU
+        p.queue = "gpu_b300"
+        return p
+
+    runs = []
+    for view, shift in [(64, 24), (96, 32), (128, 32), (160, 32)]:
+        p = trunk("mask", view + shift, view)
+        p.mask_block = 0.6
+        p.mask_shift = shift
+        p.sigreg_over = "both"
+        p.lamb = 10 / BATCH
+        runs.append(p)
+    runs.append(trunk("mae", 128, 96))
+    p = trunk("views", 128, 96)
+    p.local_size = (96, 96, 96)
+    p.batch_views = True
+    p.lamb = 0.1
+    runs.append(p)
+    for i, p in enumerate(runs):
+        p.savedir = f"outdir/{EXPERIMENT}/d{i}/"
+    return runs
 
 def milestone_steps(trunk: Train) -> list[int]:
     """The steps whose checkpoints train() keeps in checkpoints/milestones/: every milestone_every steps up to steps_per_epoch,
     or, if that is 0, every 10% of it (the last is the final checkpoint of a trunk that ran to completion). A trunk stopped
-    early by max_hours never reaches the later ones: with a time budget, steps_per_epoch is just the cap that lists them."""
+    early by max_hours never reaches the later ones: with a time budget, steps_per_epoch is just the cap that lists them.
+    With milestone_doubling, they double from milestone_every instead."""
+    if trunk.milestone_doubling:
+        assert trunk.milestone_every > 0, f"{trunk.savedir}: doubling milestones start at milestone_every, which is 0"
+        return [trunk.milestone_every * 2 ** k for k in range((trunk.steps_per_epoch // trunk.milestone_every).bit_length())]
     if trunk.milestone_every:
         return list(range(trunk.milestone_every, trunk.steps_per_epoch + 1, trunk.milestone_every))
     return sorted({round(k * trunk.steps_per_epoch / 10) for k in range(1, 11)})
