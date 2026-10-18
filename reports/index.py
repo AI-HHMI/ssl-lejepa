@@ -24,7 +24,8 @@ THREADS = {
     "Architecture and scaling": ["e00/b300-train8h-dynamic", "e00/scaling-law-calib", "e00/scaling-law", "e00/scaling-law-pca"],
     "Evaluation": ["e00/probe-test", "e00/unetr-probe"],
     "Masked-token objective": ["e00/e02-maskloss-sweep", "e00/e03-anticollapse", "e00/e04-sigreg-both", "e00/e05-shifted-target",
-                                "e00/e06-viewsize-vs-baselines", "e00/e07-mask-side"],
+                                "e00/e06-viewsize-vs-baselines", "e00/e06-01-test-tile-size", "e00/e07-mask-side"],
+    "MAE baseline": ["e00/e08-mae-fix"],
 }
 
 
