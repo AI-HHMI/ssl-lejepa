@@ -374,6 +374,27 @@ def test_run_trains_then_evals(tmp_path, monkeypatch, max_hours):
     assert calls == ["train", "pca", "probe"]  # evals after train() has torn down the process group; a benchmark is its own entrypoint
 
 
+def test_a_run_probed_on_several_sets_probes_each_in_its_own_dir(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    probed = []
+    monkeypatch.setattr(experiment, "train", lambda job: None)
+    monkeypatch.setattr(experiment, "pca", lambda job: probed.append(("pca", job.savedir)))
+    monkeypatch.setattr(experiment, "probe", lambda job: probed.append((job.probe_on, job.savedir)))
+    monkeypatch.delenv("RANK", raising=False)
+    experiment.run(experiment.Train(savedir="outdir/e00/x/d0/", probe_sets=("fish2", "kasthuri15")))
+    assert probed == [("pca", "outdir/e00/x/d0/"), ("fish2", "outdir/e00/x/d0/probe_fish2/"), ("kasthuri15", "outdir/e00/x/d0/probe_kasthuri15/")]
+    assert all(Path(d).is_dir() for _, d in probed)
+
+
+def test_train_volumes_weigh_a_joint_sets_families_equally():
+    from lib.data import JOINT_DATA, TRAIN_BOXES, train_volumes
+    vols = train_volumes("lmd4")
+    assert sum(w for _, _, w in vols) == pytest.approx(1)
+    for f in JOINT_DATA["lmd4"]:  # each family a quarter, split equally among its volumes
+        assert sum(w for n, _, w in vols if n in TRAIN_BOXES[f]) == pytest.approx(1 / 4)
+    assert [w for _, _, w in train_volumes("fish2")] == [0.25] * 4 and train_volumes("hemibrain_eb")[0][2] == 1
+
+
 def test_benchmark_times_and_profiles_the_training_step_only(tmp_path, monkeypatch):
     params = experiment.Train(
         savedir=str(tmp_path), patch_size=(8, 8, 8), batch_size=2, steps_per_epoch=1000, max_hours=1.0,

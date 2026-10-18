@@ -21,7 +21,7 @@ from itertools import product
 
 # local
 
-from lib.data import HEMIBRAIN_EB, HEMIBRAIN_EB_LABELS, HEMIBRAIN_EB_PROBE_ANNOTATED, HEMIBRAIN_EB_PROBE_BOXES, TRAIN_BOXES
+from lib.data import HEMIBRAIN_EB, HEMIBRAIN_EB_LABELS, HEMIBRAIN_EB_PROBE_ANNOTATED, HEMIBRAIN_EB_PROBE_BOXES, PROBE_SETS, ProbeVolume, train_volumes
 from lib.benchmark import Benchmark
 from lib.losses import LejepaOutput
 from lib.encoders import EncoderConfig
@@ -73,6 +73,8 @@ CHECKPOINT_EVERY, CHECKPOINT_KEEP = 2000, 1
 MAX_SKIPPED, BAD_BATCHES_KEPT = 100, 2
 N_PARAMS_CACHE = Path(".cache/lejepa_n_params.json")  # machine-local (gitignored): see lejepa_n_params
 TEST_TILES = (16, 32, 64, 128, 256, 512)  # pca_sizes: the tile sides an encoder is run at, test time (2^3 to 64^3 tokens)
+PROBE_SIDE = 896  # probe: a block's largest side, 8 nm voxels (its box cut to it about its centre; hemibrain_eb's are exactly it)
+PROBE_MARGIN = 16  # read_window: the extra read around a window, 8 nm voxels (miao's resampling and label-quantization slack)
 # Model sizes and compute budgets of e00/scaling-law's IsoFLOP grid (scaling_budgets), for designing size x budget sweeps.
 SIZES = {"xs": (4, 256), "s": (6, 384), "m": (12, 512), "l": (16, 768), "xl": (24, 1024)}  # (n_layers, width); m = Train' default
 SCALING_BATCH = 64  # per GPU, fixed across sizes (== gpu_b300's validated default at m); xl OOMs at it on one B300
@@ -127,6 +129,7 @@ def scaling_budgets() -> dict[str, float]:
 class Train:
     savedir: str = "outdir/e00/main/basic/"
     data: TrainData = "hemibrain_eb"  # training volumes, see lib.data.TRAIN_BOXES
+    probe_sets: tuple[str, ...] = ("hemibrain_eb",)  # run(): the lib.data.PROBE_SETS its end of training is probed on (probe_evals)
     patch_size: Tup3Int = (104, 104, 104)  # hemibrain EB is 8 nm isotropic
     batch_size: int = 84
     steps_per_epoch: int = 71  # warmup + benchmark + 1 profiler warmup + profile steps: stop right after profiling.
@@ -189,6 +192,7 @@ class Eval:
     unetr_freeze_encoder: bool = True  # decoder="unetr": keep the encoder frozen while fitting it (fair vs. the linear probe)
     score: bool = False  # probe() also writes the affinity artifacts `score` reads (probe/{fit,test}, GBs each; score deletes them after)
     jobs: tuple[str, ...] = ("pca", "probe")  # the entrypoints start() submits for it
+    probe_on: str = "hemibrain_eb"  # probe(): the lib.data.PROBE_SETS it fits on and is scored on
 
 @dataclass(slots=True)
 class Rank:
@@ -206,31 +210,50 @@ class Rank:
         return torch.device(f"cuda:{self.local}" if torch.cuda.is_available() else "cpu")
 
 # This experiment's id (README: experiment ids): its roots are outdir/<EXPERIMENT>/d<i>/, a trunk's branches in its own dir.
-EXPERIMENT = "e00/e06-01-test-tile-size"
+EXPERIMENT = "e00/e09-data-transfer"
 
 def roots() -> list[Train | Eval]:
     """This experiment: the runs it starts from nothing (trunks, other training runs, evals of another experiment's weights).
     Each trunk evaluates its own milestones as it saves them (eval_milestone)."""
-    # Every eval so far ran an encoder in tiles of its own training view. How do its tokens change with the input size at
-    # test time? The best encoder so far, e06-viewsize-vs-baselines' d0 (masked tokens, view 64 = 8^3 tokens, shift 24, at
-    # its last checkpoint, 133.6k steps: short / long AP 0.205 / 0.847), run on one held-out EB val crop in cubic tiles of
-    # 16 to 512 voxels (2^3 to 64^3 tokens; pca_sizes), 4 tiles of the largest and 131072 of the smallest. Its position
-    # embedding has only seen 0-7 per axis. PCA maps only: the probe's context around its test block leaves the EB crop
-    # at tiles of 256 and up.
-    trunk = Train()
-    trunk.savedir = "outdir/e00/e06-viewsize-vs-baselines/d0/"  # its architecture, for load_checkpoint's strict load
-    trunk.objective = "mask"
-    trunk.data = "hemibrain_wide"
-    trunk.views = "displace"
-    trunk.patch_size = (88, 88, 88)
-    trunk.global_size = (64, 64, 64)
-    trunk.mask_block = 0.6
-    trunk.mask_shift = 24
-    trunk.sigreg_over = "both"
-    trunk.lamb = 10 / 32
-    trunk.batch_size = 32
-    trunk.queue = "gpu_b300"
-    return [Eval(savedir=f"outdir/{EXPERIMENT}/d0/", train=trunk, init_from=trunk.savedir, jobs=("pca_sizes",))]
+    # Does pretraining on one kind of data transfer to others, and does training on all of them jointly cost any? The four
+    # families of mia-evals' lmd_ssl_v1 (one per modality pair): fly EM (hemibrain), zebrafish EM (fish2), mouse ExM
+    # (LICONN) and mouse cortex EM (Kasthuri15, whose eval volumes are all its data: pretrained on MICrONS instead; see
+    # lib.data.TRAIN_BOXES), every volume read at 8 nm. One encoder per family and one on all four (lmd4, the families
+    # weighted equally), all at the same compute: e07-mask-side's cube of side 3 (view 96, shift 32, pull 10, SIGReg
+    # "both"), 4 h of m (12x512) at batch 32 on one B300. Each is probed at the end on all four families (all-vs-all:
+    # Train.probe_sets, each fitted on the family's lmd_ssl_v1 fit block and scored on its test blocks; hemibrain's are our
+    # usual EB blocks), beside a random encoder on each. No milestone evals (four probes each would cost ~an hour of the 4).
+    BATCH, STEPS, HOURS, VIEW, SHIFT, SIDE, GRID = 32, 2_560_000, 4, 96, 32, 3, 12
+    families: list[TrainData] = ["hemibrain_wide", "fish2", "liconn_mouse", "microns", "lmd4"]
+    sets = ("hemibrain_eb", "fish2", "liconn_mouse", "kasthuri15")
+    runs: list[Train | Eval] = []
+    for data in families:
+        p = Train()
+        p.savedir = f"outdir/{EXPERIMENT}/d{len(runs)}/"
+        p.data = data
+        p.probe_sets = sets
+        p.views = "displace"
+        p.patch_size = (VIEW + SHIFT, VIEW + SHIFT, VIEW + SHIFT)
+        p.global_size = (VIEW, VIEW, VIEW)
+        p.mask_block = SIDE / GRID  # lib.models.lejepa.mask_side rounds block x grid back to side
+        p.mask_shift = SHIFT
+        p.sigreg_over = "both"
+        p.lamb = 10 / BATCH
+        p.batch_size = BATCH
+        p.steps_per_epoch = STEPS
+        p.milestone_every = STEPS  # one milestone, at a step 4 h never reaches: none
+        p.max_hours = HOURS
+        p.weight_decay = 0.05
+        p.adam_beta2 = 0.95
+        p.cudagraphs = True
+        p.n_workers = 11  # 12 cores per GPU
+        p.queue = "gpu_b300"
+        runs.append(p)
+    trunk = runs[0]
+    assert isinstance(trunk, Train)
+    for s in sets:  # the random encoder: the baseline of each family's probe
+        runs.append(Eval(savedir=f"outdir/{EXPERIMENT}/d{len(runs)}/", train=trunk, init_from="random", probe_on=s, jobs=("probe",)))
+    return runs
 
 def milestone_steps(trunk: Train) -> list[int]:
     """The steps whose checkpoints train() keeps in checkpoints/milestones/: every milestone_every steps up to steps_per_epoch,
@@ -261,6 +284,13 @@ def eval_params(trunk: Train, step: int) -> Eval:
 def own_eval(t: Train) -> Eval:
     """The eval of a training run's own latest checkpoint, in its own savedir: what run() does after training."""
     return Eval(savedir=t.savedir, train=t)
+
+def probe_evals(t: Train) -> list[Eval]:
+    """The probes run() makes of a training run's own latest checkpoint: own_eval, or, for a run probed on several sets
+    (Train.probe_sets), one per set in its own savedir, <savedir>probe_<set>/."""
+    if t.probe_sets == ("hemibrain_eb",):
+        return [own_eval(t)]
+    return [Eval(savedir=f"{t.savedir}probe_{s}/", train=t, probe_on=s) for s in t.probe_sets]
 
 def source(p: Train | Eval) -> str:
     """The weights p starts from: an anneal's checkpoint (Train.anneal_from), or the ones an eval reads (Eval.init_from)."""
@@ -365,8 +395,9 @@ def dataloader(par: Train):
     import torch
     # volumes = [x.to_miao() for x in lmd.all() if x.name == "exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001"]
     # Training volumes (lib/data.py), images only. Boxes are x y z; output is z y x.
-    # With several volumes miao samples each equally (size_weighting_exponent=0); the wide crops are ~equal size.
-    volumes = [lmd.get(name).to_miao(bounding_box=box[::-1]) for name, box in TRAIN_BOXES[par.data].items()]
+    # miao samples each volume by its weight alone (size_weighting_exponent=0): equally within a family (lib.data.train_volumes),
+    # and a joint set's families equally. Every volume is read at 8 nm (resolutions below), resampled where it is stored otherwise.
+    volumes = [lmd.get(name).to_miao(bounding_box=box[::-1], weight=w) for name, box, w in train_volumes(par.data)]
     mcfg = MiaoConfig(
         volumes=volumes,
         patch_size=list(par.patch_size),
@@ -658,8 +689,8 @@ def latest_step(par: Train) -> int:
     return max((int(p.stem.split("_")[1]) for p in (Path(par.savedir) / "checkpoints").glob("step_*.pt")), default=-1)
 
 def run(job: Train | str):
-    """The LSF training job: train the spec job (or its train.json's), then rank 0 evaluates its last finite checkpoint (pca,
-    probe of own_eval).
+    """The LSF training job: train the spec job (or its train.json's), then rank 0 evaluates its last finite checkpoint (pca
+    of own_eval, and probe_evals).
 
     Evals run after train() has destroyed the process group, so the other ranks exit instead of waiting at a
     collective for minutes; not for a trunk (a run with milestones: not an anneal) that stopped on a milestone: train()
@@ -672,7 +703,9 @@ def run(job: Train | str):
     b2 = not par.anneal_from and latest_step(par) in milestone_steps(par)
     if b1 and not b2:
         pca(own_eval(par))
-        probe(own_eval(par))
+        for e in probe_evals(par):
+            Path(e.savedir).mkdir(parents=True, exist_ok=True)
+            probe(e)
 
 
 def replay_bad_batch(path: str):
@@ -791,6 +824,59 @@ def eb_val_crop(shape: tuple[int, ...]):
     mcfg = MiaoConfig(volumes=[vol], patch_size=list(shape), resolutions=[[8.0, 8.0, 8.0]],
                       samples_per_epoch=1, sampling="random", output_axes="lzyx")
     return VolumeDataset(mcfg)[0]["img"]
+
+def probe_volume_config(vol: ProbeVolume, box: list[list[int]] | None, patch: list[int]) -> MiaoConfig:
+    """miao reading patches (Z Y X, 8 nm voxels) of vol within box (Z Y X, level-0 voxels; None: anywhere), image and
+    labels, on a grid (sequential): the first is the one nearest the box's low corner miao's read margins allow."""
+    from miao.config import VolumeConfig
+    lo, hi = vol.clip or (None, None)
+    vc = VolumeConfig(name=vol.name, path=vol.path, image_key="raw", label_key=f"labels/{vol.label_key}", zarr_version="zarr3",
+                      normalize_min=lo, normalize_max=hi, bounding_box=box)
+    return MiaoConfig(volumes=[vc], patch_size=patch, resolutions=[[8.0, 8.0, 8.0]], samples_per_epoch=1, sampling="sequential", output_axes="lzyx")
+
+def volume_grid(vol: ProbeVolume) -> tuple[np.ndarray, np.ndarray]:
+    """(level-0 voxel size in nm, level-0 shape), each Z Y X, of vol's image, as miao resolves them (its OME transforms,
+    expansion-corrected for ExM). Read off miao's VolumeInfo, which has no public accessor."""
+    info = VolumeDataset(probe_volume_config(vol, None, [8, 8, 8]).model_copy(update={"sampling": "random"}))._volumes[0]  # no grid
+    order = [info.img_spatial_axes.index(a) for a in "zyx"]
+    return np.asarray(info.finest_voxel_size)[order], np.asarray(info.image_meta.scales[0].shape)[info.img_spatial_idx][order]
+
+def read_window(vol: ProbeVolume, center, size: list[int]):
+    """(img in [0, 1], labels int64), each Z Y X: size voxels at 8 nm about center (Z Y X, level-0 voxels) of vol, read as
+    training reads (miao: resampled to 8 nm, normalized; labels nearest). What lies outside the volume is edge-replicated
+    in the image and 0 (ignored) in the labels, as is the volume's outermost voxel (miao keeps a voxel's slack inside the
+    box it reads from: checked on hemibrain, where 8 nm is native and every other voxel equals the stored one)."""
+    import torch.nn.functional as F
+    vox, shape = volume_grid(vol)
+    want = np.array(size)
+    low = center - want * 4 / vox  # the window's low corner, level-0 voxels
+    # The box: the window and 2 margins (8 nm voxels) below it, 4 above, cut to the volume. miao's first read of it (its grid,
+    # sequential) starts a little past the box's corner (its slack for resampling and a coarser label pyramid), under 2
+    # margins before the window, so a patch 3 margins longer than the window covers it, if the box holds it with that
+    # slack: at the volume's edge, the patch is cut to the most the box holds, the least slack miao accepts (it says how
+    # little by refusing, its bounds being private). Then the window is cut out of the read, where it landed.
+    lo = np.clip(np.floor(low - 2 * PROBE_MARGIN * 8 / vox), 0, shape).astype(int)
+    hi = np.clip(np.ceil(low + (want + 4 * PROBE_MARGIN) * 8 / vox), 0, shape).astype(int)
+    box = [[int(l), int(h)] for l, h in zip(lo, hi)]
+
+    def first_read():  # (patch, its sample) at the least slack miao accepts
+        for slack in (2, 4, 8, PROBE_MARGIN):
+            patch = np.minimum(want + 3 * PROBE_MARGIN, ((hi - lo) * vox / 8).astype(int) - slack)
+            try:
+                return patch, VolumeDataset(probe_volume_config(vol, box, patch.tolist()))[0]
+            except ValueError:  # "bounding_box ... too small to contain the requested window"
+                pass
+        assert False, f"{vol.name}: miao reads no window from {box}, even {PROBE_MARGIN} voxels smaller"
+
+    patch, sample = first_read()
+    img, lab = sample["img"][0], sample["label"][0].long()
+    start = np.round((np.asarray(sample["bbox"][0][0]) / vox - low) * vox / 8).astype(int)  # the read's corner in the window
+    a, b = np.clip(-start, 0, patch), np.clip(want - start, 0, patch)  # the read's part inside the window
+    img, lab = img[a[0]:b[0], a[1]:b[1], a[2]:b[2]], lab[a[0]:b[0], a[1]:b[1], a[2]:b[2]]
+    before = np.maximum(start, 0)
+    after = want - before - (b - a)  # what the volume doesn't hold, padded
+    pad = [int(n) for lo_, hi_ in zip(before[::-1], after[::-1]) for n in (lo_, hi_)]  # F.pad: last axis first
+    return F.pad(img[None, None], pad, mode="replicate")[0, 0], F.pad(lab, pad, value=0)
 
 def pca_rgb(f, size):
     """N D tokens of a size (... ) box -> (... 3 uint8: the top 3 principal components, each scaled 1st-99th percentile;
@@ -986,7 +1072,8 @@ def write_affinities(path: Path, array, **attrs):
 
 def probe(job: Eval | str):
     """Linear or dense (par.decoder) affinity probe of the spec job's weights (or those of the eval.json it names), scored as
-    mia-evals' neuron-instance task, fitted on HEMIBRAIN_EB_PROBE_BOXES["train"] against proofread-cell-hemibrain-v1.2.
+    mia-evals' neuron-instance task: fitted on the train block of its probe set (par.probe_on, lib.data.PROBE_SETS) against
+    its instance labels, scored on its test blocks (averaged). Every block read at 8 nm, as training reads (read_window).
 
     decoder="linear" (default, lib.probe): frozen encoder, one Linear per token to mia-evals' 6 affinity channels
       at every voxel of its patch.
@@ -1000,12 +1087,13 @@ def probe(job: Eval | str):
     Weights: par.init_from (load_checkpoint): this run's checkpoint, an older run's, or random (the baseline).
       savedir/probe/{fit,test}/hemibrain_eb_{split}.zarr   mia-evals affinity artifacts, (6, X, Y, Z) float16, for
                                   `mia-evals score` with truth_kind = "instances" (reads the GT from the store)
-      savedir/probe.png           test block, middle z: EM | true boundaries | predicted boundaries
-    Reads get whole tiles of context (the training view, tile) around each 896^3 block, as in training.
+      savedir/probe.png           test block, middle z: EM | true boundaries | predicted boundaries (probe_<block>.png
+                                  for any further test blocks)
+    Reads get whole tiles of context (the training view, tile) around each block (at most PROBE_SIDE a side), as in
+    training; where a block's context leaves its volume, the image is edge-replicated.
     """
     import math
     import torch
-    import zarr
     from PIL import Image
     from lib.probe import AFFINITY_OFFSETS_XYZ, affinities, average_precision, fit_probe, to_tokens, to_voxels
     par = load(job, Eval)
@@ -1014,31 +1102,33 @@ def probe(job: Eval | str):
     record(par, "probe")
     encoder, device = model.encoder, next(model.parameters()).device
     p = encoder.patch_embed.patch_size
-    vol = lmd.get(HEMIBRAIN_EB)
-    raw, lab = zarr.open_array(f"{vol.path}/raw/s0", mode="r"), zarr.open_array(f"{vol.path}/{HEMIBRAIN_EB_LABELS}/s0", mode="r")
-    offsets = [o[::-1] for o in AFFINITY_OFFSETS_XYZ]  # the store is x y z; the model sees z y x
+    sets = PROBE_SETS[par.probe_on]
+    b1 = par.decoder == "linear" and not par.score
+    b2 = par.probe_on == "hemibrain_eb"
+    assert b1 or b2, f"{par.savedir}: unetr and score are hemibrain_eb's (its artifacts and boxes), not {par.probe_on}'s"
+    assert len(sets["train"]) == 1, f"{par.probe_on}: the probe fits on one block"
+    offsets = [o[::-1] for o in AFFINITY_OFFSETS_XYZ]  # x y z offsets; the model sees z y x
 
-    def block(box):  # (token features N D, labels Z Y X, EM Z Y X, padded img Z Y X [a multiple of tile],
-        # margin m, box size) for an x y z box of the store: img/m/size let a dense model (unetr) tile the padded
-        # region (tile_logits needs an exact multiple of tile, unlike em, trimmed to the box's own size)
-        # and then trim its predictions back to the box with the same margin feats are trimmed by, in token space.
-        lo, size = [b[0] for b in box][::-1], [b[1] - b[0] for b in box][::-1]  # z y x
+    def block(vol: ProbeVolume):  # (token features N D, labels Z Y X, EM Z Y X, padded img Z Y X [a multiple of tile],
+        # margin m, box size) for vol's box, cut to whole patches at most PROBE_SIDE a side about its centre, at 8 nm: img/m/size
+        # let a dense model (unetr) tile the padded region (tile_logits needs an exact multiple of tile, unlike em, trimmed to
+        # the box's own size) and then trim its predictions back to the box with the same margin feats are trimmed by, in token space.
+        vox, _ = volume_grid(vol)
+        lo, hi = np.array([b[0] for b in vol.box][::-1]), np.array([b[1] for b in vol.box][::-1])  # z y x, level-0 voxels
+        size = [min(s - s % q, PROBE_SIDE) for s, q in zip(((hi - lo) * vox / 8).astype(int), p)]
         region = [math.ceil(s / t) * t for s, t in zip(size, tile)]  # whole tiles around the box
-        m = [(r - s) // 2 for r, s in zip(region, size)]
-        assert all(mi % q == 0 for mi, q in zip(m, p)) and all(s % q == 0 for s, q in zip(size, p)), (box, region)
-        (z0, y0, x0), (zs, ys, xs) = [l - mi for l, mi in zip(lo, m)], region
-        assert min(z0, y0, x0) >= 0 and max(z0 + zs, y0 + ys, x0 + xs) <= min(raw.shape), f"{box}: context leaves the crop"
-        img = torch.from_numpy(np.asarray(raw[x0:x0 + xs, y0:y0 + ys, z0:z0 + zs])).permute(2, 1, 0).to(device).float() / 255
+        m = [(r - s) // 2 // q * q for r, s, q in zip(region, size, p)]
+        img, lab = read_window(vol, (lo + hi) / 2, region)
+        img, lab = img.to(device), lab.to(device)
         feats = tile_features(encoder, img, tile)
         t0 = [mi // q for mi, q in zip(m, p)]
         feats = feats[t0[0]:t0[0] + size[0] // p[0], t0[1]:t0[1] + size[1] // p[1], t0[2]:t0[2] + size[2] // p[2]]
-        (bx0, bx1), (by0, by1), (bz0, bz1) = box
-        labels = torch.from_numpy(np.asarray(lab[bx0:bx1, by0:by1, bz0:bz1]).astype(np.int64)).permute(2, 1, 0).to(device)
+        labels = lab[m[0]:m[0] + size[0], m[1]:m[1] + size[1], m[2]:m[2] + size[2]]
         em = img[m[0]:m[0] + size[0], m[1]:m[1] + size[1], m[2]:m[2] + size[2]]
         return feats.reshape(-1, feats.shape[-1]), labels.contiguous(), em, img, m, size
 
     assert len(set(p)) == 1, f"patch {p} must be cubic"
-    test_feats, test_labels, test_em, test_img, test_m, test_size = block(HEMIBRAIN_EB_PROBE_BOXES["test"])  # reused below
+    test_feats, test_labels, test_em, test_img, test_m, test_size = block(sets["test"][0])  # reused below
 
     if par.decoder == "linear":
         del test_img, test_m, test_size  # only unetr's tiled inference needs the padded region + its trim margin
@@ -1047,17 +1137,17 @@ def probe(job: Eval | str):
         i = torch.randperm(len(test_feats), device=device, generator=g)[:16384]  # held-out tokens, fit curve only
         held = (test_feats[i], to_tokens(aff, p[0])[i], to_tokens(valid, p[0])[i])
         del aff, valid
-        feats, labels, _, _, _, _ = block(HEMIBRAIN_EB_PROBE_BOXES["train"])
+        feats, labels, _, _, _, _ = block(sets["train"][0])
         aff, valid = affinities(labels, offsets)
         del labels
         head, curve = fit_probe(feats, to_tokens(aff, p[0]), to_tokens(valid, p[0]), held)
         del feats, aff, valid, held
 
-        def predict(box):
-            if box is HEMIBRAIN_EB_PROBE_BOXES["test"]:
+        def predict(vol: ProbeVolume):
+            if vol is sets["test"][0]:
                 feats, labels, em = test_feats, test_labels, test_em
             else:
-                feats, labels, em, _, _, _ = block(box)
+                feats, labels, em, _, _, _ = block(vol)
             with torch.no_grad():
                 prob = torch.cat([torch.sigmoid(head(f.float())).half() for f in feats.split(65536)])
             return to_voxels(prob, tuple(s // p[0] for s in labels.shape), p[0]), labels, em
@@ -1073,44 +1163,49 @@ def probe(job: Eval | str):
         g = torch.Generator().manual_seed(0)
         held = random_crop(test_em[None], test_aff, test_valid, tile, g)  # one crop, monitoring only
         del test_aff, test_valid
-        _, train_labels, train_em, _, _, _ = block(HEMIBRAIN_EB_PROBE_BOXES["train"])
+        _, train_labels, train_em, _, _, _ = block(sets["train"][0])
         train_aff, train_valid = affinities(train_labels, offsets)
         del train_labels
         curve = fit_unetr(unetr, train_em[None], train_aff, train_valid, tile, held, steps=par.unetr_steps)
         del train_em, train_aff, train_valid, held
 
-        def predict(box):
-            if box is HEMIBRAIN_EB_PROBE_BOXES["test"]:
+        def predict(vol: ProbeVolume):
+            if vol is sets["test"][0]:
                 labels, em, img, m, size = test_labels, test_em, test_img, test_m, test_size
             else:
-                _, labels, em, img, m, size = block(box)
+                _, labels, em, img, m, size = block(vol)
             logits = tile_logits(unetr, img, tile)  # OutDim (padded region) Z Y X
             pred = torch.sigmoid(logits[:, m[0]:m[0] + size[0], m[1]:m[1] + size[1], m[2]:m[2] + size[2]])
             return pred, labels, em
 
     (Path(par.savedir) / "probe_fit.json").write_text("".join(json.dumps({"tbl": "probe_fit", **c}) + "\n" for c in curve))
     run_name = "-".join(Path(par.savedir).parts[1:])  # mia-evals row name: letters, digits, _ and - only
-    stats = {"tbl": "probe", "step": step, "run": run_name}
-    for split in ["fit", "test"] if par.score else ["test"]:  # the fit block's predictions only feed the artifacts
-        box = HEMIBRAIN_EB_PROBE_BOXES[split]
-        pred, labels, em = predict(box)  # C Z Y X sigmoid probabilities, Z Y X instance labels, Z Y X EM
+    # Scored on each test block, then averaged over them (equally, as lmd_ssl_v1 weights its volumes). With score, also
+    # hemibrain_eb's mia-evals fit block, whose predictions only feed the artifacts.
+    eb_fit = [ProbeVolume("hemibrain_eb_fit", sets["test"][0].path, sets["test"][0].label_key, HEMIBRAIN_EB_PROBE_BOXES["fit"])]
+    per_block = []
+    for split, vol in [("test", v) for v in sets["test"]] + [("fit", v) for v in eb_fit * par.score]:
+        pred, labels, em = predict(vol)  # C Z Y X sigmoid probabilities, Z Y X instance labels, Z Y X EM
         if split == "test":  # cheap scores, on a fixed random subset of the valid edges
+            s = {}
             aff, valid = affinities(labels, offsets)
             g = torch.Generator(device=device).manual_seed(0)
             for c, o in enumerate(AFFINITY_OFFSETS_XYZ):
                 idx = valid[c].nonzero()
                 idx = idx[torch.randint(len(idx), (min(len(idx), 10_000_000),), device=device, generator=g)]
                 q, t = pred[c][tuple(idx.T)].float(), aff[c][tuple(idx.T)].float()
-                stats[f"bce_{o}"] = float(torch.nn.functional.binary_cross_entropy(q.clamp(1e-6, 1 - 1e-6), t))
-                stats[f"boundary_ap_{o}"] = average_precision(1 - q, 1 - t)  # boundary = different objects
-                stats[f"boundary_frac_{o}"] = float(1 - t.mean())
-            stats["boundary_ap_short"] = sum(stats[f"boundary_ap_{o}"] for o in AFFINITY_OFFSETS_XYZ[:3]) / 3
+                s[f"bce_{o}"] = float(torch.nn.functional.binary_cross_entropy(q.clamp(1e-6, 1 - 1e-6), t))
+                s[f"boundary_ap_{o}"] = average_precision(1 - q, 1 - t)  # boundary = different objects
+                s[f"boundary_frac_{o}"] = float(1 - t.mean())
+            per_block.append(s)
             # EM | true boundaries | predicted boundaries (1 - min of the 3 short-range affinities), middle z slice
             zm = labels.shape[0] // 2
             row = [em[zm], 1 - aff[:3, zm].float().amin(0), 1 - pred[:3, zm].float().amin(0)]
             gap = torch.ones(row[0].shape[0], 8, device=device)
-            Image.fromarray((torch.cat([row[0], gap, row[1], gap, row[2]], 1) * 255).byte().cpu().numpy()).save(Path(par.savedir) / "probe.png")
+            png = "probe.png" if vol is sets["test"][0] else f"probe_{vol.name}.png"
+            Image.fromarray((torch.cat([row[0], gap, row[1], gap, row[2]], 1) * 255).byte().cpu().numpy()).save(Path(par.savedir) / png)
             del aff, valid
+        box = vol.box
         (x0, x1), (y0, y1), (z0, z1) = box
         if par.score:
             write_affinities(Path(par.savedir) / "probe" / split / f"hemibrain_eb_{split}.zarr", pred.permute(0, 3, 2, 1).cpu().numpy(),
@@ -1118,6 +1213,9 @@ def probe(job: Eval | str):
                              run=run_name, step=step, axes="xyz", source_path=vol.path, source_label_key=HEMIBRAIN_EB_LABELS,
                              native_box=box, scale=[1, 1, 1], annotated_box=HEMIBRAIN_EB_PROBE_ANNOTATED[split], covers_full_box=False)
         del pred, labels, em
+    stats = {"tbl": "probe", "step": step, "run": run_name, "probe_on": par.probe_on, "test_blocks": [v.name for v in sets["test"]],
+             **{k: sum(s[k] for s in per_block) / len(per_block) for k in per_block[0]}}
+    stats["boundary_ap_short"] = sum(stats[f"boundary_ap_{o}"] for o in AFFINITY_OFFSETS_XYZ[:3]) / 3
     (Path(par.savedir) / "probe.json").write_text(json.dumps(stats) + "\n")
     print(f"{par.savedir}: probe at step {step}: boundary AP (short-range mean) {stats['boundary_ap_short']:.3f}{'; wrote probe/' * par.score}", flush=True)
     release_milestone(par)
