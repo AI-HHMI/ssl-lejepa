@@ -26,6 +26,7 @@ THREADS = {
     "Masked-token objective": ["e00/e02-maskloss-sweep", "e00/e03-anticollapse", "e00/e04-sigreg-both", "e00/e05-shifted-target",
                                 "e00/e06-viewsize-vs-baselines", "e00/e06-01-test-tile-size", "e00/e07-mask-side"],
     "MAE baseline": ["e00/e08-mae-fix"],
+    "Data and modalities": ["e00/e09-data-transfer"],
 }
 
 
