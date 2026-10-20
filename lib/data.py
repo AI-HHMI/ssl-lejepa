@@ -7,7 +7,9 @@ from typing import NamedTuple
 import lmd_catalog as lmd
 from miao.config import MiaoConfig
 
-from lib.types import TrainData
+# from lib.types import TrainData
+from typing import Literal
+TrainData = Literal["hemibrain_eb", "hemibrain_wide", "fish2", "liconn_mouse", "microns", "lmd4"]  # keys of lib.data.TRAIN_BOXES, or JOINT_DATA
 
 LMD_DATA = "/groups/miaai/miaai/lmd-v0.0.1/data"  # the catalog's stores, <catalog name>.zarr
 
