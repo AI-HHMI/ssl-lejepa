@@ -123,24 +123,26 @@ def test_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch, score):
     assert all(0 <= f["held_boundary_ap"] <= 1 and f["held_bce"] > 0 for f in fit)
 
 
-@pytest.mark.parametrize("freeze", [True, False])
-def test_finetune_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch, freeze):
-    # The linear probe's synthetic store and boxes, a fit cube of 24 (of its 32^3 train box) and global_size=24 crops. The
-    # tiny encoder has patch 2, since Unetr needs one block per upsample stage (log2(patch_size)), and a narrow decoder.
+@pytest.mark.parametrize("freeze, fit_side, size", [(True, 24, 24), (False, 0, 32)])
+def test_finetune_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch, freeze, fit_side, size):
+    # The linear probe's synthetic store and boxes, a fit cube of 24 or the whole 32^3 train box (smaller than PROBE_SIDE:
+    # its size comes from numpy, which json can't write unless cast) and global_size=24 crops. The tiny encoder has patch 2,
+    # since Unetr needs one block per upsample stage (log2(patch_size)), and a narrow decoder.
     import lib.decoders
     synthetic_store(tmp_path, monkeypatch)
     config = lib.decoders.UnetrConfig
     monkeypatch.setattr(lib.decoders, "UnetrConfig", lambda out_dim: config(out_dim=out_dim, hidden_dim=8))
-    par = experiment.Finetune(savedir=str(tmp_path / "run"), train=experiment.Train(global_size=(24, 24, 24)), fit_side=24, steps=250,
-                              freeze_encoder=freeze)
-    (tmp_path / "run").mkdir()
+    par = experiment.Finetune(savedir=str(tmp_path / "run"), train=experiment.Train(global_size=(24, 24, 24)), fit_side=fit_side,
+                              steps=250, freeze_encoder=freeze)
+    spec = experiment.dump(par)  # as submit writes it
     model = Lejepa(TINY, encoder=EncoderConfig(depth=2, embed_dim=16, num_heads=2, patch_size=(2, 2, 2)))
     before = {k: v.clone() for k, v in model.encoder.state_dict().items()}
     monkeypatch.setattr(experiment, "load_checkpoint", lambda p: (model.eval(), 7))
     experiment.finetune(par)
 
-    data, *curve = [json.loads(l) for l in (tmp_path / "run/finetune.json").read_text().splitlines()]
-    assert data == {"tbl": "finetune_data", "step": 7, "fit_size": [24, 24, 24], "fit_labelled": 24 ** 3, "test_blocks": ["hemibrain_eb_test"]}
+    assert experiment.load(str(spec), experiment.Finetune) == par  # its results didn't overwrite its spec
+    data, *curve = [json.loads(l) for l in (tmp_path / "run/finetune_curve.json").read_text().splitlines()]
+    assert data == {"tbl": "finetune_data", "step": 7, "fit_size": [size] * 3, "fit_labelled": size ** 3, "test_blocks": ["hemibrain_eb_test"]}
     assert [c["step"] for c in curve] == [100, 200, 250] and all(c["tbl"] == "finetune" for c in curve)
     for c in curve:  # every one a doubling step or the last: the test block scored, as probe.json has it
         assert 0 <= c["boundary_ap_short"] <= 1 and abs(c["boundary_frac_(1, 0, 0)"] - 1 / 31) < 0.003 and c["boundary_frac_(0, 1, 0)"] == 0

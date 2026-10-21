@@ -495,6 +495,27 @@ def test_a_finetune_of_a_trunk_here_waits_in_lsf_for_its_training(tmp_path, monk
     assert held == ["e00-e01-test-d0-run", "", "", ""]
 
 
+def test_retryall_restarts_only_finetunes_that_ended_unfinished(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    footer = "Successfully completed.\n\nResource usage summary:\n"
+    trunk = experiment.Train(savedir="outdir/e00/e01-test/d0/")
+    runs = [trunk] + [experiment.Finetune(savedir=f"outdir/e00/e01-test/d{i}/", train=trunk) for i in range(1, 5)]
+    for i, (log, png) in enumerate([(footer, True), (footer, False), ("still running", False), (None, False)], 1):  # done, failed, running, queued
+        d = Path(runs[i].savedir)
+        d.mkdir(parents=True)
+        if log:
+            (d / "job_finetune_1.log").write_text(log)
+        if png:
+            (d / "finetune.png").write_bytes(b"")
+    started = []
+    monkeypatch.setattr(experiment, "roots", lambda: runs)
+    monkeypatch.setattr(experiment, "check_experiment", lambda: None)
+    monkeypatch.setattr(experiment, "assert_committed", lambda: None)
+    monkeypatch.setattr(experiment, "start", lambda p: started.append(p.savedir))
+    experiment.retryall()
+    assert started == ["outdir/e00/e01-test/d2/"]
+
+
 def sweep(monkeypatch, name, init_from=""):
     """Point experiment at EXPERIMENT = name with 3 roots (evals of init_from + d<i>/ if set, else trainings), start() recording
     their indices, and no LSF."""

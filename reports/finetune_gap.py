@@ -64,8 +64,10 @@ def existing(path: Path) -> list:
 
 
 def curve(d: Path) -> list[dict]:
-    """A finetune's finetune.json rows, or [] if the file is still its spec: the spec and the results share the name, and a
-    job that failed never overwrote it."""
+    """A finetune's finetune_curve.json rows; [] without results. e10's first jobs wrote theirs to finetune.json, over their
+    spec (the same name then), so there it is results only if it isn't still the spec."""
+    if (d / "finetune_curve.json").is_file():
+        return read_jsonl(d / "finetune_curve.json")
     lines = (d / "finetune.json").read_text().splitlines()
     return [json.loads(l) for l in lines] if lines and lines[0].startswith('{"tbl"') else []
 

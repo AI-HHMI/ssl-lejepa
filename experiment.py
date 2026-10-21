@@ -1117,7 +1117,7 @@ def read_block(vol: ProbeVolume, tile, p, device, side: int = PROBE_SIDE):
     size) trims what it makes, or img itself (the box's EM), back to the box."""
     vox, _ = volume_grid(vol)
     lo, hi = np.array([b[0] for b in vol.box][::-1]), np.array([b[1] for b in vol.box][::-1])  # z y x, level-0 voxels
-    size = [min(s - s % q, side) for s, q in zip(((hi - lo) * vox / 8).astype(int), p)]
+    size = [int(min(s - s % q, side)) for s, q in zip(((hi - lo) * vox / 8).astype(int), p)]  # ints, not numpy's: json writes them
     region = [math.ceil(s / t) * t for s, t in zip(size, tile)]  # whole tiles around the box
     m = [(r - s) // 2 // q * q for r, s, q in zip(region, size, p)]
     img, lab = read_window(vol, (lo + hi) / 2, region)
@@ -1246,12 +1246,12 @@ def finetune(job: Finetune | str):
     finetune.json it names), fitted to mia-evals' 6 affinity channels of its probe set's (par.probe_on) train block, or of the
     par.fit_side cube about its centre: on crops of the encoder's view size, with the encoder trained too unless
     par.freeze_encoder, and scored as it fits on the set's test blocks, tiled at that size. Blocks read as probe reads them.
-      savedir/finetune.json   a first row (tbl "finetune_data"): the weights' step, the fit cube's size and labelled voxels (the
-                              GT the fit had), the test blocks. Then the fit curve (tbl "finetune", fit_unetr's): the batch loss
-                              every 100 steps, and at 100, 200, 400, ... steps and the last, the test blocks' scores averaged,
-                              as probe.json has them
+      savedir/finetune_curve.json   a first row (tbl "finetune_data"): the weights' step, the fit cube's size and labelled voxels
+                              (the GT the fit had), the test blocks. Then the fit curve (tbl "finetune", fit_unetr's): the batch
+                              loss every 100 steps, and at 100, 200, 400, ... steps and the last, the test blocks' scores
+                              averaged, as probe.json has them. (Not finetune.json: that is the job's spec, dump's.)
       savedir/finetune.png    test block after the fit, middle z: EM | true boundaries | predicted boundaries
-                              (finetune_<block>.png for any further test blocks)
+                              (finetune_<block>.png for any further test blocks), written last: the job finished
     """
     import torch
     from lib.decoders import Unetr, UnetrConfig, fit_unetr
@@ -1286,7 +1286,7 @@ def finetune(job: Finetune | str):
     curve = fit_unetr(unetr, inner(img, m, size)[None], aff, valid, tile, test_scores, steps=par.steps)
     del img, aff, valid
     rows = [data] + [{"tbl": "finetune", **c} for c in curve]
-    (Path(par.savedir) / "finetune.json").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    (Path(par.savedir) / "finetune_curve.json").write_text("".join(json.dumps(r) + "\n" for r in rows))
     for k, (vol, (img, labels, m, size)) in enumerate(zip(sets["test"], tests)):
         boundary_png(Path(par.savedir) / ("finetune.png" if k == 0 else f"finetune_{vol.name}.png"), inner(img, m, size), labels, predict(img, m, size))
     print(f"{par.savedir}: finetune of step {step} on {size} voxels of {par.probe_on}: boundary AP (short-range mean) "
@@ -1421,6 +1421,19 @@ def submitall():
     assert_committed()
     for r in roots():
         if not spec_path(r).is_file():
+            start(r)
+
+def retryall():
+    """Resubmit this experiment's finetunes whose job ended without finishing (its LSF log has its footer, but there is no
+    finetune.png, which finetune writes last), fresh (start: the failed dir's contents -> outdir/.trash/). Finished ones,
+    and ones still queued or running, are left alone."""
+    check_experiment()
+    assert_committed()
+    for r in roots():
+        logs = sorted(Path(r.savedir).glob("job_finetune_*.log"))
+        b1 = isinstance(r, Finetune) and not (Path(r.savedir) / "finetune.png").is_file()
+        b2 = bool(logs) and "Resource usage summary" in logs[-1].read_text(errors="ignore")
+        if b1 and b2:
             start(r)
 
 
