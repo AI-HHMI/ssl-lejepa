@@ -147,6 +147,7 @@ class Train:
     global_size: Tup3Int = (88, 88, 88)  # displace only
     local_size: Tup3Int = (56, 56, 56)  # displace, "views" only (analysis_utils reads it)
     batch_views: bool = False  # "views": one encoder call per group of same-shape views (2 per step with displace)
+    mae_decoder: tuple[int, int] = (192, 2)  # "mae": the decoder's (width, depth), heads width // 32 (lib.models.MaeConfig)
     mask_block: float = 0.6  # the masked cube's side as a fraction of the view's token grid side (lib.models.MaskConfig.block)
     mask_shift: int = 0  # >0: targets from a second view up to this many voxels off the context's (lib.models.MaskConfig.shift); both global_size
     # loss = prediction error + lamb x SIGReg. SIGReg's pull is lamb x its sample count (its statistic is N x an empirical-CF
@@ -350,8 +351,10 @@ def model_config(par: Train) -> LejepaConfig | MaeConfig:
     """par's model's config: an MAE on the same encoder and view, or lejepa_config."""
     if par.objective != "mae":
         return lejepa_config(par)
+    (dim, depth) = par.mae_decoder
     return MaeConfig(encoder=EncoderConfig(depth=par.n_layers, embed_dim=par.width, num_heads=par.width // 64),
-                     view=ViewConfig(views=par.views, global_size=par.global_size))
+                     view=ViewConfig(views=par.views, global_size=par.global_size),
+                     decoder_dim=dim, decoder_depth=depth, decoder_heads=dim // 32)
 
 def make_model(par: Train) -> Lejepa | Mae:
     """par's model, untrained."""

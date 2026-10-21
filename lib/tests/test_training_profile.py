@@ -146,6 +146,11 @@ def test_each_objective_trains_logs_its_terms_and_reloads_for_eval(tmp_path, mon
     assert step == 3 and type(model).__name__ == {"views": "Lejepa", "mae": "Mae"}[objective]
 
 
+def test_mae_decoder_sets_the_mae_models_decoder():
+    c = experiment.model_config(experiment.Train(objective="mae", mae_decoder=(512, 8)))
+    assert isinstance(c, MaeConfig) and (c.decoder_dim, c.decoder_depth, c.decoder_heads) == (512, 8, 16)
+
+
 def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")  # replay_bad_batch replays only this experiment's dumps
