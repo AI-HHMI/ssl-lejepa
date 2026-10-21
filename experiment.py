@@ -223,49 +223,69 @@ class Rank:
         return torch.device(f"cuda:{self.local}" if torch.cuda.is_available() else "cpu")
 
 # This experiment's id (README: experiment ids): its roots are outdir/<EXPERIMENT>/d<i>/, a trunk's branches in its own dir.
-EXPERIMENT = "e00/e09-data-transfer"
+EXPERIMENT = "e00/e10-finetune-gap"
 
 def roots() -> list[Spec]:
     """This experiment: the runs it starts from nothing (trunks, other training runs, evals of another experiment's weights).
     Each trunk evaluates its own milestones as it saves them (eval_milestone)."""
-    # Does pretraining on one kind of data transfer to others, and does training on all of them jointly cost any? The four
-    # families of mia-evals' lmd_ssl_v1 (one per modality pair): fly EM (hemibrain), zebrafish EM (fish2), mouse ExM
-    # (LICONN) and mouse cortex EM (Kasthuri15, whose eval volumes are all its data: pretrained on MICrONS instead; see
-    # lib.data.TRAIN_BOXES), every volume read at 8 nm. One encoder per family and one on all four (lmd4, the families
-    # weighted equally), all at the same compute: e07-mask-side's cube of side 3 (view 96, shift 32, pull 10, SIGReg
-    # "both"), 4 h of m (12x512) at batch 32 on one B300. Each is probed at the end on all four families (all-vs-all:
-    # Train.probe_sets, each fitted on the family's lmd_ssl_v1 fit block and scored on its test blocks; hemibrain's are our
-    # usual EB blocks), beside a random encoder on each. No milestone evals (four probes each would cost ~an hour of the 4).
-    BATCH, STEPS, HOURS, VIEW, SHIFT, SIDE, GRID = 32, 2_560_000, 4, 96, 32, 3, 12
-    families: list[TrainData] = ["hemibrain_wide", "fish2", "liconn_mouse", "microns", "lmd4"]
-    sets = ("hemibrain_eb", "fish2", "liconn_mouse", "kasthuri15")
-    runs: list[Spec] = []
-    for data in families:
+    # Is pretraining worth it once labels are used to train? unetr-probe's UNETR decoders on pretrained encoders led random ones
+    # early in the fit, then random caught up by ~1-2k of 3k steps. Map the gap: test AP as a function of finetuning compute
+    # (fit steps, scored at doubling steps to 10k: Finetune) and of GT (the fit block cut to a cube of side 128, 256, 512 or
+    # whole: Finetune.fit_side), on all four lmd_ssl_v1 families (sparse ones scoring labelled-vs-unlabelled pairs as
+    # boundaries), the encoder frozen or trained with the decoder. The encoders are trained here, on this commit, so every
+    # load means what it did in training: the best of each objective so far on hemibrain_wide, at one budget (6 h of m,
+    # 12x512, batch 32, one H200, ~0.7x a B300's speed: about e08's 4 h of B300 steps; linear-probe evals at doubling steps
+    # from 5k): e08's MAE (decoder 512x8, view 96 of 128; 0.296 / 0.869 short / long AP at 4 h of B300), e06's masked tokens
+    # at view 64 (shift 24, block 0.6, pull 10, SIGReg "both"; 0.205 / 0.847 at 8 h) and e06's multi-view invariance (input
+    # 128, globals and locals 96; 0.113 / 0.544), and the masked recipe on lmd4 (all four families, as e09). Each finetunes
+    # at its own view, beside a random encoder at views 96 and 64. B300s were full: the trunks on H200s, the finetunes (192
+    # independent jobs) on the larger pool of RTX PRO 6000s (95 GB), their queue set on the Train each carries (submit uses
+    # its queue; it doesn't change the weights). A trunk's finetunes wait in LSF for its training job (submit).
+    BATCH, STEPS, HOURS = 32, 2_560_000, 6
+    SETS, SIDES = ("hemibrain_eb", "fish2", "liconn_mouse", "kasthuri15"), (128, 256, 512, 0)
+
+    def trunk(objective: Literal["views", "mask", "mae"], data: TrainData, input_size: int, view: int) -> Train:
         p = Train()
-        p.savedir = f"outdir/{EXPERIMENT}/d{len(runs)}/"
+        p.objective = objective
         p.data = data
-        p.probe_sets = sets
         p.views = "displace"
-        p.patch_size = (VIEW + SHIFT, VIEW + SHIFT, VIEW + SHIFT)
-        p.global_size = (VIEW, VIEW, VIEW)
-        p.mask_block = SIDE / GRID  # lib.models.lejepa.mask_side rounds block x grid back to side
-        p.mask_shift = SHIFT
-        p.sigreg_over = "both"
-        p.lamb = 10 / BATCH
+        p.patch_size = (input_size, input_size, input_size)
+        p.global_size = (view, view, view)
         p.batch_size = BATCH
         p.steps_per_epoch = STEPS
-        p.milestone_every = STEPS  # one milestone, at a step 4 h never reaches: none
+        p.milestone_every = 5_000
+        p.milestone_doubling = True
         p.max_hours = HOURS
         p.weight_decay = 0.05
         p.adam_beta2 = 0.95
         p.cudagraphs = True
         p.n_workers = 11  # 12 cores per GPU
-        p.queue = "gpu_b300"
+        p.queue = "gpu_h200"
+        return p
+
+    def masked(data: TrainData) -> Train:
+        p = trunk("mask", data, 88, 64)
+        p.mask_block = 0.6
+        p.mask_shift = 24
+        p.sigreg_over = "both"
+        p.lamb = 10 / BATCH
+        return p
+
+    mae = trunk("mae", "hemibrain_wide", 128, 96)
+    mae.mae_decoder = (512, 8)
+    views = trunk("views", "hemibrain_wide", 128, 96)
+    views.local_size = (96, 96, 96)
+    views.batch_views = True
+    views.lamb = 0.1
+    trunks = [mae, masked("hemibrain_wide"), views, masked("lmd4")]
+    runs: list[Spec] = []
+    for p in trunks:
+        p.savedir = f"outdir/{EXPERIMENT}/d{len(runs)}/"
         runs.append(p)
-    trunk = runs[0]
-    assert isinstance(trunk, Train)
-    for s in sets:  # the random encoder: the baseline of each family's probe
-        runs.append(Eval(savedir=f"outdir/{EXPERIMENT}/d{len(runs)}/", train=trunk, init_from="random", probe_on=s, jobs=("probe",)))
+    encoders = [(t, t.savedir) for t in trunks] + [(mae, "random"), (trunks[1], "random")]  # random at view 96 and 64
+    for (t, init), s, freeze, side in product(encoders, SETS, (True, False), SIDES):
+        runs.append(Finetune(savedir=f"outdir/{EXPERIMENT}/d{len(runs)}/", train=replace(t, queue="gpu_rtx6000"), init_from=init,
+                             probe_on=s, fit_side=side, freeze_encoder=freeze))
     return runs
 
 def milestone_steps(trunk: Train) -> list[int]:
@@ -1237,6 +1257,7 @@ def finetune(job: Finetune | str):
     from lib.decoders import Unetr, UnetrConfig, fit_unetr
     from lib.probe import AFFINITY_OFFSETS_XYZ, affinities
     par = load(job, Finetune)
+    torch.set_float32_matmul_precision(par.train.f32mode)  # as the encoder trained: TF32 matmuls ("high"), not full fp32
     tile = par.train.global_size
     model, step = load_checkpoint(par)
     record(par, "finetune")
@@ -1271,9 +1292,14 @@ def finetune(job: Finetune | str):
     print(f"{par.savedir}: finetune of step {step} on {size} voxels of {par.probe_on}: boundary AP (short-range mean) "
           f"{curve[-1]['boundary_ap_short']:.3f} after {par.steps} steps", flush=True)
 
-def bsub(savedir: str, job: str, minutes: int, n_gpus: int, queue: str, cmd: str, slots: int | None = None):
-    """Submit `uv run <cmd>` for the run dir savedir to LSF as job <sweep>-<dN>-<job>, logging to savedir/job_<job>_%J.log,
-    on queue with CPUS_PER_GPU slots per GPU (a CPU job, n_gpus = 0, names its slots).
+def job_name(savedir: str, job: str) -> str:
+    """The LSF name of the run dir savedir's job: <sweep>-<dN>-<job>, e.g. e00-nanhunt-d9-run, so bjobs shows which is which."""
+    return "-".join(Path(savedir).parts[1:]) + f"-{job}"
+
+def bsub(savedir: str, job: str, minutes: int, n_gpus: int, queue: str, cmd: str, slots: int | None = None, after: str = ""):
+    """Submit `uv run <cmd>` for the run dir savedir to LSF as job job_name(savedir, job), logging to savedir/job_<job>_%J.log,
+    on queue with CPUS_PER_GPU slots per GPU (a CPU job, n_gpus = 0, names its slots); held until the job named after is
+    done (exited 0), if given.
 
     {code} in cmd is this commit's code snapshot (.tmpcode/<sweep>/), which the job runs instead of the shared
     checkout: that may have moved on (another sweep pushed) by the time the job starts. Python puts the script's
@@ -1281,29 +1307,31 @@ def bsub(savedir: str, job: str, minutes: int, n_gpus: int, queue: str, cmd: str
     resolve as before. Callers from the shared checkout assert_committed() first.
     """
     import subprocess
-    name = "-".join(Path(savedir).parts[1:]) + f"-{job}"  # e.g. e00-nanhunt-d9-run, so bjobs shows which is which
+    name = job_name(savedir, job)
     here = Path(__file__).resolve().parent
     # A job submitting a job hands on the snapshot it runs itself, not the shared checkout's current state.
     code = here if ".tmpcode" in here.parts else snapshot(SNAPSHOT_PATHS, Path(".tmpcode") / EXPERIMENT.replace("/", "-"))
     gpu = f'-gpu "num={n_gpus}:mode=exclusive_process"' if n_gpus else ""
+    wait = f'-w "done({after})"' if after else ""
     full = f""" bsub -J {name} \
         -W {minutes // 60}:{minutes % 60:02d} \
         -P miaai \
         -n {slots or n_gpus * CPUS_PER_GPU} \
         -R "span[hosts=1]" {gpu} \
-        -q {queue} \
+        -q {queue} {wait} \
         -o {savedir}/job_{job}_%J.log \
         uv run {cmd.format(code=code)}
         """
-    subprocess.Popen(full, shell=True, stdin=subprocess.DEVNULL, start_new_session=True)
+    subprocess.run(full, shell=True, stdin=subprocess.DEVNULL, check=True)  # waits: a later job may name this one in its after
     print(f"Submitted {name} (code {code}) to LSF.")
 
 def submit(fn: str, job: Spec):
     """Run the entrypoint fn on the spec job as an LSF job: job written to its savedir (dump: train.json, eval.json or
     finetune.json), and `experiment.py <fn> <that file>` submitted (bsub), which loads it. Resources by fn: run and benchmark,
     a training job on job's queue and GPUs (torchrun); pca, pca_sizes, probe and finetune, one GPU on the trained run's queue;
-    score, a CPU job on SCORE_QUEUE. No commit check: callers from the shared checkout (submitall, lsf) assert_committed()
-    first; a job submitting one is committed code."""
+    score, a CPU job on SCORE_QUEUE. A finetune of one of this experiment's own trunks waits in LSF for the trunk's run job,
+    unless the trunk is done (its own probe.json is written). No commit check: callers from the shared checkout (submitall,
+    lsf) assert_committed() first; a job submitting one is committed code."""
     b1 = fn in ("run", "benchmark") and isinstance(job, Train)
     b2 = fn in ("pca", "pca_sizes", "probe", "score") and isinstance(job, Eval)
     b3 = fn == "finetune" and isinstance(job, Finetune)
@@ -1318,7 +1346,11 @@ def submit(fn: str, job: Spec):
     elif fn == "score":
         bsub(job.savedir, fn, SCORE_MINUTES, 0, SCORE_QUEUE, f"python {{code}}/experiment.py score {spec}", slots=SCORE_SLOTS)
     else:
-        bsub(job.savedir, fn, {"pca": 30, "pca_sizes": 60, "probe": 60, "finetune": 120}[fn], 1, job.train.queue, f"python {{code}}/experiment.py {fn} {spec}")
+        b4 = job.init_from.startswith(f"outdir/{EXPERIMENT}/")
+        b5 = not (Path(job.init_from) / "probe.json").is_file()
+        after = job_name(job.init_from, "run") if isinstance(job, Finetune) and b4 and b5 else ""
+        bsub(job.savedir, fn, {"pca": 30, "pca_sizes": 60, "probe": 60, "finetune": 120}[fn], 1, job.train.queue, f"python {{code}}/experiment.py {fn} {spec}",
+             after=after)
 
 def start(p: Spec):
     """Submit p fresh: its savedir emptied (old contents -> outdir/.trash/), then its jobs: a training run (which evals itself

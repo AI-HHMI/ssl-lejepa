@@ -480,6 +480,21 @@ def test_submit_writes_the_spec_its_job_loads(tmp_path, monkeypatch):
         experiment.load("extra.json", experiment.Eval)
 
 
+def test_a_finetune_of_a_trunk_here_waits_in_lsf_for_its_training(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")
+    held = []
+    monkeypatch.setattr(experiment, "bsub", lambda savedir, job, minutes, n_gpus, queue, cmd, after="", **kw: held.append(after))
+    trunk = experiment.Train(savedir="outdir/e00/e01-test/d0/")
+    finetune = lambda init: experiment.Finetune(savedir="outdir/e00/e01-test/d1/", train=trunk, init_from=init)
+    for init in [trunk.savedir, "random", "outdir/e00/e00-other/d0/"]:
+        experiment.submit("finetune", finetune(init))
+    Path(trunk.savedir).mkdir(parents=True)
+    Path(trunk.savedir, "probe.json").write_text("{}")  # the trunk is done: nothing to wait for (LSF may have forgotten its job)
+    experiment.submit("finetune", finetune(trunk.savedir))
+    assert held == ["e00-e01-test-d0-run", "", "", ""]
+
+
 def sweep(monkeypatch, name, init_from=""):
     """Point experiment at EXPERIMENT = name with 3 roots (evals of init_from + d<i>/ if set, else trainings), start() recording
     their indices, and no LSF."""

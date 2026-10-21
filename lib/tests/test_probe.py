@@ -230,7 +230,7 @@ def test_lsf_score_submits_a_cpu_job_on_the_runs_own_eval(tmp_path, monkeypatch)
     monkeypatch.setattr(experiment, "snapshot", lambda paths, dest: tmp_path / "code")
     submitted = []
     import subprocess
-    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: submitted.append(cmd))
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: submitted.append(cmd))
     experiment.lsf("score", 0)
     (cmd,) = submitted
     assert f"-q {experiment.SCORE_QUEUE}" in cmd and f"-n {experiment.SCORE_SLOTS}" in cmd and "-gpu" not in cmd
