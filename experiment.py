@@ -1103,12 +1103,13 @@ def read_block(vol: ProbeVolume, tile, p, device, side: int = PROBE_SIDE):
     img, lab = read_window(vol, (lo + hi) / 2, region)
     return img.to(device), inner(lab, m, size).contiguous().to(device), m, size
 
-def score_block(pred, labels) -> dict:
-    """pred (C Z Y X affinity probabilities) against the affinities of labels (Z Y X instance ids), per channel: BCE, boundary
-    AP (boundary = different objects) and the boundary base rate, on a fixed random subset (at most 10M) of its valid pairs."""
+def score_block(pred, labels, sparse: bool) -> dict:
+    """pred (C Z Y X affinity probabilities) against the affinities of labels (Z Y X instance ids; sparse: ProbeVolume.sparse),
+    per channel: BCE, boundary AP (boundary = different objects) and the boundary base rate, on a fixed random subset (at most
+    10M) of its valid pairs."""
     import torch
     from lib.probe import AFFINITY_OFFSETS_XYZ, affinities, average_precision
-    aff, valid = affinities(labels, [o[::-1] for o in AFFINITY_OFFSETS_XYZ])  # x y z offsets; the model sees z y x
+    aff, valid = affinities(labels, [o[::-1] for o in AFFINITY_OFFSETS_XYZ], sparse)  # x y z offsets; the model sees z y x
     g = torch.Generator(device=labels.device).manual_seed(0)
     s = {}
     for c, o in enumerate(AFFINITY_OFFSETS_XYZ):
@@ -1176,13 +1177,13 @@ def probe(job: Eval | str):
 
     tests = [read_block(v, tile, p, device) for v in sets["test"]]  # (img, labels, m, size) each
     img, labels, m, size = tests[0]
-    aff, valid = affinities(labels, offsets)
+    aff, valid = affinities(labels, offsets, sets["test"][0].sparse)
     feats = tokens(img, m, size)
     g = torch.Generator(device=device).manual_seed(0)
     i = torch.randperm(len(feats), device=device, generator=g)[:16384]  # held-out tokens, fit curve only
     held = (feats[i], to_tokens(aff, p[0])[i], to_tokens(valid, p[0])[i])
     img, labels, m, size = read_block(sets["train"][0], tile, p, device)
-    aff, valid = affinities(labels, offsets)
+    aff, valid = affinities(labels, offsets, sets["train"][0].sparse)
     feats = tokens(img, m, size)
     del img, labels
     head, curve = fit_probe(feats, to_tokens(aff, p[0]), to_tokens(valid, p[0]), held)
@@ -1206,7 +1207,7 @@ def probe(job: Eval | str):
     per_block = []
     for k, (vol, (img, labels, m, size)) in enumerate(zip(sets["test"], tests)):
         pred = predict(img, m, size)
-        per_block.append(score_block(pred, labels))
+        per_block.append(score_block(pred, labels, vol.sparse))
         boundary_png(Path(par.savedir) / ("probe.png" if k == 0 else f"probe_{vol.name}.png"), inner(img, m, size), labels, pred)
         if par.score:
             artifact("test", vol, pred)
@@ -1249,7 +1250,7 @@ def finetune(job: Finetune | str):
     encoder.requires_grad_(not par.freeze_encoder)
     img, labels, m, size = read_block(sets["train"][0], tile, p, device, side)
     assert all(s >= t for s, t in zip(size, tile)), f"{par.savedir}: the fit cube {size} is smaller than a crop {tile}"
-    aff, valid = affinities(labels, [o[::-1] for o in AFFINITY_OFFSETS_XYZ])  # x y z offsets; the model sees z y x
+    aff, valid = affinities(labels, [o[::-1] for o in AFFINITY_OFFSETS_XYZ], sets["train"][0].sparse)  # x y z offsets; the model sees z y x
     data = {"tbl": "finetune_data", "step": step, "fit_size": size, "fit_labelled": int((labels != 0).sum()),
             "test_blocks": [v.name for v in sets["test"]]}
     del labels
@@ -1259,7 +1260,7 @@ def finetune(job: Finetune | str):
         return torch.sigmoid(inner(tile_logits(unetr, img, tile), m, size)).half()
 
     def test_scores() -> dict:
-        return mean_scores([score_block(predict(t_img, t_m, t_size), t_labels) for t_img, t_labels, t_m, t_size in tests])
+        return mean_scores([score_block(predict(t_img, t_m, t_size), t_labels, v.sparse) for v, (t_img, t_labels, t_m, t_size) in zip(sets["test"], tests)])
 
     curve = fit_unetr(unetr, inner(img, m, size)[None], aff, valid, tile, test_scores, steps=par.steps)
     del img, aff, valid

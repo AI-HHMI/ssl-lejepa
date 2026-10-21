@@ -91,10 +91,13 @@ class ProbeVolume(NamedTuple):
     label_key: str
     box: list[list[int]]  # [lo, hi) level-0 voxels, x y z
     clip: tuple[float, float] | None = None  # uint16 images: the [lo, hi] mapped to [0, 1] (miao's normalize_min / _max)
+    sparse: bool = False  # its labels are whole cells but not every cell: labelled against unlabelled is a boundary (lib.probe.affinities)
 
 
 def _lmd_ssl_v1(name: str, catalog: str, label_key: str, box: list[list[int]], clip: tuple[float, float] | None = None) -> ProbeVolume:
-    return ProbeVolume(name, f"{LMD_DATA}/{catalog}.zarr", label_key, box, clip)
+    # lmd_ssl_v1's labels (proofread, or manual "final") label some cells whole: e09's probes there scored labelled pairs only,
+    # where +1 voxel boundaries were 0.1-1% of pairs and every encoder's short AP sat at that base rate.
+    return ProbeVolume(name, f"{LMD_DATA}/{catalog}.zarr", label_key, box, clip, sparse=True)
 
 
 # Probe sets (Eval.probe_on): a "train" block the probe fits on, and the "test" blocks it is scored on. hemibrain_eb is the

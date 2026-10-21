@@ -52,6 +52,17 @@ def test_affinities_mark_the_split_between_two_objects():
     assert aff[2, :, :, :3].logical_not().all() and valid[2, :, :, :3].all() and not valid[2, :, :, 3:].any()
 
 
+def test_sparse_labels_score_a_labelled_cell_against_unlabelled_as_a_boundary():
+    labels = torch.tensor([[[1, 1, 0, 2, 0, 0]]])  # x: cell 1, unlabelled, cell 2, unlabelled
+    aff, dense = affinities(labels, [(0, 0, 1)])
+    _, sparse = affinities(labels, [(0, 0, 1)], sparse=True)
+    assert aff[0, 0, 0].tolist() == [True, False, False, False, False, False]  # same object only within cell 1
+    assert dense[0, 0, 0].tolist() == [True, False, False, False, False, False]  # both labelled: cell 1's inside only
+    assert sparse[0, 0, 0].tolist() == [True, True, True, True, False, False]  # one labelled: its edges too, not 0 vs 0
+    assert all(v.sparse for s in experiment.PROBE_SETS.values() for vs in s.values() for v in vs if not v.name.startswith("hemibrain"))
+    assert not any(v.sparse for vs in experiment.PROBE_SETS["hemibrain_eb"].values() for v in vs)  # dense proofread: unchanged
+
+
 def test_tokens_voxels_round_trip():
     vox = torch.randn(6, 8, 12, 16)
     tok = to_tokens(vox, 4)

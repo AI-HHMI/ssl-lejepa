@@ -9,18 +9,19 @@ from torch import Tensor, nn
 # store's x y z axes: channel c at voxel p is 1 if p and p + offset_c belong to the same object.
 AFFINITY_OFFSETS_XYZ = [(1, 0, 0), (0, 1, 0), (0, 0, 1), (10, 0, 0), (0, 10, 0), (0, 0, 10)]
 
-def affinities(labels: Tensor, offsets: list[tuple[int, ...]]) -> tuple[Tensor, Tensor]:
-    """labels: Z Y X instance ids (0 = background); offsets: per channel (dz, dy, dx), all >= 0.
+def affinities(labels: Tensor, offsets: list[tuple[int, ...]], sparse: bool = False) -> tuple[Tensor, Tensor]:
+    """labels: Z Y X instance ids (0 = unlabelled); offsets: per channel (dz, dy, dx), all >= 0.
     Returns (aff, valid), both C Z Y X bool. aff: p and p + offset have the same nonzero id. valid: p + offset is
-    inside the block and neither voxel is background (the loss and metrics ignore the rest)."""
+    inside the block and neither voxel is unlabelled (the loss and metrics ignore the rest); with sparse (labels that
+    are whole cells, but not every cell), only one need be labelled: a labelled cell against an unlabelled voxel is a
+    boundary too."""
     Z, Y, X = labels.shape
     aff = torch.zeros(len(offsets), Z, Y, X, dtype=torch.bool, device=labels.device)
     valid = torch.zeros_like(aff)
     for c, (dz, dy, dx) in enumerate(offsets):
         a, b = labels[:Z - dz, :Y - dy, :X - dx], labels[dz:, dy:, dx:]
-        v = (a != 0) & (b != 0)
-        aff[c, :Z - dz, :Y - dy, :X - dx] = (a == b) & v
-        valid[c, :Z - dz, :Y - dy, :X - dx] = v
+        aff[c, :Z - dz, :Y - dy, :X - dx] = (a == b) & (a != 0)
+        valid[c, :Z - dz, :Y - dy, :X - dx] = ((a != 0) | (b != 0)) if sparse else ((a != 0) & (b != 0))
     return aff, valid
 
 def to_tokens(vox: Tensor, p: int) -> Tensor:
