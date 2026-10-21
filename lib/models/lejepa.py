@@ -90,6 +90,10 @@ class MaskConfig:
     # grids are then offset by a random, fractional number of tokens, so only content lines up between them, not a code of
     # each view's own token positions (the shortcut e02-e04 took). 0: the targets are the context view's own tokens.
     shift: int = 0
+    aligned: bool = False  # shift only: both views' origins are whole tokens, so the two token grids coincide (no fractional offset)
+    # shift only: hide one more token per axis of the context, on the side the masked target tokens overhang the cube (their
+    # centres are in it, their edges up to half a token out), so none of the masked target voxels is visible to the context.
+    expand: bool = False
 
 
 def mask_side(mask: MaskConfig, grid: tuple[int, ...]) -> tuple[int, ...]:
@@ -99,16 +103,21 @@ def mask_side(mask: MaskConfig, grid: tuple[int, ...]) -> tuple[int, ...]:
     return side
 
 
+def hidden_side(mask: MaskConfig, grid: tuple[int, ...]) -> tuple[int, ...]:
+    """Side, in tokens, of the cube of context tokens hidden from the encoder: the masked cube, plus one token with mask.expand."""
+    return tuple(s + mask.expand for s in mask_side(mask, grid))
+
+
 def train_flops(config: LejepaConfig, grid: tuple[int, ...], n_encoder: int, n_predictor: int, n_projector: int) -> int:
     """Training FLOPs of one sample whose view has this token grid (backward ~ 2x forward), given the parameter counts:
     per token, 6 x params for the weights plus 12 x depth x width x n for attention over the n tokens it sees. The
     encoder sees every token (the targets), then the visible ones; the predictor sees all N; the projector every token
     and every prediction. Ignores flash-attention recompute and elementwise ops, as MFU conventionally does."""
-    n, m = prod(grid), prod(mask_side(config.mask, grid))
+    n, m, h = prod(grid), prod(mask_side(config.mask, grid)), prod(hidden_side(config.mask, grid))
     attention = lambda n_tokens, depth: 12 * depth * config.encoder.embed_dim * n_tokens
     encoder = lambda n_tokens: n_tokens * (6 * n_encoder + attention(n_tokens, config.encoder.depth))
     predictor = n * (6 * n_predictor + attention(n, config.mask.predictor_depth))
-    return encoder(n) + encoder(n - m) + predictor + 6 * n_projector * (n + m)
+    return encoder(n) + encoder(n - h) + predictor + 6 * n_projector * (n + m)
 
 
 class Predictor(nn.Module):
@@ -224,21 +233,26 @@ class Lejepa(nn.Module):
         masked: Batch M, the target view's tokens whose centres fall inside it, M the cube's; their coordinates in the
         context's token grid, Batch M 3, off the integers by offset / patch.) offset 0: the cube's own tokens, at its own."""
         device, s, patch = offset.device, mask_side(self.config.mask, grid), self.encoder.patch_embed.patch_size
+        h = hidden_side(self.config.mask, grid)
         assert all(n - m >= -(-self.config.mask.shift // q) for n, m, q in zip(grid, s, patch)), (
             f"a mask cube {s} in grid {grid} does not fit both views at a shift of {self.config.mask.shift}")
-        side, g, p = [torch.tensor(t, device=device) for t in (s, grid, patch)]
+        side, g, p, hid = [torch.tensor(t, device=device) for t in (s, grid, patch, h)]
         lo = (-(-offset // p)).clamp(min=0)  # ceil(offset / p): the target's first whole token in the context's grid
         hi = g - side + (offset // p).clamp(max=0)
         origin = lo + (torch.rand(offset.shape, device=device) * (hi - lo + 1)).long()  # Batch 3
         grid_coords = lambda shape: torch.stack(torch.meshgrid(*[torch.arange(n, device=device) for n in shape], indexing="ij"), dim=-1).reshape(-1, 3)
         coords = grid_coords(grid)  # N 3
-        inside = ((coords >= origin[:, None]) & (coords < origin[:, None] + side)).all(dim=-1)  # Batch N
-        order = inside.to(torch.uint8).argsort(dim=1, stable=True)  # the visible tokens, then the masked cube's
         # The target token k's centre, offset + (k + 1/2) p in the context's voxels, is in the cube [origin p, (origin + side) p)
         # from k = ceil(origin - offset / p - 1/2) on.
         first = -((2 * offset + p - 2 * origin * p) // (2 * p))  # Batch 3
+        # The masked target tokens overhang the cube by under half a token, on one side: the left if they start before it.
+        # With expand the hidden cube grows by a token there (and stays in the grid), covering them.
+        left = (first * p + offset < origin * p).long()
+        hidden_origin = torch.minimum((origin - left * self.config.mask.expand).clamp(min=0), g - hid)
+        inside = ((coords >= hidden_origin[:, None]) & (coords < hidden_origin[:, None] + hid)).all(dim=-1)  # Batch N
+        order = inside.to(torch.uint8).argsort(dim=1, stable=True)  # the visible tokens, then the hidden cube's
         k = first[:, None] + grid_coords(s)  # Batch M 3, in the cube's (Z-major) order, as order's
-        return order[:, :-prod(s)], (k * torch.tensor([grid[1] * grid[2], grid[2], 1], device=device)).sum(-1), k + offset[:, None] / p
+        return order[:, :-prod(h)], (k * torch.tensor([grid[1] * grid[2], grid[2], 1], device=device)).sum(-1), k + offset[:, None] / p
 
     def forward(
         self,
@@ -283,7 +297,11 @@ class Lejepa(nn.Module):
         region = self.view_maker(vol)[0][0]  # the one crop, Batch C Z Y X: both views' region (each is it, without a shift)
         batch, shift = region.shape[0], self.config.mask.shift
         size = tuple(s - shift for s in region.shape[2:])
-        origins = torch.randint(0, shift + 1, (2, batch, 3), device=region.device)  # context's, target's
+        if self.config.mask.aligned:
+            q = torch.tensor(self.encoder.patch_embed.patch_size, device=region.device)
+            origins = (torch.rand((2, batch, 3), device=region.device) * (shift // q + 1)).long() * q  # whole tokens
+        else:
+            origins = torch.randint(0, shift + 1, (2, batch, 3), device=region.device)  # context's, target's
         view, target_view = crop(region, origins[0], size), crop(region, origins[1], size)
         grid = tuple(s // p for s, p in zip(size, self.encoder.patch_embed.patch_size))
         gather = lambda t, i: torch.gather(t, 1, i.unsqueeze(-1).expand(-1, -1, t.shape[-1]))  # Batch N D, Batch K -> Batch K D

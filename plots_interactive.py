@@ -257,7 +257,7 @@ def heatmap(z: dict, xs: list, ys: list, xlabel: str, ylabel: str, zrange: tuple
     data = [{"type": "heatmap", "x": [str(x) for x in xs], "y": [str(y) for y in ys], "z": rows, "zmin": zrange[0], "zmax": zrange[1],
              "colorscale": "Viridis", "xgap": 2, "ygap": 2, "texttemplate": "%{z:.3f}",
              "hovertemplate": f"{html.escape(xlabel)} %{{x}}, {html.escape(ylabel)} %{{y}}: %{{z:.4g}}<extra></extra>"}]
-    return figure(data, {"height": 300, "xaxis": {"type": "category", "title": xlabel}, "yaxis": {"type": "category", "title": ylabel}})
+    return figure(data, {"height": 300, "xaxis": {"type": "category", "title": xlabel}, "yaxis": {"type": "category", "title": ylabel, "automargin": True}})
 
 
 def bar(rows: list, xlabel: str, stack: bool = False) -> str:

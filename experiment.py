@@ -149,6 +149,8 @@ class Train:
     batch_views: bool = False  # "views": one encoder call per group of same-shape views (2 per step with displace)
     mae_decoder: tuple[int, int] = (192, 2)  # "mae": the decoder's (width, depth), heads width // 32 (lib.models.MaeConfig)
     mask_block: float = 0.6  # the masked cube's side as a fraction of the view's token grid side (lib.models.MaskConfig.block)
+    mask_aligned: bool = False  # mask_shift only: whole-token view origins (lib.models.MaskConfig.aligned)
+    mask_expand: bool = False  # mask_shift only: hide a token more of the context around the masked target tokens (MaskConfig.expand)
     mask_shift: int = 0  # >0: targets from a second view up to this many voxels off the context's (lib.models.MaskConfig.shift); both global_size
     # loss = prediction error + lamb x SIGReg. SIGReg's pull is lamb x its sample count (its statistic is N x an empirical-CF
     # distance) and it sees each view's N tokens: the old lamb 0.1 over 32 batch samples (a pull of 3.2) is 0.002 at 12^3 tokens.
@@ -361,7 +363,7 @@ def lejepa_config(par: Train) -> LejepaConfig:
         objective = par.objective,
         view = ViewConfig(views=par.views, n_global=n_global, n_local=n_local, global_size=(z + s, y + s, x + s), local_size=par.local_size),  # "mask": both views' region
         batch_views = par.batch_views,
-        mask = MaskConfig(block=par.mask_block, shift=par.mask_shift),
+        mask = MaskConfig(block=par.mask_block, shift=par.mask_shift, aligned=par.mask_aligned, expand=par.mask_expand),
         lamb = par.lamb,
         sigreg_over = par.sigreg_over,
         stop_grad = par.stop_grad,

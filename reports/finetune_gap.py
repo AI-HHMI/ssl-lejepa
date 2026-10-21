@@ -23,39 +23,43 @@ REFERENCE = {"d0": ("e08-mae-fix/d3, 4 h of B300", 0.296, 0.869), "d1": ("e06-vi
              "d2": ("e06-viewsize-vs-baselines/d5, 8 h of B300", 0.113, 0.544)}
 SHORT, LONG = "short (+1)", "long (+10)"
 
-# Read from the runs' finetune.json, probe.json and job logs (2026-10-21).
-FINDINGS = """<p><b>Pretraining helps at every amount of GT tested, and the gap closes with GT more than with fit compute.</b>
-At 10k fit steps the MAE encoder beats the random one in 23 of 24 (set, GT, frozen or trained) cells, on short and on long
-AP; all four pretrained encoders together in 79 of 96 (short) and 87 of 96 (long).</p>
+# Read from the runs' finetune_curve.json (finetune.json for the first 144), probe.json and job logs (2026-10-21).
+FINDINGS = """<p><b>Pretraining helps at every amount of GT and fit compute tested.</b> At 10k fit steps the MAE encoder beats
+its random one in 30 of 32 (set, GT, frozen or trained) cells, on short and on long AP; all four pretrained encoders together
+in 105 of 128 (short) and 113 of 128 (long). The gap shrinks with GT up to 512^3 and then stops shrinking.</p>
 <ul>
 <li><b>Near eval(0, *) the gap is large everywhere</b>, as the linear probe implied: at 100 fit steps MAE leads its random
-encoder by 0.08 short / 0.27 long AP on average (hemibrain EB, 512^3 of GT, frozen: 0.124 against 0.034 short, 0.875 against
+encoder by 0.09 short / 0.30 long AP on average (hemibrain EB, 512^3 of GT, frozen: 0.124 against 0.034 short, 0.875 against
 0.406 long).</li>
-<li><b>With enough GT, fit compute closes most of it.</b> On hemibrain EB at 512^3, random reaches MAE's 100-step AP after 400
-(short) and 1600 (long) steps, and at 10k is within 0.016-0.025 short and 0.020-0.028 long: one seed, so near noise. That is
-the largest GT that ran on EB (the whole-block fits failed; see Missing runs).</li>
-<li><b>With little GT it doesn't.</b> At 128^3 random never reaches MAE's 100-step AP within 10k steps on hemibrain, fish2 or
-Kasthuri; the long-AP gap at 10k (all four pretrained encoders) is 0.12 on average at 128^3, against 0.02-0.05 at 512^3 and
-whole blocks. At 128^3 pretrained fits peak early (MAE at a median 800 steps) and then overfit: their best point beats random's
-best by about as much as at 10k.</li>
-<li><b>Kasthuri15 gains the most</b>, from encoders that never saw it (all but lmd4 are hemibrain-only): +0.19-0.21 short and
-+0.17-0.20 long AP for MAE at 256^3 and 10k steps. <b>LICONN gains least</b> (short within 0.05), and the lmd4 encoder, the
-only one that saw LICONN data, is not clearly better there than the same recipe on hemibrain alone (within +-0.025 at 10k).</li>
+<li><b>Fit compute closes most of it, not all.</b> On hemibrain EB, at 512^3 and at the whole 896^3 block (712M labelled
+voxels), random reaches MAE's 100-step AP after 400 (short) and 1600 (long) steps. At 10k MAE still leads by 0.016-0.040 short
+and 0.012-0.028 long, and on the whole block frozen random has flattened (short 0.353 at 6.4k steps, 0.355 at 10k) while MAE
+still rises (0.388, 0.395): more steps alone may not close it.</li>
+<li><b>GT closes it up to a point.</b> The long-AP gap at 10k (all four pretrained encoders) is 0.12 at 128^3, 0.07 at 256^3,
+0.04 at 512^3 and 0.05 on whole blocks; short 0.04-0.045 at 128-256^3, 0.03-0.04 above. At 128^3 random never reaches MAE's
+100-step AP within 10k steps on hemibrain, fish2 or Kasthuri, and pretrained fits peak early (MAE at a median 800 steps) and
+then overfit: their best point beats random's best by about as much as at 10k.</li>
+<li><b>Kasthuri15 gains the most and keeps it</b>, from encoders that never saw it (all but lmd4 are hemibrain-only): on its
+whole block (360 x 768 x 768) MAE leads by +0.26 (frozen) and +0.18 (trained) short AP at 10k, and it is where MAE is furthest
+ahead of masked tokens (+0.13-0.16 short from 512^3 up). <b>LICONN gains least</b>: on its whole block a frozen MAE ties random
+(-0.005 short, -0.017 long), and the lmd4 encoder, the only one that saw LICONN data, is not clearly better there than the same
+recipe on hemibrain alone (within +-0.025 at 10k).</li>
 <li><b>Ranking: MAE > masked 64 = masked 64 on lmd4 > views > random</b>, by every summary in Encoder ranking. The views
-encoder's gap is mostly gone by 10k steps (positive in 13 of 24 short cells).</li>
-<li><b>Training the encoder with the decoder adds little</b> at these GT sizes: 10k-step AP trained minus frozen is -0.003 to
-+0.026 short per encoder, and random encoders gain nothing from it (+0.006 at view 64, -0.002 at 96). The decoder does the
-fitting.</li>
+encoder's gap is mostly gone by 10k steps (positive in 17 of 32 short cells).</li>
+<li><b>Training the encoder with the decoder adds little</b>: 10k-step AP trained minus frozen averages +0.002 (MAE) to +0.026
+(masked 64) short, and +0.006 / +0.017 for the random encoders at views 96 / 64. The decoder does the fitting.</li>
 <li><b>The encoders reproduce</b> on their linear probes (Encoders): MAE 0.297 / 0.877 short / long AP (e08: 0.296 / 0.869)
 and masked 64 0.203 / 0.858 (e06: 0.205 / 0.847), in 1.5-1.9x those runs' steps; views probes better than e06's (0.176 /
 0.616 against 0.113 / 0.544) in half its steps; masked 64 on lmd4 reaches 0.211 / 0.847 on EB, level with hemibrain alone.</li>
 </ul>
 <p><b>Caveats.</b> One seed per cell: fish2's curves move by up to 0.05 between doubling steps, so read sub-0.03 gaps as ties.
 A fit step at view 96 decodes 3.4x the voxels of one at view 64, so steps compare within an encoder's pair, not across views.
-Best-of-curve numbers pick the step on the test blocks themselves. The whole-block fits of hemibrain EB, LICONN and
-Kasthuri15 (and Kasthuri's 512^3) are missing, so the large-GT end rests on hemibrain and LICONN at 512^3 and fish2.</p>
-<p><b>Next.</b> Rerun the 48 failed fits (fixed), then larger GT on hemibrain (several 896^3 blocks: the regime where random
-should catch up), 2-3 seeds at the closing cells, and the gap as a function of pretraining compute (keep the milestones).</p>"""
+Best-of-curve numbers pick the step on the test blocks themselves. Whole blocks differ by set (896^3 on EB and fish2, 600 x 592
+x 592 on LICONN, 360 x 768 x 768 on Kasthuri). The 48 largest fits (the whole blocks of EB, LICONN and Kasthuri, and Kasthuri's
+512^3) failed writing their results the first time and were rerun (retryall) from the fix's commit, with the same fit code.</p>
+<p><b>Next.</b> 2-3 seeds at the cells where the gap is near zero (EB and LICONN, whole blocks); longer fits (30k steps) on
+the whole blocks, to see whether random's plateau below MAE holds; GT beyond one block on EB (several 896^3 blocks); and the gap
+as a function of pretraining compute (keep the milestones).</p>"""
 
 
 def existing(path: Path) -> list:
@@ -166,12 +170,9 @@ def build() -> tuple:
                             pi.table(["run", "encoder", "set", "mode", "side", "labelled", SHORT, LONG, "minutes"],
                                      [[f["run"].name, *k, f["labelled"], f["curve"][10000][SHORT], f["curve"][10000][LONG], f["minutes"]]
                                       for k, f in done.items()]))]),
-        ("Missing runs", [(f"{len(missing)} finetunes without results",
-                           "<p>Each ran its 10k steps, then failed writing finetune.json: its fit block's size was numpy integers wherever the "
-                           "block is smaller than the side asked for (the whole blocks of hemibrain EB, LICONN and Kasthuri15, and Kasthuri's "
-                           "512^3, whose z is 362), which json can't write. fish2's block is larger than every side, so all of its ran.</p>"
-                           + pi.table(["run", "encoder", "set", "mode", "side"], missing))]),
     ]
+    if missing:  # queued, running or failed: retryall reruns the failed
+        sections.append(("Missing runs", [(f"{len(missing)} finetunes without results", pi.table(["run", "encoder", "set", "mode", "side"], missing))]))
     return tiles, sections
 
 

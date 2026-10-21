@@ -185,6 +185,32 @@ def test_a_shifted_targets_centres_fall_in_the_context_cube():
         assert ((c >= lo - 0.5) & (c < lo + 3 - 0.5)).all()  # token j spans [j - 1/2, j + 1/2) of the context's grid
 
 
+def test_expand_hides_every_voxel_of_the_masked_target_tokens():
+    torch.manual_seed(0)
+    mask = MaskConfig(block=0.5, shift=8, expand=True)
+    model = Lejepa(TINY, view=ViewConfig(views="displace", global_size=(32, 32, 32)), mask=mask)
+    grid, p = (6, 6, 6), 4
+    offset = torch.randint(-8, 9, (64, 3))
+    visible, masked, _ = model.mask_block(grid, offset)
+    assert visible.shape == (64, 216 - 4 ** 3) and masked.shape == (64, 27)  # one token more per axis hidden, same targets
+    k = torch.stack([masked // 36, masked // 6 % 6, masked % 6], dim=-1)
+    for v, kk, o in zip(visible, k, offset):
+        hidden = torch.tensor(sorted(set(range(216)) - set(v.tolist())))
+        h = torch.stack([hidden // 36, hidden // 6 % 6, hidden % 6], dim=-1)
+        span = lambda t: (t.min(0).values * p, (t.max(0).values + 1) * p)  # voxels of the context's grid
+        (h_lo, h_hi), (t_lo, t_hi) = span(h), span(kk)
+        assert ((h_lo <= (t_lo + o).clamp(min=0)) & (h_hi >= (t_hi + o).clamp(max=24))).all()  # the part in the context view
+
+
+def test_aligned_views_are_a_whole_number_of_tokens_apart():
+    torch.manual_seed(0)
+    model = Lejepa(TINY, view=ViewConfig(views="displace", global_size=(24, 24, 24)), mask=MaskConfig(shift=8, aligned=True))
+    offsets, mask_block = [], model.mask_block
+    model.mask_block = lambda grid, offset: offsets.append(offset) or mask_block(grid, offset)
+    assert torch.isfinite(model(torch.randn(64, 1, 24, 24, 24)).loss)
+    assert (offsets[0] % 4 == 0).all() and offsets[0].abs().max() == 8 and (offsets[0] != 0).any()
+
+
 def test_sincos_at_integer_coords_is_the_grid_embedding():
     coords = torch.stack(torch.meshgrid(*[torch.arange(n) for n in (3, 4, 5)], indexing="ij"), dim=-1).reshape(-1, 3)
     torch.testing.assert_close(sincos_at(coords, 50), get_3d_sincos_pos_embed(50, (3, 4, 5))[0])
