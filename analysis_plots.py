@@ -74,7 +74,7 @@ def bench(sweep: str, *compare: str) -> list:
 
 def probe_table(sweep: str) -> list:
     """One row per run with a probe.json: config, the pretraining checkpoint step it probed, how many steps the
-    linear probe itself trained for (probe_fit.json, fixed at fit_probe's STEPS unless a run crashed mid-fit) and
+    linear probe itself trained for (probe_fit.json, fixed at lib.probe.FIT_STEPS unless a run crashed mid-fit) and
     its own walltime (probe_walltime_s: excludes pretraining), test-block boundary AP (mean of the 3 short-range
     channels, then each short and long channel) and mean short-range BCE. Higher AP is better; compare against a
     near-random encoder's run (e.g. probe-test/d1). Also results/<sweep>/probe.csv."""

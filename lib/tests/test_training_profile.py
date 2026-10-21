@@ -85,7 +85,7 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
     params = experiment.Train(
         savedir=str(tmp_path), patch_size=(8, 8, 8), batch_size=2,
         steps_per_epoch=n_steps, warmup_steps=1, benchmark_steps=2, profile_steps=profile_steps,
-        n_workers=1, defer_image_ops=False,  # synthetic dataset yields finished float images
+        n_workers=0, defer_image_ops=False,  # synthetic dataset yields finished float images; loaded in-process (no worker startup)
     )
     patch_experiment(monkeypatch, tmp_path, params)
     consumed = []
@@ -133,7 +133,7 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
 @pytest.mark.parametrize("objective", ["views", "mae"])
 def test_each_objective_trains_logs_its_terms_and_reloads_for_eval(tmp_path, monkeypatch, objective):
     params = experiment.Train(savedir=str(tmp_path), objective=objective, patch_size=(8, 8, 8), batch_size=2, steps_per_epoch=3,
-                              warmup_steps=1, benchmark_steps=1, profile_steps=0, n_workers=1, defer_image_ops=False)
+                              warmup_steps=1, benchmark_steps=1, profile_steps=0, n_workers=0, defer_image_ops=False)
     patch_experiment(monkeypatch, tmp_path, params)
     experiment.train(params)
     metrics = [json.loads(line) for line in (tmp_path / "metrics.json").read_text().splitlines()]
@@ -158,7 +158,7 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
     run.mkdir(parents=True)
     params = experiment.Train(
         savedir="outdir/e00/e01-test/d0/", patch_size=(8, 8, 8), batch_size=2, steps_per_epoch=6,
-        warmup_steps=1, benchmark_steps=2, profile_steps=0, n_workers=1, defer_image_ops=False,
+        warmup_steps=1, benchmark_steps=2, profile_steps=0, n_workers=0, defer_image_ops=False,
         compile=False,  # eager on CPU, so the replay below must reproduce the step's loss exactly
     )
     patch_experiment(monkeypatch, tmp_path, params)
@@ -197,9 +197,10 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
 def test_a_trunk_evaluates_each_milestone_and_an_anneal_continues_one(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")
+    monkeypatch.setattr(experiment, "LR_WARMUP", 100)  # a short warmup, so a short trunk gets past it
     src = experiment.Train(
-        savedir="outdir/e00/e01-test/d0/", patch_size=(8, 8, 8), batch_size=2, steps_per_epoch=1300, max_hours=1.0,  # past LR_WARMUP
-        warmup_steps=1, benchmark_steps=2, profile_steps=0, n_workers=1, defer_image_ops=False, compile=False,
+        savedir="outdir/e00/e01-test/d0/", patch_size=(8, 8, 8), batch_size=2, steps_per_epoch=130, max_hours=1.0,  # past LR_WARMUP
+        warmup_steps=1, benchmark_steps=2, profile_steps=0, n_workers=0, defer_image_ops=False, compile=False,
     )
     patch_experiment(monkeypatch, tmp_path, src)
     experiment.dump(src)  # as submit() does: the trunk was submitted
@@ -209,17 +210,17 @@ def test_a_trunk_evaluates_each_milestone_and_an_anneal_continues_one(tmp_path, 
         monkeypatch.setattr(experiment, fn, lambda job, fn=fn: evals.append((fn, job, Path(job.init_from).is_file())))
     experiment.train(src)
 
-    steps = range(130, 1301, 130)
+    steps = range(13, 131, 13)
     assert evals == [(fn, experiment.eval_params(src, s), True) for s in steps for fn in ("pca", "probe")]  # the last once only
     assert all(experiment.load(f"{experiment.branch_dir(src, s)}eval.json", experiment.Eval) == experiment.eval_params(src, s) for s in steps)  # for `lsf probe`
     ckdir = Path(src.savedir) / "checkpoints"
-    assert [p.name for p in ckdir.glob("step_*.pt")] == ["step_0001300.pt"]  # rolling: the newest only
+    assert [p.name for p in ckdir.glob("step_*.pt")] == ["step_0000130.pt"]  # rolling: the newest only
     assert [p.name for p in sorted((ckdir / "milestones").glob("*.pt"))] == [f"step_{s:07d}.pt" for s in steps]  # the evals were stubs: none released
     trunk = [json.loads(line) for line in (Path(src.savedir) / "metrics.json").read_text().splitlines()]
-    assert all(r["lr"] == pytest.approx(src.lr * min(1, (r["idx_step"] + 2) / 1000)) for r in trunk)  # warmup, then constant, no decay
+    assert all(r["lr"] == pytest.approx(src.lr * min(1, (r["idx_step"] + 2) / 100)) for r in trunk)  # warmup, then constant, no decay
     assert trunk[-1]["lr"] == src.lr
 
-    par = replace(src, savedir=experiment.branch_dir(src, 1170), steps_per_epoch=117, anneal_from=str(experiment.milestone(src, 1170)))
+    par = replace(src, savedir=experiment.branch_dir(src, 117), steps_per_epoch=12, anneal_from=str(experiment.milestone(src, 117)))
     experiment.train(str(experiment.dump(par)))  # as its LSF job would: from its spec file
     start = torch.load(par.anneal_from, weights_only=False)
     metrics = [json.loads(line) for line in (Path(par.savedir) / "metrics.json").read_text().splitlines()]
@@ -227,13 +228,13 @@ def test_a_trunk_evaluates_each_milestone_and_an_anneal_continues_one(tmp_path, 
     assert lr0 == src.lr and metrics[0]["lr"] <= lr0 and metrics[-1]["lr"] == pytest.approx(0.01 * lr0)  # trunk's lr down to 1%
     done = torch.load(sorted((Path(par.savedir) / "checkpoints").glob("step_*.pt"))[-1], weights_only=False)
     assert not (Path(par.savedir) / "checkpoints/milestones").exists() and len(evals) == 20  # an anneal has no milestones
-    assert done["step"] == 117 and done["opt"]["state"][0]["step"] == 1170 + 117  # Adam's step count carried over
+    assert done["step"] == 12 and done["opt"]["state"][0]["step"] == 117 + 12  # Adam's step count carried over
 
 
 def test_a_milestone_eval_neither_stops_nor_steers_training(tmp_path, monkeypatch):
     params = experiment.Train(
         patch_size=(8, 8, 8), batch_size=2, steps_per_epoch=21, milestone_every=10,
-        warmup_steps=1, benchmark_steps=2, profile_steps=0, n_workers=1, defer_image_ops=False, compile=False,
+        warmup_steps=1, benchmark_steps=2, profile_steps=0, n_workers=0, defer_image_ops=False, compile=False,
     )
     patch_experiment(monkeypatch, tmp_path, params)
     losses, calls = {}, []
@@ -403,7 +404,7 @@ def test_train_volumes_weigh_a_joint_sets_families_equally():
 def test_benchmark_times_and_profiles_the_training_step_only(tmp_path, monkeypatch):
     params = experiment.Train(
         savedir=str(tmp_path), patch_size=(8, 8, 8), batch_size=2, steps_per_epoch=1000, max_hours=1.0,
-        warmup_steps=1, benchmark_steps=2, profile_steps=2, n_workers=1, defer_image_ops=False,
+        warmup_steps=1, benchmark_steps=2, profile_steps=2, n_workers=0, defer_image_ops=False,
     )
     patch_experiment(monkeypatch, tmp_path, params)
     experiment.benchmark(params)

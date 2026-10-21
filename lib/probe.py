@@ -8,6 +8,7 @@ from torch import Tensor, nn
 # mia-evals' neuron-instance affinity channels (its src/postprocess/mws.py SHORT_OFFSETS + LONG_OFFSETS), in the
 # store's x y z axes: channel c at voxel p is 1 if p and p + offset_c belong to the same object.
 AFFINITY_OFFSETS_XYZ = [(1, 0, 0), (0, 1, 0), (0, 0, 1), (10, 0, 0), (0, 10, 0), (0, 0, 10)]
+FIT_STEPS = 3000  # fit_probe's Adam steps
 
 def affinities(labels: Tensor, offsets: list[tuple[int, ...]], sparse: bool = False) -> tuple[Tensor, Tensor]:
     """labels: Z Y X instance ids (0 = unlabelled); offsets: per channel (dz, dy, dx), all >= 0.
@@ -43,7 +44,7 @@ def fit_probe(feats: Tensor, targets: Tensor, valid: Tensor,
     Also returns the fit curve, every 100 steps: the batch loss, and on held (feats, targets, valid of held-out
     tokens) the BCE and the AP of predicting target 0 (for affinities: boundary, different objects). Monitoring only.
     """
-    STEPS, BATCH, LR = 3000, 4096, 1e-3
+    BATCH, LR = 4096, 1e-3
     head = nn.Linear(feats.shape[1], targets.shape[1]).to(feats.device)
     opt = torch.optim.Adam(head.parameters(), lr=LR)
     g = torch.Generator(device=feats.device).manual_seed(0)
@@ -52,7 +53,7 @@ def fit_probe(feats: Tensor, targets: Tensor, valid: Tensor,
         entries = held[2].nonzero()
         entries = entries[torch.randperm(len(entries), device=entries.device, generator=g)[:2_000_000]]
     curve = []
-    for step in range(STEPS):
+    for step in range(FIT_STEPS):
         i = torch.randint(len(feats), (BATCH,), device=feats.device, generator=g)
         w = valid[i].float()
         loss = F.binary_cross_entropy_with_logits(head(feats[i].float()), targets[i].float(), weight=w, reduction="sum")
@@ -60,7 +61,7 @@ def fit_probe(feats: Tensor, targets: Tensor, valid: Tensor,
         loss.backward()
         opt.step()
         opt.zero_grad(set_to_none=True)
-        if step % 100 == 0 or step == STEPS - 1:
+        if step % 100 == 0 or step == FIT_STEPS - 1:
             row = {"step": step, "loss": loss.item()}
             if held is not None and entries is not None:
                 with torch.no_grad():  # the head on all held-out tokens once (a few k x K), then the sampled entries

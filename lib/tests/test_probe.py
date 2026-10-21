@@ -9,6 +9,7 @@ import torch
 import zarr
 
 import experiment
+import lib.probe
 from lib.encoders import EncoderConfig
 from lib.models import Lejepa, LejepaConfig, ProjectorConfig
 from lib.probe import AFFINITY_OFFSETS_XYZ, affinities, average_precision, fit_probe, to_tokens, to_voxels
@@ -40,6 +41,7 @@ def synthetic_store(tmp_path, monkeypatch, sets=None):
     monkeypatch.setattr(experiment, "volume_grid", lambda vol: (np.array([8.0, 8.0, 8.0]), np.array([64, 64, 64])))
     monkeypatch.setattr(experiment, "read_window", read_window)
     monkeypatch.setattr(experiment, "code_provenance", lambda: {"commit_id": "test"})
+    monkeypatch.setattr(lib.probe, "FIT_STEPS", 300)  # the linear probe's fit: plenty for the store's one split
 
 
 def test_affinities_mark_the_split_between_two_objects():
@@ -119,7 +121,7 @@ def test_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch, score):
     else:
         assert not (tmp_path / "run/probe").exists()  # nobody scores this run: GBs of artifacts nobody reads
     fit = [json.loads(l) for l in (tmp_path / "run/probe_fit.json").read_text().splitlines()]
-    assert fit[0]["step"] == 0 and fit[-1]["step"] == 2999 and all(f["tbl"] == "probe_fit" for f in fit)
+    assert fit[0]["step"] == 0 and fit[-1]["step"] == 299 and all(f["tbl"] == "probe_fit" for f in fit)
     assert all(0 <= f["held_boundary_ap"] <= 1 and f["held_bce"] > 0 for f in fit)
 
 
@@ -133,7 +135,7 @@ def test_finetune_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch, freeze,
     config = lib.decoders.UnetrConfig
     monkeypatch.setattr(lib.decoders, "UnetrConfig", lambda out_dim: config(out_dim=out_dim, hidden_dim=8))
     par = experiment.Finetune(savedir=str(tmp_path / "run"), train=experiment.Train(global_size=(24, 24, 24)), fit_side=fit_side,
-                              steps=250, freeze_encoder=freeze)
+                              steps=150, freeze_encoder=freeze)
     spec = experiment.dump(par)  # as submit writes it
     model = Lejepa(TINY, encoder=EncoderConfig(depth=2, embed_dim=16, num_heads=2, patch_size=(2, 2, 2)))
     before = {k: v.clone() for k, v in model.encoder.state_dict().items()}
@@ -143,7 +145,7 @@ def test_finetune_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch, freeze,
     assert experiment.load(str(spec), experiment.Finetune) == par  # its results didn't overwrite its spec
     data, *curve = [json.loads(l) for l in (tmp_path / "run/finetune_curve.json").read_text().splitlines()]
     assert data == {"tbl": "finetune_data", "step": 7, "fit_size": [size] * 3, "fit_labelled": size ** 3, "test_blocks": ["hemibrain_eb_test"]}
-    assert [c["step"] for c in curve] == [100, 200, 250] and all(c["tbl"] == "finetune" for c in curve)
+    assert [c["step"] for c in curve] == [100, 150] and all(c["tbl"] == "finetune" for c in curve)
     for c in curve:  # every one a doubling step or the last: the test block scored, as probe.json has it
         assert 0 <= c["boundary_ap_short"] <= 1 and abs(c["boundary_frac_(1, 0, 0)"] - 1 / 31) < 0.003 and c["boundary_frac_(0, 1, 0)"] == 0
     assert (tmp_path / "run/finetune.png").is_file()

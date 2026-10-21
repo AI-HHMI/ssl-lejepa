@@ -449,9 +449,9 @@ def dataloader(par: Train):
       batch_size=par.batch_size,
       num_workers=par.n_workers,
       collate_fn=collate_deferred if par.defer_image_ops else collate_images,
-      prefetch_factor=par.prefetch_factor,
+      prefetch_factor=par.prefetch_factor if par.n_workers else None,  # n_workers 0 (tests): loads in this process, no workers
       pin_memory=torch.cuda.is_available(),
-      multiprocessing_context="spawn",
+      multiprocessing_context="spawn" if par.n_workers else None,
     )
     batches = iter(loader)
     # pprint(volumes)
