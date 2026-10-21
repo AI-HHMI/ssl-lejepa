@@ -112,31 +112,34 @@ def test_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch, score):
     assert all(0 <= f["held_boundary_ap"] <= 1 and f["held_bce"] > 0 for f in fit)
 
 
-def test_unetr_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch):
-    # Same synthetic store, boxes and context padding as the linear probe's end-to-end test above (32^3 boxes ->
-    # 48^3 of context at global_size=24): only the decoder and the tiny encoder's patch_size/depth differ, since
-    # Unetr needs at least one block per upsample stage (num_stages = log2(patch_size); patch_size=2 -> 1 stage).
+@pytest.mark.parametrize("freeze", [True, False])
+def test_finetune_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch, freeze):
+    # The linear probe's synthetic store and boxes, a fit cube of 24 (of its 32^3 train box) and global_size=24 crops. The
+    # tiny encoder has patch 2, since Unetr needs one block per upsample stage (log2(patch_size)), and a narrow decoder.
+    import lib.decoders
     synthetic_store(tmp_path, monkeypatch)
-    par = experiment.Eval(savedir=str(tmp_path / "run"), train=experiment.Train(global_size=(24, 24, 24)),
-                          decoder="unetr", unetr_hidden_dim=8, unetr_steps=20, score=True)
+    config = lib.decoders.UnetrConfig
+    monkeypatch.setattr(lib.decoders, "UnetrConfig", lambda out_dim: config(out_dim=out_dim, hidden_dim=8))
+    par = experiment.Finetune(savedir=str(tmp_path / "run"), train=experiment.Train(global_size=(24, 24, 24)), fit_side=24, steps=250,
+                              freeze_encoder=freeze)
     (tmp_path / "run").mkdir()
-    monkeypatch.setattr(experiment, "HEMIBRAIN_EB_LABELS", "labels/cells")
     model = Lejepa(TINY, encoder=EncoderConfig(depth=2, embed_dim=16, num_heads=2, patch_size=(2, 2, 2)))
+    before = {k: v.clone() for k, v in model.encoder.state_dict().items()}
     monkeypatch.setattr(experiment, "load_checkpoint", lambda p: (model.eval(), 7))
-    experiment.probe(par)
+    experiment.finetune(par)
 
-    stats = json.loads((tmp_path / "run/probe.json").read_text())
-    assert stats["step"] == 7 and 0 <= stats["boundary_ap_short"] <= 1
-    frac = [stats[f"boundary_frac_{o}"] for o in AFFINITY_OFFSETS_XYZ[:3]]
-    assert abs(frac[0] - 1 / 31) < 0.003 and frac[1] == frac[2] == 0
-    art = zarr.open_array(str(tmp_path / "run/probe/test/hemibrain_eb_test.zarr"), mode="r")
-    assert dict(art.attrs)["origin"] == [24, 20, 24] and dict(art.attrs)["convention"] == "sigmoid(logit), unetr decoder"
-    arr = np.asarray(art[:])
-    assert arr.shape == (6, 32, 32, 32) and 0 <= arr.min() and arr.max() <= 1  # tiled over the 48^3 padded region, then trimmed
-    assert (tmp_path / "run/probe.png").is_file() and (tmp_path / "run/probe/fit/hemibrain_eb_fit.zarr").is_dir()
-    fit = [json.loads(l) for l in (tmp_path / "run/probe_fit.json").read_text().splitlines()]
-    assert fit[0]["step"] == 0 and fit[-1]["step"] == 19 and all(f["tbl"] == "probe_fit" for f in fit)
-    assert all(0 <= f["held_boundary_ap"] <= 1 and f["held_bce"] > 0 for f in fit)
+    data, *curve = [json.loads(l) for l in (tmp_path / "run/finetune.json").read_text().splitlines()]
+    assert data == {"tbl": "finetune_data", "step": 7, "fit_size": [24, 24, 24], "fit_labelled": 24 ** 3, "test_blocks": ["hemibrain_eb_test"]}
+    assert [c["step"] for c in curve] == [100, 200, 250] and all(c["tbl"] == "finetune" for c in curve)
+    for c in curve:  # every one a doubling step or the last: the test block scored, as probe.json has it
+        assert 0 <= c["boundary_ap_short"] <= 1 and abs(c["boundary_frac_(1, 0, 0)"] - 1 / 31) < 0.003 and c["boundary_frac_(0, 1, 0)"] == 0
+    assert (tmp_path / "run/finetune.png").is_file()
+    moved = any(not torch.equal(v, before[k]) for k, v in model.encoder.state_dict().items())
+    assert moved != freeze  # the encoder trained with the decoder only when not frozen
+    with pytest.raises(AssertionError, match="whole patches"):
+        experiment.finetune(experiment.Finetune(savedir=par.savedir, train=par.train, fit_side=25))
+    with pytest.raises(AssertionError, match="smaller than a crop"):
+        experiment.finetune(experiment.Finetune(savedir=par.savedir, train=par.train, fit_side=16))
 
 
 def test_probe_on_another_set_averages_its_test_blocks(tmp_path, monkeypatch):

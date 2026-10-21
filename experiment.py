@@ -181,18 +181,30 @@ class Train:
 
 @dataclass(slots=True)
 class Eval:
-    """The spec of pca, probe and score: one set of weights, in the architecture of the run that made them. A run's own
-    end-of-training eval (own_eval), a trunk milestone's (eval_params), or an older run's or untrained weights."""
+    """The spec of pca, probe and score: one set of weights, in the architecture of the run that made them, measured as they
+    are (frozen; the probe fits only a per-token Linear). A run's own end-of-training eval (own_eval), a trunk milestone's
+    (eval_params), or an older run's or untrained weights. Training anything bigger on labels is a Finetune."""
     savedir: str
     train: Train  # the run the weights are of: its architecture, its view size (the tiles pca and probe encode), its queue
     init_from: str = ""  # the weights: "" train's own latest checkpoint; a run dir, its latest; a checkpoint .pt; "random" untrained
-    decoder: Decoder = "linear"  # probe(): "linear" (per-token Linear, lib.probe.fit_probe) or "unetr" (lib.decoders.unetr)
-    unetr_hidden_dim: int = 64  # decoder="unetr": its decoder channel width (lib.decoders.unetr.UnetrConfig)
-    unetr_steps: int = 3000  # decoder="unetr": fit_unetr training steps (fit_probe's STEPS, for comparison)
-    unetr_freeze_encoder: bool = True  # decoder="unetr": keep the encoder frozen while fitting it (fair vs. the linear probe)
     score: bool = False  # probe() also writes the affinity artifacts `score` reads (probe/{fit,test}, GBs each; score deletes them after)
     jobs: tuple[str, ...] = ("pca", "probe")  # the entrypoints start() submits for it
     probe_on: str = "hemibrain_eb"  # probe(): the lib.data.PROBE_SETS it fits on and is scored on
+
+@dataclass(slots=True)
+class Finetune:
+    """The spec of finetune: a dense decoder (lib.decoders.unetr.Unetr) trained on a probe set's GT affinities on top of one
+    set of weights, frozen or trained with it, and scored on the set's test blocks as it trains: AP against fit compute
+    (steps) at one amount of GT (fit_side)."""
+    savedir: str
+    train: Train  # the weights' run, as Eval.train: its architecture, and its view size (the crops the decoder fits and predicts on)
+    init_from: str = ""  # the weights, as Eval.init_from ("random": the from-scratch baseline)
+    probe_on: str = "hemibrain_eb"  # the lib.data.PROBE_SETS whose train block it fits and whose test blocks score it
+    fit_side: int = 0  # >0: fit on a cube of this side (8 nm voxels) about the train block's centre, not all of it (less GT)
+    steps: int = 10_000  # fit steps (lib.decoders.unetr.fit_unetr, batch 4), scored at 100, 200, 400, ... and the last
+    freeze_encoder: bool = True  # False: train the encoder with the decoder (end-to-end finetuning)
+
+Spec = Train | Eval | Finetune  # a job's spec: what roots() lists and start() submits
 
 @dataclass(slots=True)
 class Rank:
@@ -212,7 +224,7 @@ class Rank:
 # This experiment's id (README: experiment ids): its roots are outdir/<EXPERIMENT>/d<i>/, a trunk's branches in its own dir.
 EXPERIMENT = "e00/e09-data-transfer"
 
-def roots() -> list[Train | Eval]:
+def roots() -> list[Spec]:
     """This experiment: the runs it starts from nothing (trunks, other training runs, evals of another experiment's weights).
     Each trunk evaluates its own milestones as it saves them (eval_milestone)."""
     # Does pretraining on one kind of data transfer to others, and does training on all of them jointly cost any? The four
@@ -226,7 +238,7 @@ def roots() -> list[Train | Eval]:
     BATCH, STEPS, HOURS, VIEW, SHIFT, SIDE, GRID = 32, 2_560_000, 4, 96, 32, 3, 12
     families: list[TrainData] = ["hemibrain_wide", "fish2", "liconn_mouse", "microns", "lmd4"]
     sets = ("hemibrain_eb", "fish2", "liconn_mouse", "kasthuri15")
-    runs: list[Train | Eval] = []
+    runs: list[Spec] = []
     for data in families:
         p = Train()
         p.savedir = f"outdir/{EXPERIMENT}/d{len(runs)}/"
@@ -292,11 +304,11 @@ def probe_evals(t: Train) -> list[Eval]:
         return [own_eval(t)]
     return [Eval(savedir=f"{t.savedir}probe_{s}/", train=t, probe_on=s) for s in t.probe_sets]
 
-def source(p: Train | Eval) -> str:
-    """The weights p starts from: an anneal's checkpoint (Train.anneal_from), or the ones an eval reads (Eval.init_from)."""
+def source(p: Spec) -> str:
+    """The weights p starts from: an anneal's checkpoint (Train.anneal_from), or the ones an eval or finetune reads (init_from)."""
     return p.anneal_from if isinstance(p, Train) else p.init_from
 
-def milestone_of(p: Train | Eval) -> str:
+def milestone_of(p: Spec) -> str:
     """The milestone checkpoint of this experiment's own trunk that a branch starts from, the one it anneals or evaluates;
     "" for a trunk, and for an eval of another experiment's weights (init_from outside outdir/<EXPERIMENT>/)."""
     return source(p) if source(p).startswith(f"outdir/{EXPERIMENT}/") else ""
@@ -305,7 +317,7 @@ def printparams():
     for p in roots():
         pprint(p)
 
-def record(par: Train | Eval, fn: str):
+def record(par: Spec, fn: str):
     """Append one row to par.savedir/runs.json: which experiment function ran (fn), its spec (params), code_provenance(),
     argv and LSF job. Written first thing, so even a run that crashes before any results describes itself.
     Repro for the dir's artifacts: that commit + argv. The command that submitted the job is in
@@ -772,8 +784,9 @@ def replay_bad_batch(path: str):
     res["as trained"] = step("as trained", compiled=True)
     return res
 
-def load_checkpoint(e: Eval):
-    """(model on the GPU if any, step) for inference (pca, probe): the weights e.init_from names, in e.train's architecture.
+def load_checkpoint(e: Eval | Finetune):
+    """(model on the GPU if any, step) for inference or finetuning (pca, probe, finetune): the weights e.init_from names, in
+    e.train's architecture.
 
     "" (default): e.train's own latest checkpoint, whose saved params must match e.train. Inference depends on lib/, so
     like training it only runs for this commit's own experiment: for an older sweep, go back to its commit.
@@ -1070,17 +1083,64 @@ def write_affinities(path: Path, array, **attrs):
     store[:] = array
     store.attrs.update(kind="affinity", **attrs)
 
-def probe(job: Eval | str):
-    """Linear or dense (par.decoder) affinity probe of the spec job's weights (or those of the eval.json it names), scored as
-    mia-evals' neuron-instance task: fitted on the train block of its probe set (par.probe_on, lib.data.PROBE_SETS) against
-    its instance labels, scored on its test blocks (averaged). Every block read at 8 nm, as training reads (read_window).
+def inner(x, m, size):
+    """x's (... Z Y X) box of size (Z Y X) at offset m (Z Y X): read_block's box, within its padded region."""
+    return x[..., m[0]:m[0] + size[0], m[1]:m[1] + size[1], m[2]:m[2] + size[2]]
 
-    decoder="linear" (default, lib.probe): frozen encoder, one Linear per token to mia-evals' 6 affinity channels
-      at every voxel of its patch.
-    decoder="unetr" (lib.decoders.unetr): Unetr, with skip connections into the encoder's own intermediate blocks,
-      fitted end to end on crops the same size as the encoder's own training views (par.train.global_size); frozen
-      unless par.unetr_freeze_encoder=False.
-    Either way:
+def read_block(vol: ProbeVolume, tile, p, device, side: int = PROBE_SIDE):
+    """vol's box cut to whole patches (p, Z Y X) at most side a side about its centre, read at 8 nm (read_window) with whole
+    tiles of context around it: (img Z Y X [the padded region, a multiple of tile, on device], labels Z Y X [the box's],
+    m [the box's offset in img, whole patches], size [the box's]). A model tiles img (tile_features, tile_logits); inner(x, m,
+    size) trims what it makes, or img itself (the box's EM), back to the box."""
+    vox, _ = volume_grid(vol)
+    lo, hi = np.array([b[0] for b in vol.box][::-1]), np.array([b[1] for b in vol.box][::-1])  # z y x, level-0 voxels
+    size = [min(s - s % q, side) for s, q in zip(((hi - lo) * vox / 8).astype(int), p)]
+    region = [math.ceil(s / t) * t for s, t in zip(size, tile)]  # whole tiles around the box
+    m = [(r - s) // 2 // q * q for r, s, q in zip(region, size, p)]
+    img, lab = read_window(vol, (lo + hi) / 2, region)
+    return img.to(device), inner(lab, m, size).contiguous().to(device), m, size
+
+def score_block(pred, labels) -> dict:
+    """pred (C Z Y X affinity probabilities) against the affinities of labels (Z Y X instance ids), per channel: BCE, boundary
+    AP (boundary = different objects) and the boundary base rate, on a fixed random subset (at most 10M) of its valid pairs."""
+    import torch
+    from lib.probe import AFFINITY_OFFSETS_XYZ, affinities, average_precision
+    aff, valid = affinities(labels, [o[::-1] for o in AFFINITY_OFFSETS_XYZ])  # x y z offsets; the model sees z y x
+    g = torch.Generator(device=labels.device).manual_seed(0)
+    s = {}
+    for c, o in enumerate(AFFINITY_OFFSETS_XYZ):
+        idx = valid[c].nonzero()
+        idx = idx[torch.randint(len(idx), (min(len(idx), 10_000_000),), device=labels.device, generator=g)]
+        q, t = pred[c][tuple(idx.T)].float(), aff[c][tuple(idx.T)].float()
+        s[f"bce_{o}"] = float(torch.nn.functional.binary_cross_entropy(q.clamp(1e-6, 1 - 1e-6), t))
+        s[f"boundary_ap_{o}"] = average_precision(1 - q, 1 - t)
+        s[f"boundary_frac_{o}"] = float(1 - t.mean())
+    return s
+
+def mean_scores(per_block: list[dict]) -> dict:
+    """score_block's dicts averaged over the test blocks (equally, as lmd_ssl_v1 weights its volumes), plus
+    boundary_ap_short: the mean of the three short-range (+1) channels' AP."""
+    from lib.probe import AFFINITY_OFFSETS_XYZ
+    s = {k: sum(b[k] for b in per_block) / len(per_block) for k in per_block[0]}
+    s["boundary_ap_short"] = sum(s[f"boundary_ap_{o}"] for o in AFFINITY_OFFSETS_XYZ[:3]) / 3
+    return s
+
+def boundary_png(path: Path, em, labels, pred):
+    """A block's middle z: EM | true boundaries | predicted boundaries (1 - min of the 3 short-range affinities)."""
+    import torch
+    from PIL import Image
+    from lib.probe import AFFINITY_OFFSETS_XYZ, affinities
+    zm = labels.shape[0] // 2
+    aff, _ = affinities(labels[zm:zm + 2], [o[::-1] for o in AFFINITY_OFFSETS_XYZ[:3]])  # short range: the next slice is enough
+    row = [em[zm], 1 - aff[:, 0].float().amin(0), 1 - pred[:3, zm].float().amin(0)]
+    gap = torch.ones(row[0].shape[0], 8, device=em.device)
+    Image.fromarray((torch.cat([row[0], gap, row[1], gap, row[2]], 1) * 255).byte().cpu().numpy()).save(path)
+
+def probe(job: Eval | str):
+    """Linear affinity probe (lib.probe) of the spec job's weights (or those of the eval.json it names), frozen: one Linear per
+    token to mia-evals' 6 affinity channels at every voxel of its patch, fitted on the train block of its probe set
+    (par.probe_on, lib.data.PROBE_SETS) against its instance labels, scored on its test blocks (averaged) as mia-evals'
+    neuron-instance task. Every block read at 8 nm, as training reads (read_block).
       savedir/probe.json          test-block BCE and boundary AP per channel (cheap, immediate)
       savedir/probe_fit.json      the fit curve every 100 steps: training loss, and BCE and boundary AP on a
                                   fixed held-out sample (monitoring only, nothing selects on it)
@@ -1092,10 +1152,8 @@ def probe(job: Eval | str):
     Reads get whole tiles of context (the training view, tile) around each block (at most PROBE_SIDE a side), as in
     training; where a block's context leaves its volume, the image is edge-replicated.
     """
-    import math
     import torch
-    from PIL import Image
-    from lib.probe import AFFINITY_OFFSETS_XYZ, affinities, average_precision, fit_probe, to_tokens, to_voxels
+    from lib.probe import AFFINITY_OFFSETS_XYZ, affinities, fit_probe, to_tokens, to_voxels
     par = load(job, Eval)
     tile = par.train.global_size
     model, step = load_checkpoint(par)
@@ -1103,122 +1161,111 @@ def probe(job: Eval | str):
     encoder, device = model.encoder, next(model.parameters()).device
     p = encoder.patch_embed.patch_size
     sets = PROBE_SETS[par.probe_on]
-    b1 = par.decoder == "linear" and not par.score
-    b2 = par.probe_on == "hemibrain_eb"
-    assert b1 or b2, f"{par.savedir}: unetr and score are hemibrain_eb's (its artifacts and boxes), not {par.probe_on}'s"
+    assert not par.score or par.probe_on == "hemibrain_eb", f"{par.savedir}: score is hemibrain_eb's (its artifacts and boxes), not {par.probe_on}'s"
     assert len(sets["train"]) == 1, f"{par.probe_on}: the probe fits on one block"
+    assert len(set(p)) == 1, f"patch {p} must be cubic"
     offsets = [o[::-1] for o in AFFINITY_OFFSETS_XYZ]  # x y z offsets; the model sees z y x
 
-    def block(vol: ProbeVolume):  # (token features N D, labels Z Y X, EM Z Y X, padded img Z Y X [a multiple of tile],
-        # margin m, box size) for vol's box, cut to whole patches at most PROBE_SIDE a side about its centre, at 8 nm: img/m/size
-        # let a dense model (unetr) tile the padded region (tile_logits needs an exact multiple of tile, unlike em, trimmed to
-        # the box's own size) and then trim its predictions back to the box with the same margin feats are trimmed by, in token space.
-        vox, _ = volume_grid(vol)
-        lo, hi = np.array([b[0] for b in vol.box][::-1]), np.array([b[1] for b in vol.box][::-1])  # z y x, level-0 voxels
-        size = [min(s - s % q, PROBE_SIDE) for s, q in zip(((hi - lo) * vox / 8).astype(int), p)]
-        region = [math.ceil(s / t) * t for s, t in zip(size, tile)]  # whole tiles around the box
-        m = [(r - s) // 2 // q * q for r, s, q in zip(region, size, p)]
-        img, lab = read_window(vol, (lo + hi) / 2, region)
-        img, lab = img.to(device), lab.to(device)
-        feats = tile_features(encoder, img, tile)
-        t0 = [mi // q for mi, q in zip(m, p)]
-        feats = feats[t0[0]:t0[0] + size[0] // p[0], t0[1]:t0[1] + size[1] // p[1], t0[2]:t0[2] + size[2] // p[2]]
-        labels = lab[m[0]:m[0] + size[0], m[1]:m[1] + size[1], m[2]:m[2] + size[2]]
-        em = img[m[0]:m[0] + size[0], m[1]:m[1] + size[1], m[2]:m[2] + size[2]]
-        return feats.reshape(-1, feats.shape[-1]), labels.contiguous(), em, img, m, size
+    def tokens(img, m, size):  # the box's token features, N D
+        f = tile_features(encoder, img, tile)
+        t0, n = [mi // q for mi, q in zip(m, p)], [s // q for s, q in zip(size, p)]
+        return f[t0[0]:t0[0] + n[0], t0[1]:t0[1] + n[1], t0[2]:t0[2] + n[2]].reshape(-1, f.shape[-1])
 
-    assert len(set(p)) == 1, f"patch {p} must be cubic"
-    test_feats, test_labels, test_em, test_img, test_m, test_size = block(sets["test"][0])  # reused below
+    tests = [read_block(v, tile, p, device) for v in sets["test"]]  # (img, labels, m, size) each
+    img, labels, m, size = tests[0]
+    aff, valid = affinities(labels, offsets)
+    feats = tokens(img, m, size)
+    g = torch.Generator(device=device).manual_seed(0)
+    i = torch.randperm(len(feats), device=device, generator=g)[:16384]  # held-out tokens, fit curve only
+    held = (feats[i], to_tokens(aff, p[0])[i], to_tokens(valid, p[0])[i])
+    img, labels, m, size = read_block(sets["train"][0], tile, p, device)
+    aff, valid = affinities(labels, offsets)
+    feats = tokens(img, m, size)
+    del img, labels
+    head, curve = fit_probe(feats, to_tokens(aff, p[0]), to_tokens(valid, p[0]), held)
+    del feats, aff, valid, held
 
-    if par.decoder == "linear":
-        del test_img, test_m, test_size  # only unetr's tiled inference needs the padded region + its trim margin
-        aff, valid = affinities(test_labels, offsets)
-        g = torch.Generator(device=device).manual_seed(0)
-        i = torch.randperm(len(test_feats), device=device, generator=g)[:16384]  # held-out tokens, fit curve only
-        held = (test_feats[i], to_tokens(aff, p[0])[i], to_tokens(valid, p[0])[i])
-        del aff, valid
-        feats, labels, _, _, _, _ = block(sets["train"][0])
-        aff, valid = affinities(labels, offsets)
-        del labels
-        head, curve = fit_probe(feats, to_tokens(aff, p[0]), to_tokens(valid, p[0]), held)
-        del feats, aff, valid, held
+    def predict(img, m, size):  # C Z Y X sigmoid probabilities over the box
+        with torch.no_grad():
+            prob = torch.cat([torch.sigmoid(head(f.float())).half() for f in tokens(img, m, size).split(65536)])
+        return to_voxels(prob, tuple(s // p[0] for s in size), p[0])
 
-        def predict(vol: ProbeVolume):
-            if vol is sets["test"][0]:
-                feats, labels, em = test_feats, test_labels, test_em
-            else:
-                feats, labels, em, _, _, _ = block(vol)
-            with torch.no_grad():
-                prob = torch.cat([torch.sigmoid(head(f.float())).half() for f in feats.split(65536)])
-            return to_voxels(prob, tuple(s // p[0] for s in labels.shape), p[0]), labels, em
-    else:
-        assert par.decoder == "unetr", f"unknown decoder {par.decoder!r}"
-        from lib.decoders import Unetr, UnetrConfig, fit_unetr
-        from lib.decoders.unetr import random_crop
-        del test_feats  # unetr tiles the raw image itself (tile_logits); the linear head's per-token features aren't used
-        unetr = Unetr(encoder, UnetrConfig(out_dim=len(AFFINITY_OFFSETS_XYZ), hidden_dim=par.unetr_hidden_dim)).to(device)
-        if par.unetr_freeze_encoder:
-            encoder.requires_grad_(False)
-        test_aff, test_valid = affinities(test_labels, offsets)
-        g = torch.Generator().manual_seed(0)
-        held = random_crop(test_em[None], test_aff, test_valid, tile, g)  # one crop, monitoring only
-        del test_aff, test_valid
-        _, train_labels, train_em, _, _, _ = block(sets["train"][0])
-        train_aff, train_valid = affinities(train_labels, offsets)
-        del train_labels
-        curve = fit_unetr(unetr, train_em[None], train_aff, train_valid, tile, held, steps=par.unetr_steps)
-        del train_em, train_aff, train_valid, held
+    run_name = "-".join(Path(par.savedir).parts[1:])  # mia-evals row name: letters, digits, _ and - only
 
-        def predict(vol: ProbeVolume):
-            if vol is sets["test"][0]:
-                labels, em, img, m, size = test_labels, test_em, test_img, test_m, test_size
-            else:
-                _, labels, em, img, m, size = block(vol)
-            logits = tile_logits(unetr, img, tile)  # OutDim (padded region) Z Y X
-            pred = torch.sigmoid(logits[:, m[0]:m[0] + size[0], m[1]:m[1] + size[1], m[2]:m[2] + size[2]])
-            return pred, labels, em
+    def artifact(split: str, vol: ProbeVolume, pred):  # for score
+        (x0, _), (y0, _), (z0, _) = vol.box
+        write_affinities(Path(par.savedir) / "probe" / split / f"hemibrain_eb_{split}.zarr", pred.permute(0, 3, 2, 1).cpu().numpy(),
+                         origin=[x0, y0, z0], convention="sigmoid(logit), linear decoder",
+                         run=run_name, step=step, axes="xyz", source_path=vol.path, source_label_key=HEMIBRAIN_EB_LABELS,
+                         native_box=vol.box, scale=[1, 1, 1], annotated_box=HEMIBRAIN_EB_PROBE_ANNOTATED[split], covers_full_box=False)
 
     (Path(par.savedir) / "probe_fit.json").write_text("".join(json.dumps({"tbl": "probe_fit", **c}) + "\n" for c in curve))
-    run_name = "-".join(Path(par.savedir).parts[1:])  # mia-evals row name: letters, digits, _ and - only
-    # Scored on each test block, then averaged over them (equally, as lmd_ssl_v1 weights its volumes). With score, also
-    # hemibrain_eb's mia-evals fit block, whose predictions only feed the artifacts.
-    eb_fit = [ProbeVolume("hemibrain_eb_fit", sets["test"][0].path, sets["test"][0].label_key, HEMIBRAIN_EB_PROBE_BOXES["fit"])]
     per_block = []
-    for split, vol in [("test", v) for v in sets["test"]] + [("fit", v) for v in eb_fit * par.score]:
-        pred, labels, em = predict(vol)  # C Z Y X sigmoid probabilities, Z Y X instance labels, Z Y X EM
-        if split == "test":  # cheap scores, on a fixed random subset of the valid edges
-            s = {}
-            aff, valid = affinities(labels, offsets)
-            g = torch.Generator(device=device).manual_seed(0)
-            for c, o in enumerate(AFFINITY_OFFSETS_XYZ):
-                idx = valid[c].nonzero()
-                idx = idx[torch.randint(len(idx), (min(len(idx), 10_000_000),), device=device, generator=g)]
-                q, t = pred[c][tuple(idx.T)].float(), aff[c][tuple(idx.T)].float()
-                s[f"bce_{o}"] = float(torch.nn.functional.binary_cross_entropy(q.clamp(1e-6, 1 - 1e-6), t))
-                s[f"boundary_ap_{o}"] = average_precision(1 - q, 1 - t)  # boundary = different objects
-                s[f"boundary_frac_{o}"] = float(1 - t.mean())
-            per_block.append(s)
-            # EM | true boundaries | predicted boundaries (1 - min of the 3 short-range affinities), middle z slice
-            zm = labels.shape[0] // 2
-            row = [em[zm], 1 - aff[:3, zm].float().amin(0), 1 - pred[:3, zm].float().amin(0)]
-            gap = torch.ones(row[0].shape[0], 8, device=device)
-            png = "probe.png" if vol is sets["test"][0] else f"probe_{vol.name}.png"
-            Image.fromarray((torch.cat([row[0], gap, row[1], gap, row[2]], 1) * 255).byte().cpu().numpy()).save(Path(par.savedir) / png)
-            del aff, valid
-        box = vol.box
-        (x0, x1), (y0, y1), (z0, z1) = box
+    for k, (vol, (img, labels, m, size)) in enumerate(zip(sets["test"], tests)):
+        pred = predict(img, m, size)
+        per_block.append(score_block(pred, labels))
+        boundary_png(Path(par.savedir) / ("probe.png" if k == 0 else f"probe_{vol.name}.png"), inner(img, m, size), labels, pred)
         if par.score:
-            write_affinities(Path(par.savedir) / "probe" / split / f"hemibrain_eb_{split}.zarr", pred.permute(0, 3, 2, 1).cpu().numpy(),
-                             origin=[x0, y0, z0], convention=f"sigmoid(logit), {par.decoder} decoder",
-                             run=run_name, step=step, axes="xyz", source_path=vol.path, source_label_key=HEMIBRAIN_EB_LABELS,
-                             native_box=box, scale=[1, 1, 1], annotated_box=HEMIBRAIN_EB_PROBE_ANNOTATED[split], covers_full_box=False)
-        del pred, labels, em
+            artifact("test", vol, pred)
+    if par.score:  # also hemibrain_eb's mia-evals fit block, whose predictions only feed the artifacts
+        vol = ProbeVolume("hemibrain_eb_fit", sets["test"][0].path, sets["test"][0].label_key, HEMIBRAIN_EB_PROBE_BOXES["fit"])
+        img, _, m, size = read_block(vol, tile, p, device)
+        artifact("fit", vol, predict(img, m, size))
     stats = {"tbl": "probe", "step": step, "run": run_name, "probe_on": par.probe_on, "test_blocks": [v.name for v in sets["test"]],
-             **{k: sum(s[k] for s in per_block) / len(per_block) for k in per_block[0]}}
-    stats["boundary_ap_short"] = sum(stats[f"boundary_ap_{o}"] for o in AFFINITY_OFFSETS_XYZ[:3]) / 3
+             **mean_scores(per_block)}
     (Path(par.savedir) / "probe.json").write_text(json.dumps(stats) + "\n")
     print(f"{par.savedir}: probe at step {step}: boundary AP (short-range mean) {stats['boundary_ap_short']:.3f}{'; wrote probe/' * par.score}", flush=True)
     release_milestone(par)
+
+def finetune(job: Finetune | str):
+    """A UNETR (lib.decoders.unetr: skip connections into the encoder's own blocks) on the spec job's weights (or those of the
+    finetune.json it names), fitted to mia-evals' 6 affinity channels of its probe set's (par.probe_on) train block, or of the
+    par.fit_side cube about its centre: on crops of the encoder's view size, with the encoder trained too unless
+    par.freeze_encoder, and scored as it fits on the set's test blocks, tiled at that size. Blocks read as probe reads them.
+      savedir/finetune.json   a first row (tbl "finetune_data"): the weights' step, the fit cube's size and labelled voxels (the
+                              GT the fit had), the test blocks. Then the fit curve (tbl "finetune", fit_unetr's): the batch loss
+                              every 100 steps, and at 100, 200, 400, ... steps and the last, the test blocks' scores averaged,
+                              as probe.json has them
+      savedir/finetune.png    test block after the fit, middle z: EM | true boundaries | predicted boundaries
+                              (finetune_<block>.png for any further test blocks)
+    """
+    import torch
+    from lib.decoders import Unetr, UnetrConfig, fit_unetr
+    from lib.probe import AFFINITY_OFFSETS_XYZ, affinities
+    par = load(job, Finetune)
+    tile = par.train.global_size
+    model, step = load_checkpoint(par)
+    record(par, "finetune")
+    encoder, device = model.encoder, next(model.parameters()).device
+    p = encoder.patch_embed.patch_size
+    sets = PROBE_SETS[par.probe_on]
+    side = par.fit_side or PROBE_SIDE
+    assert len(sets["train"]) == 1, f"{par.probe_on}: the fit is on one block"
+    assert side % p[0] == 0, f"{par.savedir}: fit_side {side} must be whole patches of {p[0]}"
+    unetr = Unetr(encoder, UnetrConfig(out_dim=len(AFFINITY_OFFSETS_XYZ))).to(device)
+    encoder.requires_grad_(not par.freeze_encoder)
+    img, labels, m, size = read_block(sets["train"][0], tile, p, device, side)
+    assert all(s >= t for s, t in zip(size, tile)), f"{par.savedir}: the fit cube {size} is smaller than a crop {tile}"
+    aff, valid = affinities(labels, [o[::-1] for o in AFFINITY_OFFSETS_XYZ])  # x y z offsets; the model sees z y x
+    data = {"tbl": "finetune_data", "step": step, "fit_size": size, "fit_labelled": int((labels != 0).sum()),
+            "test_blocks": [v.name for v in sets["test"]]}
+    del labels
+    tests = [read_block(v, tile, p, device) for v in sets["test"]]  # (img, labels, m, size) each
+
+    def predict(img, m, size):  # C Z Y X sigmoid probabilities over the box
+        return torch.sigmoid(inner(tile_logits(unetr, img, tile), m, size)).half()
+
+    def test_scores() -> dict:
+        return mean_scores([score_block(predict(t_img, t_m, t_size), t_labels) for t_img, t_labels, t_m, t_size in tests])
+
+    curve = fit_unetr(unetr, inner(img, m, size)[None], aff, valid, tile, test_scores, steps=par.steps)
+    del img, aff, valid
+    rows = [data] + [{"tbl": "finetune", **c} for c in curve]
+    (Path(par.savedir) / "finetune.json").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    for k, (vol, (img, labels, m, size)) in enumerate(zip(sets["test"], tests)):
+        boundary_png(Path(par.savedir) / ("finetune.png" if k == 0 else f"finetune_{vol.name}.png"), inner(img, m, size), labels, predict(img, m, size))
+    print(f"{par.savedir}: finetune of step {step} on {size} voxels of {par.probe_on}: boundary AP (short-range mean) "
+          f"{curve[-1]['boundary_ap_short']:.3f} after {par.steps} steps", flush=True)
 
 def bsub(savedir: str, job: str, minutes: int, n_gpus: int, queue: str, cmd: str, slots: int | None = None):
     """Submit `uv run <cmd>` for the run dir savedir to LSF as job <sweep>-<dN>-<job>, logging to savedir/job_<job>_%J.log,
@@ -1247,15 +1294,17 @@ def bsub(savedir: str, job: str, minutes: int, n_gpus: int, queue: str, cmd: str
     subprocess.Popen(full, shell=True, stdin=subprocess.DEVNULL, start_new_session=True)
     print(f"Submitted {name} (code {code}) to LSF.")
 
-def submit(fn: str, job: Train | Eval):
-    """Run the entrypoint fn on the spec job as an LSF job: job written to its savedir (dump: train.json or eval.json), and
-    `experiment.py <fn> <that file>` submitted (bsub), which loads it. Resources by fn: run and benchmark, a training job on
-    job's queue and GPUs (torchrun); pca, pca_sizes and probe, one GPU on the trained run's queue; score, a CPU job on
-    SCORE_QUEUE. No commit check: callers from the shared checkout (submitall, lsf) assert_committed() first; a job submitting
-    one is committed code."""
+def submit(fn: str, job: Spec):
+    """Run the entrypoint fn on the spec job as an LSF job: job written to its savedir (dump: train.json, eval.json or
+    finetune.json), and `experiment.py <fn> <that file>` submitted (bsub), which loads it. Resources by fn: run and benchmark,
+    a training job on job's queue and GPUs (torchrun); pca, pca_sizes, probe and finetune, one GPU on the trained run's queue;
+    score, a CPU job on SCORE_QUEUE. No commit check: callers from the shared checkout (submitall, lsf) assert_committed()
+    first; a job submitting one is committed code."""
     b1 = fn in ("run", "benchmark") and isinstance(job, Train)
     b2 = fn in ("pca", "pca_sizes", "probe", "score") and isinstance(job, Eval)
-    assert b1 or b2, f"{job.savedir}: no LSF job {fn!r} for a {type(job).__name__} (run and benchmark take a Train; pca, pca_sizes, probe and score an Eval)"
+    b3 = fn == "finetune" and isinstance(job, Finetune)
+    assert b1 or b2 or b3, (f"{job.savedir}: no LSF job {fn!r} for a {type(job).__name__} (run and benchmark take a Train; pca, pca_sizes, "
+                            f"probe and score an Eval; finetune a Finetune)")
     assert not isinstance(job, Train) or job.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={job.n_workers} leaves no core for the training process"
     spec = dump(job)
     if isinstance(job, Train):
@@ -1265,25 +1314,29 @@ def submit(fn: str, job: Train | Eval):
     elif fn == "score":
         bsub(job.savedir, fn, SCORE_MINUTES, 0, SCORE_QUEUE, f"python {{code}}/experiment.py score {spec}", slots=SCORE_SLOTS)
     else:
-        bsub(job.savedir, fn, {"pca": 30, "pca_sizes": 60, "probe": 60}[fn], 1, job.train.queue, f"python {{code}}/experiment.py {fn} {spec}")
+        bsub(job.savedir, fn, {"pca": 30, "pca_sizes": 60, "probe": 60, "finetune": 120}[fn], 1, job.train.queue, f"python {{code}}/experiment.py {fn} {spec}")
 
-def start(p: Train | Eval):
+def start(p: Spec):
     """Submit p fresh: its savedir emptied (old contents -> outdir/.trash/), then its jobs: a training run (which evals itself
-    after), or an eval's jobs (Eval.jobs: pca and probe, unless it says otherwise)."""
+    after), an eval's jobs (Eval.jobs: pca and probe, unless it says otherwise), or a finetune."""
     trash(p.savedir)
-    for fn in ["run"] if isinstance(p, Train) else p.jobs:
+    for fn in ["run"] if isinstance(p, Train) else ["finetune"] if isinstance(p, Finetune) else p.jobs:
         submit(fn, p)
 
 def lsf(fn: str, target: int | str):
     """Redo one job on LSF, of roots()[target] or of the spec file target names (any run's, e.g. a milestone eval's
     outdir/.../d3/step_0005000/eval.json): `lsf probe 3` after changing probe. pca, probe or score of an eval, or of a training
-    run's own checkpoint (own_eval), in place; run restarts a training run fresh (start), its milestone evals with it."""
+    run's own checkpoint (own_eval), in place; finetune of a finetune, in place; run restarts a training run fresh (start), its
+    milestone evals with it."""
     assert_committed()
-    p = roots()[target] if isinstance(target, int) else load(target, Eval if target.endswith("eval.json") else Train)
+    if isinstance(target, int):
+        p = roots()[target]
+    else:
+        p = load(target, Eval if target.endswith("eval.json") else Finetune if target.endswith("finetune.json") else Train)
     if fn == "run":
         start(p)
     else:
-        submit(fn, p if isinstance(p, Eval) else own_eval(p))
+        submit(fn, own_eval(p) if isinstance(p, Train) else p)
 
 def replaylsf(n:int):
     """replay_bad_batch on LSF for roots()[n]'s first bad_batch dump. CUDA_LAUNCH_BLOCKING names a crashing kernel."""

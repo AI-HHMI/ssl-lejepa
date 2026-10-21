@@ -360,7 +360,7 @@ def test_roots_are_the_trunks_and_their_milestone_evals_nest_in_them(tmp_path, m
         for s in experiment.milestone_steps(t):
             e = experiment.eval_params(t, s)
             assert e.savedir == f"{t.savedir}step_{s:07d}/" and experiment.milestone_of(e) == f"{t.savedir}checkpoints/milestones/step_{s:07d}.pt"
-            assert e.train == t and e.decoder == "linear"  # the trunk's architecture
+            assert e.train == t  # the trunk's architecture
 
 
 @pytest.mark.parametrize("max_hours", [0.0, 1.0])
@@ -453,16 +453,22 @@ def test_submit_writes_the_spec_its_job_loads(tmp_path, monkeypatch):
     submitted = []
     monkeypatch.setattr(experiment, "bsub", lambda savedir, job, minutes, n_gpus, queue, cmd, **kw: submitted.append((job, n_gpus, queue, cmd)))
     trunk = experiment.Train(savedir="outdir/e00/x/d0/", queue="gpu_b300", global_size=(64, 64, 64), lamb=0.5, n_gpus=2, max_hours=1.0, n_workers=11)
-    e = experiment.Eval(savedir="outdir/e00/x/d1/", train=trunk, init_from="random", decoder="unetr")
+    e = experiment.Eval(savedir="outdir/e00/x/d1/", train=trunk, init_from="random", probe_on="fish2")
+    f = experiment.Finetune(savedir="outdir/e00/x/d2/", train=trunk, init_from="outdir/e00/y/d0/", fit_side=256, freeze_encoder=False)
     experiment.submit("run", trunk)
     experiment.submit("probe", e)
+    experiment.submit("finetune", f)
     assert submitted == [("run", 2, "gpu_b300", "torchrun --standalone --nproc_per_node=2 {code}/experiment.py run outdir/e00/x/d0/train.json"),
-                         ("probe", 1, "gpu_b300", "python {code}/experiment.py probe outdir/e00/x/d1/eval.json")]  # the trunk's queue
+                         ("probe", 1, "gpu_b300", "python {code}/experiment.py probe outdir/e00/x/d1/eval.json"),  # the trunk's queue
+                         ("finetune", 1, "gpu_b300", "python {code}/experiment.py finetune outdir/e00/x/d2/finetune.json")]
     assert experiment.load("outdir/e00/x/d0/train.json", experiment.Train) == trunk  # what the job runs: the same spec
     assert experiment.load("outdir/e00/x/d1/eval.json", experiment.Eval) == e
+    assert experiment.load("outdir/e00/x/d2/finetune.json", experiment.Finetune) == f
+    with pytest.raises(AssertionError, match="no LSF job 'finetune' for a Eval"):
+        experiment.submit("finetune", e)
     spec = json.loads(Path("outdir/e00/x/d1/eval.json").read_text())
-    Path("bad.json").write_text(json.dumps({**spec, "decoder": "linaer"}))
-    with pytest.raises(Exception, match="decoder"):  # validated: a typo fails at load, before any GPU work
+    Path("bad.json").write_text(json.dumps({**spec, "score": "maybe"}))
+    with pytest.raises(Exception, match="score"):  # validated: a typo fails at load, before any GPU work
         experiment.load("bad.json", experiment.Eval)
     Path("extra.json").write_text(json.dumps({**spec, "steps": 3}))
     with pytest.raises(AssertionError, match="doesn't round-trip"):  # so does a field the spec doesn't have

@@ -61,7 +61,9 @@ def test_fit_unetr_learns_a_planted_boundary():
 
     encoder = ViT3DEncoder(patch_size=(2, 2, 2), embed_dim=16, depth=3, num_heads=2)
     model = Unetr(encoder, UnetrConfig(out_dim=1, hidden_dim=16))
-    held = (img, targets, valid)
-    curve = fit_unetr(model, img, targets, valid, crop=(8, 8, 8), held=held, steps=200, batch=2, lr=1e-3)
-    assert curve[0]["step"] == 0 and curve[-1]["step"] == 199
-    assert curve[-1]["held_bce"] < curve[0]["held_bce"]
+    w = valid.float()
+    score = lambda: {"bce": float(torch.nn.functional.binary_cross_entropy_with_logits(model(img[None])[0], targets.float(), weight=w))}
+    curve = fit_unetr(model, img, targets, valid, crop=(8, 8, 8), score=score, steps=450, batch=2, lr=1e-3)
+    assert [c["step"] for c in curve] == [100, 200, 300, 400, 450]  # every 100 steps done, and the last
+    assert [c["step"] for c in curve if "bce" in c] == [100, 200, 400, 450]  # scored at doubling steps, and the last
+    assert curve[-1]["bce"] < curve[0]["bce"]

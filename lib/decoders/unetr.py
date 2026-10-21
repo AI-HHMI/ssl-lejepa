@@ -7,6 +7,7 @@ fit_unetr trains one end to end to predict dense binary targets (e.g. lib.probe.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 import torch
@@ -14,7 +15,6 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from lib.encoders import ViT3DEncoder
-from lib.probe import average_precision
 from lib.types import Tup3Int
 
 
@@ -110,21 +110,23 @@ def random_crop(img: Tensor, targets: Tensor, valid: Tensor, crop: Tup3Int, g: t
 
 
 def fit_unetr(model: Unetr, img: Tensor, targets: Tensor, valid: Tensor, crop: Tup3Int,
-              held: tuple[Tensor, Tensor, Tensor] | None = None,
+              score: Callable[[], dict] | None = None,
               steps: int = 3000, batch: int = 4, lr: float = 1e-4) -> list[dict]:
     """Train model end to end on random crop-sized windows of one training volume: img (C Z Y X, in [0, 1]),
     dense binary targets (OutDim Z Y X, e.g. lib.probe.affinities) and valid (OutDim Z Y X, BCE mask). Backprops
     through the decoder and, unless model.encoder was frozen first (encoder.requires_grad_(False)), the encoder
     too. Adam at a fixed lr; seeded, so a refit gives the same model.
 
-    Also returns the fit curve, every 100 steps: the batch loss, and on held (a fixed (img, targets, valid) crop)
-    the BCE and the AP of predicting a 0 (for affinities: boundary, different objects). Monitoring only.
+    Also returns the fit curve, one row per 100 steps done and at the last: the batch loss, and at 100, 200, 400, ...
+    steps and the last, score()'s dict (e.g. the model's test-block AP), run without gradients: what each amount of
+    fitting buys.
     """
     device = next(model.parameters()).device
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     g = torch.Generator().manual_seed(0)
+    scored = {100 * 2 ** k for k in range(steps.bit_length())} | {steps}
     curve = []
-    for step in range(steps):
+    for n in range(1, steps + 1):  # n: steps done after this one
         crops = [random_crop(img, targets, valid, crop, g) for _ in range(batch)]
         x = torch.stack([c[0] for c in crops]).to(device)
         y = torch.stack([c[1] for c in crops]).to(device).float()
@@ -133,13 +135,10 @@ def fit_unetr(model: Unetr, img: Tensor, targets: Tensor, valid: Tensor, crop: T
         loss.backward()
         opt.step()
         opt.zero_grad(set_to_none=True)
-        if step % 100 == 0 or step == steps - 1:
-            row = {"step": step, "loss": loss.item()}
-            if held is not None:
+        if n % 100 == 0 or n == steps:
+            row = {"step": n, "loss": loss.item()}
+            if score is not None and n in scored:
                 with torch.no_grad():
-                    hz = model(held[0].unsqueeze(0).to(device))[0]
-                    ht, hw = held[1].to(device).float(), held[2].to(device).bool()
-                    row["held_bce"] = float(F.binary_cross_entropy_with_logits(hz[hw], ht[hw]))
-                    row["held_boundary_ap"] = average_precision(-hz[hw], 1 - ht[hw])
+                    row.update(score())
             curve.append(row)
     return curve
