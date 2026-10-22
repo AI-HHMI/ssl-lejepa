@@ -1305,6 +1305,30 @@ def finetune(job: Finetune | str):
     print(f"{par.savedir}: finetune of step {step} on {size} voxels of {par.probe_on}: boundary AP (short-range mean) "
           f"{curve[-1]['boundary_ap_short']:.3f} after {par.steps} steps", flush=True)
 
+def tiles(job: Finetune | str):
+    """finetune's fit, without its scoring, and tile_logits' blended prediction on its first test block: savedir/tiles.png,
+    finetune.png's panels (middle z: EM | true boundaries | predicted boundaries). The fit is seeded, so these are finetune's
+    predictions, redone with the current tiling; nothing else is written."""
+    import torch
+    from lib.decoders import Unetr, UnetrConfig, fit_unetr
+    from lib.probe import AFFINITY_OFFSETS_XYZ, affinities
+    par = load(job, Finetune)
+    torch.set_float32_matmul_precision(par.train.f32mode)
+    tile = par.train.global_size
+    model, step = load_checkpoint(par)
+    encoder, device = model.encoder, next(model.parameters()).device
+    p = encoder.patch_embed.patch_size
+    sets = PROBE_SETS[par.probe_on]
+    unetr = Unetr(encoder, UnetrConfig(out_dim=len(AFFINITY_OFFSETS_XYZ))).to(device)
+    encoder.requires_grad_(not par.freeze_encoder)
+    img, labels, m, size = read_block(sets["train"][0], tile, p, device, par.fit_side or PROBE_SIDE)
+    aff, valid = affinities(labels, [o[::-1] for o in AFFINITY_OFFSETS_XYZ], sets["train"][0].sparse)  # x y z offsets; the model sees z y x
+    fit_unetr(unetr, inner(img, m, size)[None], aff, valid, tile, steps=par.steps)
+    img, labels, m, size = read_block(sets["test"][0], tile, p, device, context=True)
+    pred = torch.sigmoid(inner(tile_logits(unetr, img, tile), m, size)).half()
+    boundary_png(Path(par.savedir) / "tiles.png", inner(img, m, size), labels, pred)
+    print(f"{par.savedir}: wrote tiles.png, finetune of step {step} for {par.steps} steps", flush=True)
+
 def job_name(savedir: str, job: str) -> str:
     """The LSF name of the run dir savedir's job: <sweep>-<dN>-<job>, e.g. e00-nanhunt-d9-run, so bjobs shows which is which."""
     return "-".join(Path(savedir).parts[1:]) + f"-{job}"
@@ -1341,13 +1365,13 @@ def bsub(savedir: str, job: str, minutes: int, n_gpus: int, queue: str, cmd: str
 def submit(fn: str, job: Spec):
     """Run the entrypoint fn on the spec job as an LSF job: job written to its savedir (dump: train.json, eval.json or
     finetune.json), and `experiment.py <fn> <that file>` submitted (bsub), which loads it. Resources by fn: run and benchmark,
-    a training job on job's queue and GPUs (torchrun); pca, pca_sizes, probe and finetune, one GPU on the trained run's queue;
+    a training job on job's queue and GPUs (torchrun); pca, pca_sizes, probe, finetune and tiles, one GPU on the trained run's queue;
     score, a CPU job on SCORE_QUEUE. A finetune of one of this experiment's own trunks waits in LSF for the trunk's run job,
     unless the trunk is done (its own probe.json is written). No commit check: callers from the shared checkout (submitall,
     lsf) assert_committed() first; a job submitting one is committed code."""
     b1 = fn in ("run", "benchmark") and isinstance(job, Train)
     b2 = fn in ("pca", "pca_sizes", "probe", "score") and isinstance(job, Eval)
-    b3 = fn == "finetune" and isinstance(job, Finetune)
+    b3 = fn in ("finetune", "tiles") and isinstance(job, Finetune)
     assert b1 or b2 or b3, (f"{job.savedir}: no LSF job {fn!r} for a {type(job).__name__} (run and benchmark take a Train; pca, pca_sizes, "
                             f"probe and score an Eval; finetune a Finetune)")
     assert not isinstance(job, Train) or job.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={job.n_workers} leaves no core for the training process"
@@ -1362,7 +1386,7 @@ def submit(fn: str, job: Spec):
         b4 = job.init_from.startswith(f"outdir/{EXPERIMENT}/")
         b5 = not (Path(job.init_from) / "probe.json").is_file()
         after = job_name(job.init_from, "run") if isinstance(job, Finetune) and b4 and b5 else ""
-        bsub(job.savedir, fn, {"pca": 30, "pca_sizes": 60, "probe": 60, "finetune": 120}[fn], 1, job.train.queue, f"python {{code}}/experiment.py {fn} {spec}",
+        bsub(job.savedir, fn, {"pca": 30, "pca_sizes": 60, "probe": 60, "finetune": 120, "tiles": 120}[fn], 1, job.train.queue, f"python {{code}}/experiment.py {fn} {spec}",
              after=after)
 
 def start(p: Spec):
@@ -1435,6 +1459,15 @@ def submitall():
     for r in roots():
         if not spec_path(r).is_file():
             start(r)
+
+def tilesall():
+    """Submit tiles (in place: the run dirs are kept) for the finetunes the e10 report's Predictions panel shows (frozen encoder,
+    256^3 of GT) that have no tiles.png yet. Idempotent."""
+    check_experiment()
+    assert_committed()
+    for r in roots():
+        if isinstance(r, Finetune) and r.freeze_encoder and r.fit_side == 256 and not (Path(r.savedir) / "tiles.png").is_file():
+            submit("tiles", r)
 
 def retryall():
     """Resubmit this experiment's finetunes whose job ended without finishing (its LSF log has its footer, but there is no
