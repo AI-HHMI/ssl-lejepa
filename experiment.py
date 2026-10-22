@@ -1086,19 +1086,29 @@ def tile_features(encoder, img, tile):
 
 def tile_logits(model, img, tile):
     """A dense model's (lib.decoders.unetr.Unetr) raw per-voxel logits over img (Z Y X in [0, 1], on the model's
-    device, a multiple of tile), from non-overlapping tile-sized crops at the training global-view size, stitched:
+    device, a multiple of tile), from tile-sized crops at the training global-view size, half a tile apart, blended:
     OutDim Z Y X. Unlike tile_features (whose Linear head needs no spatial context beyond one token's own patch),
-    this tiles the whole model (encoder + decoder), since Unetr's skip connections need a full crop each call."""
+    this tiles the whole model (encoder + decoder), since Unetr's skip connections need a full crop each call.
+    A crop's voxels near its faces see little context, so each is weighted by a Hann window (0 at the faces, 1 at the
+    centre; two crops half a tile apart sum to 1): the faces drop out where another crop covers them. The outer half tile
+    of img has only one crop over it, so it is poorly predicted: read img with half a tile of context (read_block) and trim."""
     import torch
+    assert all(s % t == 0 for s, t in zip(img.shape, tile)), f"{tuple(img.shape)} must tile by {tile}"
+    ramp = [torch.sin(torch.pi * (torch.arange(t, device=img.device) + 0.5) / t) ** 2 for t in tile]  # t per axis
+    starts = [range(0, s - t // 2, t // 2) for s, t in zip(img.shape, tile)]
+    norm = [torch.zeros(s, device=img.device) for s in img.shape]  # per axis, the summed windows over it (the weights are separable)
+    for n, r, ss, t in zip(norm, ramp, starts, tile):
+        for s in ss:
+            n[s:s + t] += r
     out = None
     with torch.no_grad():
-        for z, y, x in product(*(range(0, s, t) for s, t in zip(img.shape, tile))):
+        for z, y, x in product(*starts):
             logits = model(img[None, None, z:z + tile[0], y:y + tile[1], x:x + tile[2]])[0]  # OutDim tz ty tx
             if out is None:
-                out = torch.empty(logits.shape[0], *img.shape, dtype=logits.dtype, device=img.device)
-            out[:, z:z + tile[0], y:y + tile[1], x:x + tile[2]] = logits
+                out = torch.zeros(logits.shape[0], *img.shape, dtype=logits.dtype, device=img.device)
+            out[:, z:z + tile[0], y:y + tile[1], x:x + tile[2]] += logits * (ramp[0][:, None, None] * ramp[1][None, :, None] * ramp[2][None, None, :])
     assert out is not None, "img must be nonempty"
-    return out
+    return out.div_(norm[0][:, None, None]).div_(norm[1][None, :, None]).div_(norm[2][None, None, :])
 
 def write_affinities(path: Path, array, **attrs):
     """A mia-evals affinity artifact (its artifact.write_artifact layout): one zarr array, Channel X Y Z, whose attrs say
@@ -1112,15 +1122,16 @@ def inner(x, m, size):
     """x's (... Z Y X) box of size (Z Y X) at offset m (Z Y X): read_block's box, within its padded region."""
     return x[..., m[0]:m[0] + size[0], m[1]:m[1] + size[1], m[2]:m[2] + size[2]]
 
-def read_block(vol: ProbeVolume, tile, p, device, side: int = PROBE_SIDE):
+def read_block(vol: ProbeVolume, tile, p, device, side: int = PROBE_SIDE, context: bool = False):
     """vol's box cut to whole patches (p, Z Y X) at most side a side about its centre, read at 8 nm (read_window) with whole
     tiles of context around it: (img Z Y X [the padded region, a multiple of tile, on device], labels Z Y X [the box's],
     m [the box's offset in img, whole patches], size [the box's]). A model tiles img (tile_features, tile_logits); inner(x, m,
-    size) trims what it makes, or img itself (the box's EM), back to the box."""
+    size) trims what it makes, or img itself (the box's EM), back to the box. context: at least half a tile of it on every side,
+    which tile_logits' blending needs."""
     vox, _ = volume_grid(vol)
     lo, hi = np.array([b[0] for b in vol.box][::-1]), np.array([b[1] for b in vol.box][::-1])  # z y x, level-0 voxels
     size = [int(min(s - s % q, side)) for s, q in zip(((hi - lo) * vox / 8).astype(int), p)]  # ints, not numpy's: json writes them
-    region = [math.ceil(s / t) * t for s, t in zip(size, tile)]  # whole tiles around the box
+    region = [math.ceil((s + context * t) / t) * t for s, t in zip(size, tile)]  # whole tiles around the box
     m = [(r - s) // 2 // q * q for r, s, q in zip(region, size, p)]
     img, lab = read_window(vol, (lo + hi) / 2, region)
     return img.to(device), inner(lab, m, size).contiguous().to(device), m, size
@@ -1277,7 +1288,7 @@ def finetune(job: Finetune | str):
     data = {"tbl": "finetune_data", "step": step, "fit_size": size, "fit_labelled": int((labels != 0).sum()),
             "test_blocks": [v.name for v in sets["test"]]}
     del labels
-    tests = [read_block(v, tile, p, device) for v in sets["test"]]  # (img, labels, m, size) each
+    tests = [read_block(v, tile, p, device, context=True) for v in sets["test"]]  # (img, labels, m, size) each
 
     def predict(img, m, size):  # C Z Y X sigmoid probabilities over the box
         return torch.sigmoid(inner(tile_logits(unetr, img, tile), m, size)).half()
