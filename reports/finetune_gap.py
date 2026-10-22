@@ -150,9 +150,10 @@ def build() -> tuple:
                 pi.heatmap(z, steps, [f"{side} {mode}" for side in SIDES for mode in MODES], "fit steps", "GT", zr))
 
     def lines(metric: str, s: str, side: int) -> tuple:
-        series = {f"{e}, {mode}": (sorted(f["curve"]), [f["curve"][k][metric] for k in sorted(f["curve"])])
-                  for e in ENCODERS for mode in MODES if (f := done.get((e, s, mode, side)))}
-        return (f"{s}, {side}^3 of GT: {metric} AP over fit steps", pi.lines(series, "fit steps", f"{metric} AP", logx=True))
+        series = {(e, mode): (sorted(f["curve"]), [f["curve"][k][metric] for k in sorted(f["curve"])])
+                  for mode in MODES for e in ENCODERS if (f := done.get((e, s, mode, side)))}
+        return (f"{s}, {side}^3 of GT: {metric} AP over fit steps (the encoder frozen or trained: the radio above)",
+                pi.lines(series, "fit steps", f"{metric} AP", logx=True))
 
     cells = [(s, side) for s in SETS.values() for side in SIDES if any(k[1] == s and k[3] == side for k in done)]
     missing = [[f["run"].name, *k] for k, f in runs.items() if not f["curve"]]

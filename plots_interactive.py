@@ -55,9 +55,14 @@ document.querySelectorAll("div.iplot").forEach(function(div) {  // one bad figur
   box.addEventListener("change", function() { set(box.checked); });
   set(ON);
 })();
-document.addEventListener("change", function(e) {  // a log-scale checkbox above a plot
+document.addEventListener("change", function(e) {  // a log-scale checkbox, or a subset radio, above a plot
   var label = e.target.closest && e.target.closest("div.axes label");
   if (!label) return;
+  if (label.dataset.subset !== undefined) {  // show that subset's traces (and any trace in none)
+    var div = document.getElementById(label.parentNode.dataset.plot);
+    Plotly.restyle(div, {visible: div.data.map(function(t) { return !t.meta || t.meta === label.dataset.subset; })});
+    return;
+  }
   var u = {}; u[label.dataset.axis + "axis.type"] = e.target.checked ? "log" : "linear";
   Plotly.relayout(label.parentNode.dataset.plot, u);
 });
@@ -200,7 +205,8 @@ def tooltip(row: dict) -> str:
 
 def figure(data: list, layout: dict, logx: bool = False, logy: bool = False) -> str:
     """A Plotly figure: an empty div and its JSON, drawn by runtime(), under a small round log-scale checkbox per numeric axis.
-    A "category" axis (e.g. bar labels) gets no toggle and is fixed, so zoom and pan move only the numeric axis."""
+    A "category" axis (e.g. bar labels) gets no toggle and is fixed, so zoom and pan move only the numeric axis. Traces
+    whose "meta" names a subset get one radio per subset there: one subset shown at a time, the first to start with."""
     layout = {"height": 380, "margin": {"t": 16, "r": 10, "b": 50, "l": 60}, "hovermode": "closest", "font": {"size": 11},
               "paper_bgcolor": "#fff", "plot_bgcolor": "#fff", "legend": {"font": {"size": 10}}, **layout}
     layout["xaxis"] = {"type": "log" if logx else "linear", "gridcolor": "#eee", **layout.get("xaxis", {})}
@@ -213,6 +219,12 @@ def figure(data: list, layout: dict, logx: bool = False, logy: bool = False) -> 
             layout[f"{ax}axis"]["fixedrange"] = True
             continue
         toggles.append(f"<label data-axis='{ax}'><input type='checkbox'{' checked' if t == 'log' else ''}>log {ax}</label>")
+    subsets = list(dict.fromkeys(d["meta"] for d in data if d.get("meta")))
+    for d in data:
+        if d.get("meta"):
+            d["visible"] = d["meta"] == subsets[0]
+    toggles += [f"<label data-subset='{html.escape(s, quote=True)}'><input type='radio' name='{pid}-subset'{' checked' * (i == 0)}>{html.escape(s)}</label>"
+                for i, s in enumerate(subsets)]
     payload = json.dumps(finite({"data": data, "layout": layout}), allow_nan=False).replace("</", "<\\/")  # a string can't close the script
     return (f"<div class='axes' data-plot='{pid}'>{''.join(toggles)}</div><div class='iplot' id='{pid}' {MARK}></div>"
             f"<script type='application/json' id='{pid}-data'>{payload}</script>")
@@ -242,11 +254,15 @@ def splom(groups: dict, dims: list) -> str:
 
 
 def lines(series: dict, xlabel: str, ylabel: str, logx: bool = False, logy: bool = False) -> str:
-    """series: label -> (xs, ys), one line each. The tooltip shows only the nearest point: a tooltip listing every line
-    at the hovered x hid most of the plot."""
-    data = [{"type": "scatter", "mode": "lines+markers", "marker": {"size": 5}, "name": label, "x": list(xs), "y": list(ys), "line": {"color": c, "width": 1.8},
+    """series: label -> (xs, ys), one line each; a (label, subset) key puts the line in a subset (figure: a radio per
+    subset, one shown at a time), coloured as its label is in every subset. The tooltip shows only the nearest point: a
+    tooltip listing every line at the hovered x hid most of the plot."""
+    keys = [k if isinstance(k, tuple) else (k, None) for k in series]
+    colors = dict(zip(dict.fromkeys(label for label, _ in keys), itertools.cycle(COLORS)))
+    data = [{"type": "scatter", "mode": "lines+markers", "marker": {"size": 5}, "name": label, "meta": subset, "x": list(xs), "y": list(ys),
+             "line": {"color": colors[label], "width": 1.8},
              "hovertemplate": f"{html.escape(str(label))}<br>{html.escape(xlabel)}: %{{x}}<br>{html.escape(ylabel)}: %{{y:.4g}}<extra></extra>"}
-            for (label, (xs, ys)), c in zip(series.items(), itertools.cycle(COLORS))]
+            for (label, subset), (xs, ys) in zip(keys, series.values())]
     return figure(data, {"xaxis": {"title": xlabel}, "yaxis": {"title": ylabel}}, logx=logx, logy=logy)
 
 
