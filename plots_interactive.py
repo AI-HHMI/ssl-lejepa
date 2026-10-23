@@ -32,8 +32,8 @@ table.imggrid{table-layout:fixed;width:100%} table.imggrid th:first-child{width:
 table.imggrid img.zoom{cursor:zoom-in;border:1px solid #ddd;width:100%;max-width:220px;height:auto;box-sizing:border-box}
 #viewer{position:fixed;inset:0;background:rgba(0,0,0,.93);display:none;z-index:1000;cursor:grab;overflow:hidden}
 #viewer.open{display:block} #viewer img{position:absolute;left:0;top:0;image-rendering:pixelated}
-#viewer-bar{position:fixed;top:0;left:0;right:0;padding:6px 12px;color:#ddd;font-size:13px;background:rgba(0,0,0,.6);z-index:1001}
-#viewer-bar label{margin-right:12px} #viewer-bar .hint{float:right;color:#999}
+#viewer-panel{position:fixed;top:0;left:0;bottom:0;width:240px;box-sizing:border-box;padding:10px 12px;overflow:auto;color:#ddd;font-size:13px;background:rgba(0,0,0,.6);z-index:1001;cursor:default}
+#viewer-panel .lyr{margin:10px 0} #viewer-panel input[type=range]{display:block;width:100%;margin:3px 0 0} #viewer-panel .hint{margin-top:16px;color:#999;font-size:11px}
 """
 JS = r"""
 // The corner "interactive" toggle: off, every chart is redrawn static (no zoom, pan or tooltips; it keeps its current
@@ -85,80 +85,87 @@ document.addEventListener("click", function(e) {
   th.classList.add(dir === 1 ? "asc" : "desc");
 });
 
-// Image viewer: click a grid thumbnail to open its cell full-screen. Every layer of the cell is drawn at the first
-// layer's size, stacked in order; the lowest visible layer is opaque, the ones above it at the slider's opacity. A grid with
-// data-off starts with only each cell's first layer shown.
-// Sized via width/height, not a CSS transform, which the GPU bilinear-filters at high zoom.
+// Image viewer: click a grid thumbnail to open it full-screen. A panel fixed on the left lists the layers, each with a
+// checkbox and an opacity slider (state kept across cells); every layer is drawn at the first one's size, stacked in
+// order. Layers are the cell's own images or, in a stack grid (data-stack), the column's rows (their first images), where
+// up and down show one row alone. Sized via width/height, not a CSS transform, which the GPU bilinear-filters at high zoom.
 (function() {
-  var V = document.getElementById("viewer"), BAR = document.getElementById("viewer-bar");
+  var V = document.getElementById("viewer"), PANEL = document.getElementById("viewer-panel"), LEFT = 240;  // LEFT: the panel's width
   var scale = 1, tx = 0, ty = 0, drag = false, lx = 0, ly = 0, curW = 0, curH = 0;
-  var grid = [], row = 0, col = 0, layers = [], on = {}, alpha = 0.5;  // on: layer index -> shown, kept across cells
+  var grid = [], names = [], heads = [], stack = false, row = 0, col = 0, layers = [], on = {}, alpha = {};  // on, alpha: layer index -> shown, opacity
   function esc(s) { return s.replace(/[&<>"]/g, function(c) { return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]; }); }
   function apply() {
-    var w = layers[0].naturalWidth * scale, h = layers[0].naturalHeight * scale;
-    layers.forEach(function(img) { img.style.left = tx + "px"; img.style.top = ty + "px"; img.style.width = w + "px"; img.style.height = h + "px"; });
+    var w = layers[0].el.naturalWidth * scale, h = layers[0].el.naturalHeight * scale;
+    layers.forEach(function(l) { var s = l.el.style; s.left = tx + "px"; s.top = ty + "px"; s.width = w + "px"; s.height = h + "px"; });
   }
   function fit() {
-    var nw = layers[0].naturalWidth || 1, nh = layers[0].naturalHeight || 1;
-    scale = Math.min(V.clientWidth / nw, V.clientHeight / nh) * 0.95; tx = (V.clientWidth - nw * scale) / 2; ty = (V.clientHeight - nh * scale) / 2;
+    var nw = layers[0].el.naturalWidth || 1, nh = layers[0].el.naturalHeight || 1, aw = V.clientWidth - LEFT;
+    scale = Math.min(aw / nw, V.clientHeight / nh) * 0.95; tx = LEFT + (aw - nw * scale) / 2; ty = (V.clientHeight - nh * scale) / 2;
     apply();
   }
   function loaded() {  // same-size cell: keep zoom and pan, so stepping across the grid compares one spot
-    var b = layers[0];
+    var b = layers[0].el;
     if (b.naturalWidth === curW && b.naturalHeight === curH) apply(); else fit();
     curW = b.naturalWidth; curH = b.naturalHeight;
   }
   function paint() {
-    var below = false;
-    layers.forEach(function(img, i) {
-      var shown = on[i] !== false;
-      img.style.display = shown ? "" : "none";
-      img.style.opacity = shown && below ? alpha : 1;
-      below = below || shown;
+    layers.forEach(function(l) {
+      l.el.style.display = on[l.i] !== false ? "" : "none";
+      l.el.style.opacity = alpha[l.i] === undefined ? 1 : alpha[l.i];
     });
-    var src = grid[row][col], h = "<b>" + esc(src[0].title) + "</b> ";
-    if (src.length > 1) {
-      h += src.map(function(s, i) { return "<label><input type='checkbox' data-i='" + i + "'" + (on[i] !== false ? " checked" : "") + "> " + (i + 1) + " " + esc(s.alt) + "</label>"; }).join("");
-      h += "<label>overlay opacity <input type='range' min='0' max='1' step='0.05' value='" + alpha + "'></label>";
-    }
-    BAR.innerHTML = h + "<span class='hint'>arrows: grid · 1-9: layers · scroll: zoom · drag: pan · Esc: close</span>";
+    var h = "<b>" + esc(stack ? heads[col] : grid[row][col][0].title) + "</b>";
+    layers.slice().reverse().forEach(function(l) {  // top layer first
+      h += "<div class='lyr'><label><input type='checkbox' data-i='" + l.i + "'" + (on[l.i] !== false ? " checked" : "") + "> " + (l.i + 1) + " " + esc(l.name) + "</label>" +
+           "<input type='range' min='0' max='1' step='0.05' data-i='" + l.i + "' value='" + (alpha[l.i] === undefined ? 1 : alpha[l.i]) + "'></div>";
+    });
+    PANEL.innerHTML = h + "<div class='hint'>arrows: grid · 1-9: layers · scroll: zoom · drag: pan · Esc: close</div>";
+  }
+  function only() {  // stack grid: show the current row's layer alone
+    on = {}; grid.forEach(function(_, r) { on[r] = r === row; });
   }
   function show() {
-    layers.forEach(function(img) { img.remove(); });
-    layers = grid[row][col].map(function(s) {
+    layers.forEach(function(l) { l.el.remove(); });
+    var srcs = stack ? grid.map(function(cells, r) { return cells[col].length ? {s: cells[col][0], i: r, name: names[r]} : null; })
+                     : grid[row][col].map(function(s, i) { return {s: s, i: i, name: s.alt}; });
+    layers = srcs.filter(Boolean).map(function(x) {
       var img = document.createElement("img");
-      img.className = "layer"; img.src = s.src; img.alt = s.alt; img.onload = apply;
-      V.appendChild(img); return img;
+      img.className = "layer"; img.src = x.s.src; img.alt = x.s.alt; img.onload = apply;
+      V.appendChild(img); return {el: img, i: x.i, name: x.name};
     });
     paint();
-    if (layers[0].complete) loaded(); else layers[0].onload = loaded;
+    if (layers[0].el.complete) loaded(); else layers[0].el.onload = loaded;
   }
   function open(el) {
-    var trs = Array.prototype.slice.call(el.closest("table").tBodies[0].rows);
+    var table = el.closest("table"), trs = Array.prototype.slice.call(table.tBodies[0].rows);
     grid = trs.map(function(tr) {
       return Array.prototype.slice.call(tr.cells).map(function(td) { return Array.prototype.slice.call(td.querySelectorAll("img")); });
     });
+    names = trs.map(function(tr) { return tr.cells[0].textContent; });
+    heads = Array.prototype.slice.call(table.tHead.rows[0].cells).map(function(th) { return th.textContent; });
+    stack = !!table.dataset.stack;
     grid.forEach(function(cells, i) { cells.forEach(function(imgs, j) { if (imgs[0] === el) { row = i; col = j; } }); });
-    on = {}; if (el.closest("table").dataset.off) { for (var k = 1; k < 9; k++) on[k] = false; }
+    if (stack) only();
     curW = 0; curH = 0; V.classList.add("open"); show();
   }
   function move(dr, dc) {  // the next nonempty cell in that direction; stop at the edge
     for (var r = row + dr, c = col + dc; r >= 0 && r < grid.length && c >= 0 && c < grid[r].length; r += dr, c += dc) {
-      if (grid[r][c].length) { row = r; col = c; show(); return; }
+      if (grid[r][c].length) { row = r; col = c; if (stack && dr) only(); show(); return; }
     }
   }
   function close() { V.classList.remove("open"); }
   document.addEventListener("click", function(e) { if (ON && e.target.matches && e.target.matches("table.imggrid img.zoom")) open(e.target); });
   V.addEventListener("click", function(e) { if (e.target === V) close(); });
-  BAR.addEventListener("input", function(e) {
-    if (e.target.type === "checkbox") on[+e.target.dataset.i] = e.target.checked; else alpha = +e.target.value;
-    paint();
+  PANEL.addEventListener("wheel", function(e) { e.stopPropagation(); });  // scroll the panel, don't zoom
+  PANEL.addEventListener("input", function(e) {
+    var i = +e.target.dataset.i;
+    if (e.target.type === "checkbox") { on[i] = e.target.checked; paint(); }
+    else { alpha[i] = +e.target.value; layers.forEach(function(l) { if (l.i === i) l.el.style.opacity = alpha[i]; }); }  // not paint: it would replace the slider mid-drag
   });
   document.addEventListener("keydown", function(e) {
     if (!V.classList.contains("open")) return;
     if (e.key === "Escape") { close(); return; }
     var i = "123456789".indexOf(e.key);
-    if (i >= 0 && i < layers.length) { on[i] = on[i] === false; paint(); return; }
+    if (i >= 0 && layers.some(function(l) { return l.i === i; })) { on[i] = on[i] === false; paint(); return; }
     var d = {ArrowRight: [0, 1], ArrowLeft: [0, -1], ArrowDown: [1, 0], ArrowUp: [-1, 0]}[e.key];
     if (d) { e.preventDefault(); move(d[0], d[1]); }
   });
@@ -185,7 +192,7 @@ _ids = itertools.count()  # unique plot div ids within one process
 def runtime(interactive: bool) -> str:
     """Styles, the corner toggle, the viewer and the scripts; the page starts interactive or static."""
     return (f"<style>{CSS}</style><label id='interactive'><input type='checkbox'>interactive</label>"
-            f"<div id='viewer'><div id='viewer-bar'></div></div>"
+            f"<div id='viewer'><div id='viewer-panel'></div></div>"
             f"<script src='{PLOTLY}'></script><script>{JS.replace('__ON__', json.dumps(interactive))}</script>")
 
 
@@ -314,12 +321,13 @@ def img(path: Path, base: Path | None, **attrs) -> str:
     return "<img " + " ".join(f"{k}='{html.escape(str(v), quote=True)}'" for k, v in attrs.items()) + f" src='{html.escape(src, quote=True)}'>"
 
 
-def images(grid: dict, base: Path | None = None, layers_off: bool = False) -> str:
+def images(grid: dict, base: Path | None = None, stack: bool = False) -> str:
     """grid: row label -> {column label: [image paths]}. A cell's first image is its thumbnail; the rest are layers drawn
-    over it in the viewer, toggled by checkbox or 1-9 (layer names: file stems). An empty or absent cell shows a dash.
+    over it in the viewer, each toggled and faded in its panel (layer names: file stems). An empty or absent cell shows a dash.
     Images are embedded in the page, or, with base (the page's dir), linked relative to it: for images too big to
     embed (MBs each), at the price of a page that works only beside them (e.g. results/ next to outdir/).
-    layers_off: the viewer opens a cell with only its first layer shown (the rest are toggled on)."""
+    stack: the viewer's layers are instead the column's rows (each cell's first image, named by its row label), the grid's
+    row being shown alone to start, e.g. a raw image and its labels and predictions in one column."""
     cols = list(dict.fromkeys(c for cells in grid.values() for c in cells))
     head = "<tr><th></th>" + "".join(f"<th>{html.escape(str(c))}</th>" for c in cols) + "</tr>"
     rows = []
@@ -333,4 +341,4 @@ def images(grid: dict, base: Path | None = None, layers_off: bool = False) -> st
             note = f"<br><small>{len(paths)} layers</small>" if len(paths) > 1 else ""
             tds.append(f"<td>{''.join(layers)}{note}</td>" if paths else "<td>–</td>")
         rows.append(f"<tr><th>{html.escape(str(r))}</th>{''.join(tds)}</tr>")
-    return f"<table class='imggrid' {'data-off=1' * layers_off} {MARK}><thead>{head}</thead><tbody>{''.join(rows)}</tbody></table>"
+    return f"<table class='imggrid' {'data-stack=1' * stack} {MARK}><thead>{head}</thead><tbody>{''.join(rows)}</tbody></table>"

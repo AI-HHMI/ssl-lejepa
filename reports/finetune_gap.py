@@ -86,16 +86,16 @@ def panels(run: Path) -> dict[str, Path]:
 
 def prediction_grid(runs: dict) -> str:
     """Rows: the raw EM and the true boundaries (the test blocks are the encoders' common ground), then each encoder's predicted
-    boundaries; columns the sets. In the viewer a cell's layers are its own image first, then the others (1-3 toggle them)."""
+    boundaries; columns the sets. In the viewer a column's rows are its layers, bottom to top."""
     cut = {(e, s): panels(runs[(e, s, "frozen", 256)]["run"]) for e in ENCODERS for s in SETS.values()}
     rows = {"raw EM": {}, "true boundaries": {}}
     for s in SETS.values():
         p = next((cut[(e, s)] for e in ENCODERS if cut[(e, s)]), {})
-        rows["raw EM"][s] = [p["raw"], p["true"]] if p else []
-        rows["true boundaries"][s] = [p["true"], p["raw"]] if p else []
+        rows["raw EM"][s] = [p["raw"]] if p else []
+        rows["true boundaries"][s] = [p["true"]] if p else []
     for e in ENCODERS:
-        rows[e] = {s: [p["predicted"], p["raw"], p["true"]] if (p := cut[(e, s)]) else [] for s in SETS.values()}
-    return pi.images(rows, base=page.out_path(SWEEP).parent, layers_off=True)
+        rows[e] = {s: [p["predicted"]] if (p := cut[(e, s)]) else [] for s in SETS.values()}
+    return pi.images(rows, base=page.out_path(SWEEP).parent, stack=True)
 
 
 def curve(d: Path) -> list[dict]:
@@ -195,7 +195,7 @@ def build() -> tuple:
         ("Curves: short AP", page.wide([lines(SHORT, s, side) for s, side in cells])),
         ("Curves: long AP", page.wide([lines(LONG, s, side) for s, side in cells])),
         ("Encoders", trunk_cards()),
-        ("Predictions", [("Test block after 10k steps, frozen encoder, 256^3 of GT, blended overlapping tiles; full screen: toggle raw, true and predicted as layers",
+        ("Predictions", [("Test block after 10k steps, frozen encoder, 256^3 of GT, blended overlapping tiles; full screen: each row a layer, with its own opacity",
                           prediction_grid(runs))]),
         ("All finetunes", [("AP at 10k fit steps, the GT it fit (labelled voxels) and its job's minutes",
                             pi.table(["run", "encoder", "set", "mode", "side", "labelled", SHORT, LONG, "minutes"],
