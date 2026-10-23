@@ -299,9 +299,6 @@ def test_a_milestone_eval_runs_pca_then_probe_without_stopping_or_steering_train
 def test_lsf_submits_a_training_run_as_what_the_entrypoint_takes(tmp_path, monkeypatch, fn, job_type):
     monkeypatch.chdir(tmp_path)
     sweep(monkeypatch, "e00/e01-test")
-    roots = experiment.roots()
-    roots[1].n_workers = 4  # the default's 16 leave no core of CPUS_PER_GPU for the training process
-    monkeypatch.setattr(experiment, "roots", lambda: roots)
     submitted = []
     monkeypatch.setattr(experiment, "dump", lambda job: "spec.json")
     monkeypatch.setattr(experiment, "bsub", lambda savedir, job, *a, **kw: submitted.append(job))

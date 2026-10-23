@@ -38,6 +38,7 @@ from lib.types import *
 # the experiment starts depending on others. Dependencies (pyproject.toml / uv.lock) are not frozen.
 SNAPSHOT_PATHS = ["experiment.py", "lib", "mia_evals"]
 CPUS_PER_GPU = 12  # LSF slots per GPU: 8 GPUs -> all 96 cores; training processes need cores beyond the data workers
+WORKERS_PER_CPU = 3  # data workers mostly wait on NFS reads (e11 d1: 88 workers kept ~20 of 96 cores busy), so more than cores
 # mia-evals scoring (score): CPU only. mia-evals: ~1 h and ~200 GB peak for the mutex watershed at 896^3, "give it a
 # whole node". The shortest CPU queue; check its run limit and memory per slot with `bqueues -l short`.
 SCORE_QUEUE, SCORE_SLOTS, SCORE_MINUTES = "local", 16, 4*60
@@ -75,7 +76,7 @@ def roots() -> list[Spec]:
         p.weight_decay = 0.05
         p.adam_beta2 = 0.95
         p.cudagraphs = True
-        p.n_workers = 11  # 12 cores per GPU
+        p.n_workers = 32  # e11's benchmark with 11: 0.29 s/step, 875 samples/s, 11% of the cores busy: a worker reads its batch's 32 samples one after another from NFS
         p.n_gpus = 8
         p.queue = "gpu_b300"
         return p
@@ -290,7 +291,7 @@ def submit(fn: str, job: Spec):
     b3 = fn in ("finetune", "tiles") and isinstance(job, Finetune)
     assert b1 or b2 or b3, (f"{job.savedir}: no LSF job {fn!r} for a {type(job).__name__} (run and benchmark take a Train; pca, pca_sizes, "
                             f"probe and score an Eval; finetune a Finetune)")
-    assert not isinstance(job, Train) or job.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={job.n_workers} leaves no core for the training process"
+    assert not isinstance(job, Train) or job.n_workers <= WORKERS_PER_CPU * CPUS_PER_GPU, f"n_workers={job.n_workers} is over {WORKERS_PER_CPU} per slot ({CPUS_PER_GPU} per GPU)"
     spec = dump(job)
     if isinstance(job, Train):
         # Slack: startup, final checkpoint, pca + probe. A run without max_hours (a fixed step count) or a benchmark: 15 min.
