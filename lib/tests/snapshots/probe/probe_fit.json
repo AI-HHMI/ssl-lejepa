@@ -1,0 +1,4 @@
+{"tbl": "probe_fit", "step": 0, "loss": 0.7223134636878967, "held_bce": 0.7167603969573975, "held_boundary_ap": 0.07582327723503113}
+{"tbl": "probe_fit", "step": 100, "loss": 0.35547322034835815, "held_bce": 0.35269811749458313, "held_boundary_ap": 0.5740010738372803}
+{"tbl": "probe_fit", "step": 200, "loss": 0.21762381494045258, "held_bce": 0.2183137983083725, "held_boundary_ap": 0.8099181652069092}
+{"tbl": "probe_fit", "step": 299, "loss": 0.1602112054824829, "held_bce": 0.15902738273143768, "held_boundary_ap": 0.8853652477264404}
