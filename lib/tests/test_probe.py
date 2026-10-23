@@ -9,6 +9,7 @@ import zarr
 
 import experiment
 import lib.probe
+import lib.readers
 from lib.encoders import EncoderConfig
 from lib.models import Lejepa, LejepaConfig, ProjectorConfig
 from lib.probe import AFFINITY_OFFSETS_XYZ, affinities, average_precision, fit_probe, to_tokens, to_voxels
@@ -37,8 +38,8 @@ def synthetic_store(tmp_path, monkeypatch, sets=None):
                                                    **{name: {s: [vol(*v) for v in vs] for s, vs in splits.items()} for name, splits in (sets or {}).items()}})
     monkeypatch.setattr(experiment, "HEMIBRAIN_EB_PROBE_BOXES", BOXES)
     monkeypatch.setattr(experiment, "HEMIBRAIN_EB_PROBE_ANNOTATED", {k: v for k, v in BOXES.items() if k != "train"})
-    monkeypatch.setattr(experiment, "volume_grid", lambda vol: (np.array([8.0, 8.0, 8.0]), np.array([64, 64, 64])))
-    monkeypatch.setattr(experiment, "read_window", read_window)
+    monkeypatch.setattr(lib.readers, "volume_grid", lambda vol: (np.array([8.0, 8.0, 8.0]), np.array([64, 64, 64])))
+    monkeypatch.setattr(lib.readers, "read_window", read_window)
     monkeypatch.setattr(experiment, "code_provenance", lambda: {"commit_id": "test"})
     monkeypatch.setattr(lib.probe, "FIT_STEPS", 300)  # the linear probe's fit: plenty for the store's one split
 

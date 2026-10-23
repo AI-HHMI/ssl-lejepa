@@ -24,8 +24,10 @@ from itertools import product
 
 # local
 
-from lib.data import HEMIBRAIN_EB, HEMIBRAIN_EB_LABELS, HEMIBRAIN_EB_PROBE_ANNOTATED, HEMIBRAIN_EB_PROBE_BOXES, PROBE_SETS, ProbeVolume, train_volumes
+from lib.data import HEMIBRAIN_EB_LABELS, HEMIBRAIN_EB_PROBE_ANNOTATED, HEMIBRAIN_EB_PROBE_BOXES, PROBE_SETS, ProbeVolume, train_volumes
 from lib.benchmark import Benchmark
+from lib.inference import boundary_png, mean_scores, pca_rgb, score_block, tile_features, tile_logits, write_affinities
+from lib.readers import PROBE_SIDE, eb_val_crop, inner, read_block
 from lib.losses import LejepaOutput
 from lib.encoders import EncoderConfig
 from lib.models import Lejepa, LejepaConfig, Mae, MaeConfig, MaskConfig
@@ -60,8 +62,6 @@ LR_WARMUP, LR_FLOOR, GRAD_CLIP = 1000, 0.01, 1.0
 CHECKPOINT_EVERY, CHECKPOINT_KEEP = 2000, 1
 MAX_SKIPPED, BAD_BATCHES_KEPT = 100, 2
 TEST_TILES = (16, 32, 64, 128, 256, 512)  # pca_sizes: the tile sides an encoder is run at, test time (2^3 to 64^3 tokens)
-PROBE_SIDE = 896  # probe: a block's largest side, 8 nm voxels (its box cut to it about its centre; hemibrain_eb's are exactly it)
-PROBE_MARGIN = 16  # read_window: the extra read around a window, 8 nm voxels (miao's resampling and label-quantization slack)
 @dataclass(slots=True)
 class Train:
     savedir: str = "outdir/e00/main/basic/"
@@ -781,83 +781,6 @@ def pca(job: Eval | str):
     pca_maps(model.encoder, e.train, Path(e.savedir), step)
     release_milestone(e)
 
-def eb_val_crop(shape: tuple[int, ...]):
-    """A shape (Z Y X) window of EB at (3400, 2000, 2000) z y x, inside its val slab (EB z 3000-4000), held out from
-    training: 1 Z Y X in [0, 1], through miao (training's data path and normalization). miao needs the box strictly larger
-    than the patch: one extra voxel per axis leaves exactly one window."""
-    origin = (3400, 2000, 2000)
-    assert origin[0] + shape[0] <= 4000, f"crop {shape} leaves EB's val slab"
-    vol = lmd.get(HEMIBRAIN_EB).to_miao(bounding_box=[[o, o + s + 1] for o, s in zip(origin, shape)])
-    mcfg = MiaoConfig(volumes=[vol], patch_size=list(shape), resolutions=[[8.0, 8.0, 8.0]],
-                      samples_per_epoch=1, sampling="random", output_axes="lzyx")
-    return VolumeDataset(mcfg)[0]["img"]
-
-def probe_volume_config(vol: ProbeVolume, box: list[list[int]] | None, patch: list[int]) -> MiaoConfig:
-    """miao reading patches (Z Y X, 8 nm voxels) of vol within box (Z Y X, level-0 voxels; None: anywhere), image and
-    labels, on a grid (sequential): the first is the one nearest the box's low corner miao's read margins allow."""
-    from miao.config import VolumeConfig
-    lo, hi = vol.clip or (None, None)
-    vc = VolumeConfig(name=vol.name, path=vol.path, image_key="raw", label_key=f"labels/{vol.label_key}", zarr_version="zarr3",
-                      normalize_min=lo, normalize_max=hi, bounding_box=box)
-    return MiaoConfig(volumes=[vc], patch_size=patch, resolutions=[[8.0, 8.0, 8.0]], samples_per_epoch=1, sampling="sequential", output_axes="lzyx")
-
-def volume_grid(vol: ProbeVolume) -> tuple[np.ndarray, np.ndarray]:
-    """(level-0 voxel size in nm, level-0 shape), each Z Y X, of vol's image, as miao resolves them (its OME transforms,
-    expansion-corrected for ExM). Read off miao's VolumeInfo, which has no public accessor."""
-    info = VolumeDataset(probe_volume_config(vol, None, [8, 8, 8]).model_copy(update={"sampling": "random"}))._volumes[0]  # no grid
-    order = [info.img_spatial_axes.index(a) for a in "zyx"]
-    return np.asarray(info.finest_voxel_size)[order], np.asarray(info.image_meta.scales[0].shape)[info.img_spatial_idx][order]
-
-def read_window(vol: ProbeVolume, center, size: list[int]):
-    """(img in [0, 1], labels int64), each Z Y X: size voxels at 8 nm about center (Z Y X, level-0 voxels) of vol, read as
-    training reads (miao: resampled to 8 nm, normalized; labels nearest). What lies outside the volume is edge-replicated
-    in the image and 0 (ignored) in the labels, as is the volume's outermost voxel (miao keeps a voxel's slack inside the
-    box it reads from: checked on hemibrain, where 8 nm is native and every other voxel equals the stored one)."""
-    import torch.nn.functional as F
-    vox, shape = volume_grid(vol)
-    want = np.array(size)
-    low = center - want * 4 / vox  # the window's low corner, level-0 voxels
-    # The box: the window and 2 margins (8 nm voxels) below it, 4 above, cut to the volume. miao's first read of it (its grid,
-    # sequential) starts a little past the box's corner (its slack for resampling and a coarser label pyramid), under 2
-    # margins before the window, so a patch 3 margins longer than the window covers it, if the box holds it with that
-    # slack: at the volume's edge, the patch is cut to the most the box holds, the least slack miao accepts (it says how
-    # little by refusing, its bounds being private). Then the window is cut out of the read, where it landed.
-    lo = np.clip(np.floor(low - 2 * PROBE_MARGIN * 8 / vox), 0, shape).astype(int)
-    hi = np.clip(np.ceil(low + (want + 4 * PROBE_MARGIN) * 8 / vox), 0, shape).astype(int)
-    box = [[int(l), int(h)] for l, h in zip(lo, hi)]
-
-    def first_read():  # (patch, its sample) at the least slack miao accepts
-        for slack in (2, 4, 8, PROBE_MARGIN):
-            patch = np.minimum(want + 3 * PROBE_MARGIN, ((hi - lo) * vox / 8).astype(int) - slack)
-            try:
-                return patch, VolumeDataset(probe_volume_config(vol, box, patch.tolist()))[0]
-            except ValueError:  # "bounding_box ... too small to contain the requested window"
-                pass
-        assert False, f"{vol.name}: miao reads no window from {box}, even {PROBE_MARGIN} voxels smaller"
-
-    patch, sample = first_read()
-    img, lab = sample["img"][0], sample["label"][0].long()
-    start = np.round((np.asarray(sample["bbox"][0][0]) / vox - low) * vox / 8).astype(int)  # the read's corner in the window
-    a, b = np.clip(-start, 0, patch), np.clip(want - start, 0, patch)  # the read's part inside the window
-    img, lab = img[a[0]:b[0], a[1]:b[1], a[2]:b[2]], lab[a[0]:b[0], a[1]:b[1], a[2]:b[2]]
-    before = np.maximum(start, 0)
-    after = want - before - (b - a)  # what the volume doesn't hold, padded
-    pad = [int(n) for lo_, hi_ in zip(before[::-1], after[::-1]) for n in (lo_, hi_)]  # F.pad: last axis first
-    return F.pad(img[None, None], pad, mode="replicate")[0, 0], F.pad(lab, pad, value=0)
-
-def pca_rgb(f, size):
-    """N D tokens of a size (... ) box -> (... 3 uint8: the top 3 principal components, each scaled 1st-99th percentile;
-    effective rank, ~1 a collapse; top-10 explained variance)."""
-    import torch
-    f = f - f.mean(0)
-    _, sv, vh = torch.linalg.svd(f, full_matrices=False)
-    p = sv / sv.sum()
-    erank = float(torch.exp(-(p * p.clamp_min(1e-12).log()).sum()))
-    pcs = (f @ vh[:3].T).reshape(*size, 3)
-    lo, hi = torch.quantile(pcs.reshape(-1, 3), torch.tensor([0.01, 0.99], device=f.device), dim=0)
-    rgb = ((pcs - lo) / (hi - lo)).clamp(0, 1).mul(255).byte().cpu().numpy()
-    return rgb, erank, (sv ** 2 / (sv ** 2).sum())[:10].tolist()
-
 def pca_maps(encoder, par: Train, savedir: Path, step: int):
     """PCA maps of patch-token embeddings on a held-out EB val crop -> savedir/pca2.png, pca.json.
 
@@ -997,109 +920,6 @@ def score(job: Eval | str):
     print(" ".join(cmd), flush=True)
     subprocess.run(cmd, check=True, cwd=MIA_EVALS)  # absolute paths: the cwd is mia-evals'
     shutil.rmtree(savedir / "probe")  # the artifacts are scored (the record is in mia_evals/): GBs per run, not kept
-
-def tile_features(encoder, img, tile):
-    """Encoder tokens (after its final LayerNorm) of img (Z Y X in [0, 1], on the encoder's device, a multiple of
-    tile), from non-overlapping tiles at the training global-view size, stitched: Gz Gy Gx D, bf16."""
-    import torch
-    p = encoder.patch_embed.patch_size
-    assert all(s % t == 0 for s, t in zip(img.shape, tile)), f"{tuple(img.shape)} must tile by {tile}"
-    g = [t // q for t, q in zip(tile, p)]  # tokens per tile side
-    feats = torch.empty(*(s // q for s, q in zip(img.shape, p)), encoder.config.embed_dim, dtype=torch.bfloat16, device=img.device)
-    with torch.no_grad(), torch.autocast(img.device.type, dtype=torch.bfloat16, enabled=img.device.type == "cuda"):
-        for z, y, x in product(*(range(0, s, t) for s, t in zip(img.shape, tile))):
-            t = encoder.forward_features(img[None, None, z:z + tile[0], y:y + tile[1], x:x + tile[2]])
-            feats[z // p[0]:z // p[0] + g[0], y // p[1]:y // p[1] + g[1], x // p[2]:x // p[2] + g[2]] = t[0].reshape(*g, -1)
-    return feats
-
-def tile_logits(model, img, tile):
-    """A dense model's (lib.decoders.unetr.Unetr) raw per-voxel logits over img (Z Y X in [0, 1], on the model's
-    device, a multiple of tile), from tile-sized crops at the training global-view size, half a tile apart, blended:
-    OutDim Z Y X. Unlike tile_features (whose Linear head needs no spatial context beyond one token's own patch),
-    this tiles the whole model (encoder + decoder), since Unetr's skip connections need a full crop each call.
-    A crop's voxels near its faces see little context, so each is weighted by a Hann window (0 at the faces, 1 at the
-    centre; two crops half a tile apart sum to 1): the faces drop out where another crop covers them. The outer half tile
-    of img has only one crop over it, so it is poorly predicted: read img with half a tile of context (read_block) and trim."""
-    import torch
-    assert all(s % t == 0 for s, t in zip(img.shape, tile)), f"{tuple(img.shape)} must tile by {tile}"
-    ramp = [torch.sin(torch.pi * (torch.arange(t, device=img.device) + 0.5) / t) ** 2 for t in tile]  # t per axis
-    starts = [range(0, s - t // 2, t // 2) for s, t in zip(img.shape, tile)]
-    norm = [torch.zeros(s, device=img.device) for s in img.shape]  # per axis, the summed windows over it (the weights are separable)
-    for n, r, ss, t in zip(norm, ramp, starts, tile):
-        for s in ss:
-            n[s:s + t] += r
-    out = None
-    with torch.no_grad():
-        for z, y, x in product(*starts):
-            logits = model(img[None, None, z:z + tile[0], y:y + tile[1], x:x + tile[2]])[0]  # OutDim tz ty tx
-            if out is None:
-                out = torch.zeros(logits.shape[0], *img.shape, dtype=logits.dtype, device=img.device)
-            out[:, z:z + tile[0], y:y + tile[1], x:x + tile[2]] += logits * (ramp[0][:, None, None] * ramp[1][None, :, None] * ramp[2][None, None, :])
-    assert out is not None, "img must be nonempty"
-    return out.div_(norm[0][:, None, None]).div_(norm[1][None, :, None]).div_(norm[2][None, None, :])
-
-def write_affinities(path: Path, array, **attrs):
-    """A mia-evals affinity artifact (its artifact.write_artifact layout): one zarr array, Channel X Y Z, whose attrs say
-    how to read it (kind, origin, convention, axes, native_box, scale, ...). mia-evals validates it when it scores it."""
-    import zarr
-    store = zarr.open_array(str(path), mode="w", shape=array.shape, dtype=array.dtype, chunks=tuple(min(256, s) for s in array.shape))
-    store[:] = array
-    store.attrs.update(kind="affinity", **attrs)
-
-def inner(x, m, size):
-    """x's (... Z Y X) box of size (Z Y X) at offset m (Z Y X): read_block's box, within its padded region."""
-    return x[..., m[0]:m[0] + size[0], m[1]:m[1] + size[1], m[2]:m[2] + size[2]]
-
-def read_block(vol: ProbeVolume, tile, p, device, side: int = PROBE_SIDE, context: bool = False):
-    """vol's box cut to whole patches (p, Z Y X) at most side a side about its centre, read at 8 nm (read_window) with whole
-    tiles of context around it: (img Z Y X [the padded region, a multiple of tile, on device], labels Z Y X [the box's],
-    m [the box's offset in img, whole patches], size [the box's]). A model tiles img (tile_features, tile_logits); inner(x, m,
-    size) trims what it makes, or img itself (the box's EM), back to the box. context: at least half a tile of it on every side,
-    which tile_logits' blending needs."""
-    vox, _ = volume_grid(vol)
-    lo, hi = np.array([b[0] for b in vol.box][::-1]), np.array([b[1] for b in vol.box][::-1])  # z y x, level-0 voxels
-    size = [int(min(s - s % q, side)) for s, q in zip(((hi - lo) * vox / 8).astype(int), p)]  # ints, not numpy's: json writes them
-    region = [math.ceil((s + context * t) / t) * t for s, t in zip(size, tile)]  # whole tiles around the box
-    m = [(r - s) // 2 // q * q for r, s, q in zip(region, size, p)]
-    img, lab = read_window(vol, (lo + hi) / 2, region)
-    return img.to(device), inner(lab, m, size).contiguous().to(device), m, size
-
-def score_block(pred, labels, sparse: bool) -> dict:
-    """pred (C Z Y X affinity probabilities) against the affinities of labels (Z Y X instance ids; sparse: ProbeVolume.sparse),
-    per channel: BCE, boundary AP (boundary = different objects) and the boundary base rate, on a fixed random subset (at most
-    10M) of its valid pairs."""
-    import torch
-    from lib.probe import AFFINITY_OFFSETS_XYZ, affinities, average_precision
-    aff, valid = affinities(labels, [o[::-1] for o in AFFINITY_OFFSETS_XYZ], sparse)  # x y z offsets; the model sees z y x
-    g = torch.Generator(device=labels.device).manual_seed(0)
-    s = {}
-    for c, o in enumerate(AFFINITY_OFFSETS_XYZ):
-        idx = valid[c].nonzero()
-        idx = idx[torch.randint(len(idx), (min(len(idx), 10_000_000),), device=labels.device, generator=g)]
-        q, t = pred[c][tuple(idx.T)].float(), aff[c][tuple(idx.T)].float()
-        s[f"bce_{o}"] = float(torch.nn.functional.binary_cross_entropy(q.clamp(1e-6, 1 - 1e-6), t))
-        s[f"boundary_ap_{o}"] = average_precision(1 - q, 1 - t)
-        s[f"boundary_frac_{o}"] = float(1 - t.mean())
-    return s
-
-def mean_scores(per_block: list[dict]) -> dict:
-    """score_block's dicts averaged over the test blocks (equally, as lmd_ssl_v1 weights its volumes), plus
-    boundary_ap_short: the mean of the three short-range (+1) channels' AP."""
-    from lib.probe import AFFINITY_OFFSETS_XYZ
-    s = {k: sum(b[k] for b in per_block) / len(per_block) for k in per_block[0]}
-    s["boundary_ap_short"] = sum(s[f"boundary_ap_{o}"] for o in AFFINITY_OFFSETS_XYZ[:3]) / 3
-    return s
-
-def boundary_png(path: Path, em, labels, pred):
-    """A block's middle z: EM | true boundaries | predicted boundaries (1 - min of the 3 short-range affinities)."""
-    import torch
-    from PIL import Image
-    from lib.probe import AFFINITY_OFFSETS_XYZ, affinities
-    zm = labels.shape[0] // 2
-    aff, _ = affinities(labels[zm:zm + 2], [o[::-1] for o in AFFINITY_OFFSETS_XYZ[:3]])  # short range: the next slice is enough
-    row = [em[zm], 1 - aff[:, 0].float().amin(0), 1 - pred[:3, zm].float().amin(0)]
-    gap = torch.ones(row[0].shape[0], 8, device=em.device)
-    Image.fromarray((torch.cat([row[0], gap, row[1], gap, row[2]], 1) * 255).byte().cpu().numpy()).save(path)
 
 def probe(job: Eval | str):
     """Linear affinity probe (lib.probe) of the spec job's weights (or those of the eval.json it names), frozen: one Linear per
