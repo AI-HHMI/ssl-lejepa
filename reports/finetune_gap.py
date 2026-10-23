@@ -10,7 +10,8 @@ from pathlib import Path
 from statistics import mean
 
 import plots_interactive as pi
-from analysis_utils import boundary_ap, job_text, job_walltime_s, read_jsonl, run_dirs, saved_params
+from analysis_plots import trunk_loss_curves
+from analysis_utils import boundary_ap, job_text, job_walltime_s, read_jsonl, run_dirs, saved_params, trunk_metrics
 from reports import page
 
 SWEEP = "e00/e10-finetune-gap"
@@ -197,6 +198,7 @@ def build() -> tuple:
         ("Curves: short AP", page.wide([lines(SHORT, s, side) for s, side in cells])),
         ("Curves: long AP", page.wide([lines(LONG, s, side) for s, side in cells])),
         ("Encoders", trunk_cards()),
+        ("Loss trajectories", trunk_loss_curves({TRUNKS[d.name]: trunk_metrics(d) for d in run_dirs(SWEEP)[:4]}, ["loss", "inv", "sigreg"])),  # inv, sigreg: the LeJEPA models only
         ("Predictions", [("Test block after 10k steps, frozen encoder, 256^3 of GT, blended overlapping tiles; full screen: each row a layer, with its own opacity",
                           prediction_grid(runs))]),
         ("All finetunes", [("AP at 10k fit steps, the GT it fit (labelled voxels) and its job's minutes",

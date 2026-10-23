@@ -19,6 +19,8 @@ sh serve.sh
 # Improve and rerender an experiment report, e.g.
 python reports/viewsizes_v2.py
 ```
+Every report of training runs has a "Loss trajectories" section: `analysis_plots.trunk_loss_curves(...)` with `["loss", "inv", "sigreg"]`
+(a run without a term, e.g. an MAE's inv, is left out of that card), plus any other logged term the experiment varies.
 
 Repro an experiment e.g.
 ```sh
