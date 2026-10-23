@@ -150,15 +150,17 @@ def ranking(g: list[dict], metric: str, by: str) -> tuple:
 
 def trunk_cards() -> list:
     """The pretraining runs: linear probe at each milestone and at the end, against the run each repeats."""
-    rows, series = [], {}
+    rows, series, long_series = [], {}, {}
     for d in run_dirs(SWEEP)[:4]:
         aps = [(r["step"], boundary_ap(r)) for r in [read_jsonl(f)[-1] for f in sorted(d.glob("step_*/probe.json"))] + read_jsonl(d / "probe.json")]
         series[TRUNKS[d.name]] = ([s for s, _ in aps], [a[SHORT] for _, a in aps])
+        long_series[TRUNKS[d.name]] = ([s for s, _ in aps], [a[LONG] for _, a in aps])
         ref, rs, rl = REFERENCE.get(d.name, ("-", None, None))
         rows.append([TRUNKS[d.name], aps[-1][0], aps[-1][1][SHORT], aps[-1][1][LONG], ref, rs, rl])
     return [("Linear probe on hemibrain EB at the end of pretraining, beside the run each repeats",
              pi.table(["encoder", "steps", "short AP", "long AP", "repeats", "its short AP", "its long AP"], rows)),
-            ("Linear-probe short AP over pretraining (milestones)", pi.lines(series, "pretraining step", "short AP", logx=True))]
+            ("Linear-probe short AP over pretraining (milestones)", pi.lines(series, "pretraining step", "short AP", logx=True)),
+            ("Linear-probe long AP over pretraining (milestones)", pi.lines(long_series, "pretraining step", "long AP", logx=True))]
 
 
 def build() -> tuple:
