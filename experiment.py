@@ -1,15 +1,19 @@
-"""Experiment code (remote): LeJEPA 3D ViT training runs, benchmarks, inference (pca) and replays, and their LSF
-sweep (roots, each trunk evaluating its own milestones; savedirs under outdir/e00/). Depends on lib/, so it runs only from its experiment's commit.
-Each job is an entrypoint taking its spec (Train or Eval) or the path of the spec's json, e.g. `run outdir/.../train.json`:
+"""Experiment code (remote): 3D ViT pretraining runs (LeJEPA, masked tokens, MAE), benchmarks and replays; evals of their weights
+(pca maps, linear probe, mia-evals score) and UNETR finetunes; and their LSF sweep (roots, each trunk evaluating its own milestones;
+savedirs under outdir/e00/). Depends on lib/, so it runs only from its experiment's commit.
+Each job is an entrypoint taking its spec (Train, Eval or Finetune) or the path of the spec's json, e.g. `run outdir/.../train.json`:
 called in-process with the spec, or as an LSF job with the file that submit() writes, so any job can submit another.
+`python experiment.py` or `-h` lists the entrypoints (ENTRYPOINTS, at the bottom).
 Analysis of the results lives in analysis_utils.py (readers), analysis_plots.py (report cards) and reports/ (one page per experiment)."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict, fields, replace
+from dataclasses import dataclass, asdict, replace
 from datetime import timedelta
 import hashlib
-import os, sys
+import inspect
+import os
+import sys
 import json
 import re
 import shutil
@@ -39,21 +43,6 @@ from miao import VolumeDataset, collate_deferred, finish_images
 from pprint import pprint
 import numpy as np
 
-# Default (width, batch per GPU) per LSF GPU queue, for displace 128^3 / 96^3 / 64^3 views. Measured runs cited;
-# "est." sizes extrapolate the measured ~1.7 GB/sample at width 768 and haven't been run. MFU with the Linear
-# patch embedding (patchembed-linear) where measured; older Conv3d-era numbers are marked (conv), 1.1-1.35x lower.
-# All cited speeds used cuDNN attention; runs now use flash (nanhunt_flash), 12-21% slower on H200 and ~30% on B300
-# (b300-compile/d0 vs patchembed-linear/d0).
-QUEUE_ARCH = {
- "gpu_a100": (768, 32),     # patchembed-linear/d3: 54.9% MFU, 262 ktok/s, 55 of 80 GB
- "gpu_rtx6000": (768, 32),  # rtx6k-memory/d5 (conv): 46% MFU, 55 of 95 GB
- "gpu_h200": (768, 64),     # est. ~110 of 140 GB; width 512 x 84: patchembed-linear/d2 37.7% MFU (768 x 84 conv: 38%);
-                            # flash, 512 x 64: cudagraph-fix/d2 32.5% MFU, 995 ktok/s
- "gpu_h100": (768, 32),     # est., same 80 GB as A100
- "gpu_b300": (1024, 64),    # flash: cudagraph-fix/d1 30.2% MFU, 619 ktok/s, 145 of 288 GB (512 x 64: d0 20.5%, 1428).
-                            # (patchembed-linear/d1's 49% was a NaN run: cudagraphs miscompile, see eager_patch_embed)
-}
- 
 # Code copied into .tmpcode/<sweep>/ at submission (bsub); jobs import only from these. Add files here if
 # the experiment starts depending on others. Dependencies (pyproject.toml / uv.lock) are not frozen.
 SNAPSHOT_PATHS = ["experiment.py", "lib", "mia_evals"]
@@ -83,13 +72,6 @@ ANCHOR_STEP_S_M_B84 = 0.32  # cudagraph-fix/d3: 1425 ktok/s at b84, flash + eage
 # costs about the same by FLOPs (sample_flops) but has no measurement of its own yet.
 SCALING_GRID = (12, 12, 12)  # token grid of the view cost estimates assume (a 96^3 view at patch 8)
 BUDGET_HOURS_AT_M = {"c1": 1, "c2": 2, "c3": 4, "c4": 8}  # m's wall-clock at each budget; other sizes get more/fewer steps
-
-def on_queue(p: Train, queue: str) -> Train:
-    """Put p on an LSF GPU queue with that queue's default architecture (QUEUE_ARCH)."""
-    assert queue in QUEUE_ARCH, f"no default architecture for {queue!r}; add it to QUEUE_ARCH"
-    p.queue = queue
-    p.width, p.batch_size = QUEUE_ARCH[queue]
-    return p
 
 def lejepa_n_params(n_layers: int, width: int) -> tuple[int, int, int]:
     """(encoder, predictor, projector) parameter counts of the scaling-law grid's Lejepa at this size. Building the model just to
@@ -336,10 +318,6 @@ def milestone_of(p: Spec) -> str:
     "" for a trunk, and for an eval of another experiment's weights (init_from outside outdir/<EXPERIMENT>/)."""
     return source(p) if source(p).startswith(f"outdir/{EXPERIMENT}/") else ""
 
-def printparams():
-    for p in roots():
-        pprint(p)
-
 def record(par: Spec, fn: str):
     """Append one row to par.savedir/runs.json: which experiment function ran (fn), its spec (params), code_provenance(),
     argv and LSF job. Written first thing, so even a run that crashes before any results describes itself.
@@ -430,7 +408,6 @@ def save_view_pngs(par: Train, dataset, n_samples: int = 3):
 
 def dataloader(par: Train):
     import torch
-    # volumes = [x.to_miao() for x in lmd.all() if x.name == "exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001"]
     # Training volumes (lib/data.py), images only. Boxes are x y z; output is z y x.
     # miao samples each volume by its weight alone (size_weighting_exponent=0): equally within a family (lib.data.train_volumes),
     # and a joint set's families equally. Every volume is read at 8 nm (resolutions below), resampled where it is stored otherwise.
@@ -456,9 +433,6 @@ def dataloader(par: Train):
       multiprocessing_context="spawn" if par.n_workers else None,
     )
     batches = iter(loader)
-    # pprint(volumes)
-    # pprint(mcfg)
-    # pprint(dl[0]['img'].shape)
     if int(os.environ.get("RANK", 0)) == 0:
         save_view_pngs(par, dl)
     return batches
@@ -821,7 +795,6 @@ def load_checkpoint(e: Eval | Finetune):
     "random": untrained weights, seeded (the baseline every trained encoder must beat). Step 0.
     """
     import torch
-    model = make_model(e.train)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if e.init_from == "random":
         torch.manual_seed(0)
@@ -832,6 +805,7 @@ def load_checkpoint(e: Eval | Finetune):
     ckpt = torch.load(paths[-1], map_location="cpu", weights_only=False)
     if not e.init_from:
         assert json_equal(ckpt["params"], asdict(e.train)), f"{paths[-1]} was made by other params: run from its experiment's commit"
+    model = make_model(e.train)
     model.load_state_dict(ckpt["model"])  # strict: architecture drift fails loudly
     return model.to(device).eval(), ckpt["step"]
 
@@ -1006,7 +980,6 @@ def pca_sizes(job: Eval | str):
     EM | PCA of its tokens | PCA after subtracting each tile's mean token, fitted on that slice. The row's effective rank
     and explained variance are of 65536 tokens drawn from the whole crop, its between-tile variance (the share of token
     variance that is each tile's mean) of all of them."""
-    import time
     import torch
     from PIL import Image
     e = load(job, Eval)
@@ -1483,58 +1456,15 @@ def retryall():
             start(r)
 
 
-def mpix_per_week():
-    a = 511e6 * 8 # input-vox/s/node
-    b = 3600 * 24 * 7 # s/week
-    c = 10_000**3 # pix / volume
-    d = 103_884_030_089_749
-
-    r1 = a*b # pix/week 1 node = 2.5e15 = 2500 * c = 2500 volumes / week = 25 volumes / week * 100x augmentation
-    print(r1, c, r1/c)
-    r2 = d   # pix/dataset
-    print(d/(a*b))
-
-
-def test():
-    tot = 0
-    from math import prod
-    for vol in lmd.all():
-        print(vol.name, vol.shape)
-        if vol.shape:
-            tot += prod(vol.shape[-3:])
-
-    print("tot = ", tot) # 103_884_030_089_749
-
-    # import lib.data as libdata
-    # x = libdata.TRAIN_BOXES["hemibrain_eb"][libdata.HEMIBRAIN_EB]
-    # print(x)
-    # x = libdata.TRAIN_BOXES["hemibrain_wide"][libdata.HEMIBRAIN_002]
-    # print(x)
-    # x = libdata.TRAIN_BOXES["hemibrain_wide"][libdata.HEMIBRAIN_003]
-    # print(x)
-    # print(lmd.get(HEMIBRAIN_EB))
-    # print(libdata.hemibrain_wide_config("train"))
-    # for xi in x:
-    #     if "em-drosophila-flyem-hemibrain/crop-001_EllipsoidBody_x24000_y23000_z17000" in xi.name:
-    #         pprint(xi)
-
-def size():
-  import zarr
-  from typing import Any, cast
-  v = lmd.get("exm-drosophila-flyliconn-matt-260601-60X-B4-2-045/crop-001")
-  g = zarr.open_group(v.path, mode="r")[v.image_key]
-  assert isinstance(g, zarr.Group)
-  meta = cast(dict[str, Any], g.attrs.get("ome", g.attrs))
-  a = g[meta["multiscales"][0]["datasets"][0]["path"]]
-  assert isinstance(a, zarr.Array)
-  print(a.size)
-  print(a.shape)
+ENTRYPOINTS = [run, benchmark, replay_bad_batch, pca, pca_sizes, probe, score, finetune, tiles, lsf, replaylsf, submitall, tilesall, retryall]
 
 if __name__ == "__main__":
-    import sys
     print(sys.argv)
-    if len(sys.argv) == 1:
-        pick_entrypoint()
-    else:
-        log_command(sys.argv)  # commands issued outside jobs -> outdir/_log/commands.jsonl; jobs use runs.json
-        call_entrypoint(sys.argv[1], *sys.argv[2:])
+    names = {f.__name__: f for f in ENTRYPOINTS}
+    if len(sys.argv) == 1 or sys.argv[1] in ("-h", "--help"):
+        for name, f in names.items():
+            print(f"  {name}{inspect.signature(f)}  {(f.__doc__ or '').strip().splitlines()[0]}")
+        sys.exit()
+    assert sys.argv[1] in names, f"unknown entrypoint {sys.argv[1]!r}: {', '.join(names)}"
+    log_command(sys.argv)  # commands issued outside jobs -> outdir/_log/commands.jsonl; jobs use runs.json
+    names[sys.argv[1]](*[int(a) if a.isdigit() else a for a in sys.argv[2:]])  # `lsf probe 3`: the target is a roots() index
