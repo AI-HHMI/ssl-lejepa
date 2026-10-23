@@ -10,7 +10,7 @@ Analysis of the results lives in analysis_utils.py (readers), analysis_plots.py 
 
 from __future__ import annotations
 
-from dataclasses import asdict, replace
+from dataclasses import asdict
 import inspect
 import os
 import sys
@@ -19,7 +19,6 @@ import re
 import shutil
 from pathlib import Path
 
-from itertools import product
 
 # local
 
@@ -48,26 +47,18 @@ SCORE_CONFIG = "mia_evals/gary_comparison_neuron_instance/mws.toml"  # ours: tru
 MIA_EVALS = Path.home() / "proj/mia-evals"
 
 # This experiment's id (README: experiment ids): its roots are outdir/<EXPERIMENT>/d<i>/, a trunk's branches in its own dir.
-EXPERIMENT = "e00/e10-finetune-gap"
+EXPERIMENT = "e00/e11-pretrain-b300-48h"
 
 def roots() -> list[Spec]:
     """This experiment: the runs it starts from nothing (trunks, other training runs, evals of another experiment's weights).
     Each trunk evaluates its own milestones as it saves them (eval_milestone)."""
-    # Is pretraining worth it once labels are used to train? unetr-probe's UNETR decoders on pretrained encoders led random ones
-    # early in the fit, then random caught up by ~1-2k of 3k steps. Map the gap: test AP as a function of finetuning compute
-    # (fit steps, scored at doubling steps to 10k: Finetune) and of GT (the fit block cut to a cube of side 128, 256, 512 or
-    # whole: Finetune.fit_side), on all four lmd_ssl_v1 families (sparse ones scoring labelled-vs-unlabelled pairs as
-    # boundaries), the encoder frozen or trained with the decoder. The encoders are trained here, on this commit, so every
-    # load means what it did in training: the best of each objective so far on hemibrain_wide, at one budget (6 h of m,
-    # 12x512, batch 32, one H200, ~0.7x a B300's speed: about e08's 4 h of B300 steps; linear-probe evals at doubling steps
-    # from 5k): e08's MAE (decoder 512x8, view 96 of 128; 0.296 / 0.869 short / long AP at 4 h of B300), e06's masked tokens
-    # at view 64 (shift 24, block 0.6, pull 10, SIGReg "both"; 0.205 / 0.847 at 8 h) and e06's multi-view invariance (input
-    # 128, globals and locals 96; 0.113 / 0.544), and the masked recipe on lmd4 (all four families, as e09). Each finetunes
-    # at its own view, beside a random encoder at views 96 and 64. B300s were full: the trunks on H200s, the finetunes (192
-    # independent jobs) on the larger pool of RTX PRO 6000s (95 GB), their queue set on the Train each carries (submit uses
-    # its queue; it doesn't change the weights). A trunk's finetunes wait in LSF for its training job (submit).
-    BATCH, STEPS, HOURS = 32, 2_560_000, 6
-    SETS, SIDES = ("hemibrain_eb", "fish2", "liconn_mouse", "kasthuri15"), (128, 256, 512, 0)
+    # e10's four pretraining runs, unchanged except the hardware and the budget: each on a full node of 8 B300s for 48 h (e10: 6 h
+    # on one H200), to see what the best of each objective reaches with 8x the GPUs for 8x the time: e08's MAE (decoder 512x8, view
+    # 96 of 128), e06's masked tokens at view 64 (shift 24, block 0.6, pull 10, SIGReg "both") and e06's multi-view invariance
+    # (input 128, globals and locals 96) on hemibrain_wide, and the masked recipe on lmd4 (all four families, as e09). Model m
+    # (12x512), batch 32 per GPU (256 global), linear-probe evals at doubling steps from 5k, as e10. No finetunes: e10's gap is
+    # measured on its own trunks. 4 jobs x 8 GPUs = 4 nodes.
+    BATCH, STEPS, HOURS = 32, 2_560_000, 48
 
     def trunk(objective: Literal["views", "mask", "mae"], data: TrainData, input_size: int, view: int) -> Train:
         p = Train()
@@ -85,7 +76,8 @@ def roots() -> list[Spec]:
         p.adam_beta2 = 0.95
         p.cudagraphs = True
         p.n_workers = 11  # 12 cores per GPU
-        p.queue = "gpu_h200"
+        p.n_gpus = 8
+        p.queue = "gpu_b300"
         return p
 
     def masked(data: TrainData) -> Train:
@@ -102,15 +94,9 @@ def roots() -> list[Spec]:
     views.local_size = (96, 96, 96)
     views.batch_views = True
     views.lamb = 0.1
-    trunks = [mae, masked("hemibrain_wide"), views, masked("lmd4")]
-    runs: list[Spec] = []
-    for p in trunks:
-        p.savedir = f"outdir/{EXPERIMENT}/d{len(runs)}/"
-        runs.append(p)
-    encoders = [(t, t.savedir) for t in trunks] + [(mae, "random"), (trunks[1], "random")]  # random at view 96 and 64
-    for (t, init), s, freeze, side in product(encoders, SETS, (True, False), SIDES):
-        runs.append(Finetune(savedir=f"outdir/{EXPERIMENT}/d{len(runs)}/", train=replace(t, queue="gpu_rtx6000"), init_from=init,
-                             probe_on=s, fit_side=side, freeze_encoder=freeze))
+    runs: list[Spec] = [mae, masked("hemibrain_wide"), views, masked("lmd4")]
+    for i, p in enumerate(runs):
+        p.savedir = f"outdir/{EXPERIMENT}/d{i}/"
     return runs
 
 def milestone_of(p: Spec) -> str:
@@ -390,15 +376,6 @@ def submitall():
         if not spec_path(r).is_file():
             start(r)
 
-def tilesall():
-    """Submit tiles (in place: the run dirs are kept) for the finetunes the e10 report's Predictions panel shows (frozen encoder,
-    256^3 of GT) that have no tiles.png yet. Idempotent."""
-    check_experiment()
-    assert_committed()
-    for r in roots():
-        if isinstance(r, Finetune) and r.freeze_encoder and r.fit_side == 256 and not (Path(r.savedir) / "tiles.png").is_file():
-            submit("tiles", r)
-
 def retryall():
     """Resubmit this experiment's finetunes whose job ended without finishing (its LSF log has its footer, but there is no
     finetune.png, which finetune writes last), fresh (start: the failed dir's contents -> outdir/.trash/). Finished ones,
@@ -413,7 +390,7 @@ def retryall():
             start(r)
 
 
-ENTRYPOINTS = [run, benchmark, replay_bad_batch, pca, pca_sizes, probe, score, finetune, tiles, lsf, replaylsf, submitall, tilesall, retryall]
+ENTRYPOINTS = [run, benchmark, replay_bad_batch, pca, pca_sizes, probe, score, finetune, tiles, lsf, replaylsf, submitall, retryall]
 
 if __name__ == "__main__":
     print(sys.argv)
