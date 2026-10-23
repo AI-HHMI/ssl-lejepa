@@ -9,6 +9,7 @@ import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
+from lib.data import DEFAULT_DATA
 from lib.encoders import EncoderConfig
 from lib.models import Lejepa, LejepaConfig, Mae, MaeConfig, MaskConfig
 from lib.views import ViewConfig
@@ -19,9 +20,9 @@ from lib.types import *
 @dataclass(slots=True)
 class Train:
     savedir: str = "outdir/e00/main/basic/"
-    data: TrainData = "hemibrain_eb"  # training volumes, see lib.data.TRAIN_BOXES
-    probe_sets: tuple[str, ...] = ("hemibrain_eb",)  # run(): the lib.data.PROBE_SETS its end of training is probed on (probe_evals)
-    patch_size: Tup3Int = (104, 104, 104)  # hemibrain EB is 8 nm isotropic
+    data: TrainData = DEFAULT_DATA  # training volumes, see lib.data.TRAIN_BOXES
+    probe_sets: tuple[str, ...] = (DEFAULT_DATA,)  # run(): the lib.data.PROBE_SETS its end of training is probed on (probe_evals)
+    patch_size: Tup3Int = (104, 104, 104)  # voxels are 8 nm isotropic (the dataloader reads every volume at 8 nm)
     batch_size: int = 84
     steps_per_epoch: int = 71  # warmup + benchmark + 1 profiler warmup + profile steps: stop right after profiling.
     # Training runs set it to the expected step count: milestone checkpoints are every 10% of it.
@@ -83,7 +84,7 @@ class Eval:
     init_from: str = ""  # the weights: "" train's own latest checkpoint; a run dir, its latest; a checkpoint .pt; "random" untrained
     score: bool = False  # probe() also writes the affinity artifacts `score` reads (probe/{fit,test}, GBs each; score deletes them after)
     jobs: tuple[str, ...] = ("pca", "probe")  # the entrypoints start() submits for it
-    probe_on: str = "hemibrain_eb"  # probe(): the lib.data.PROBE_SETS it fits on and is scored on
+    probe_on: str = DEFAULT_DATA  # probe(): the lib.data.PROBE_SETS it fits on and is scored on
 
 @dataclass(slots=True)
 class Finetune:
@@ -93,7 +94,7 @@ class Finetune:
     savedir: str
     train: Train  # the weights' run, as Eval.train: its architecture, and its view size (the crops the decoder fits and predicts on)
     init_from: str = ""  # the weights, as Eval.init_from ("random": the from-scratch baseline)
-    probe_on: str = "hemibrain_eb"  # the lib.data.PROBE_SETS whose train block it fits and whose test blocks score it
+    probe_on: str = DEFAULT_DATA  # the lib.data.PROBE_SETS whose train block it fits and whose test blocks score it
     fit_side: int = 0  # >0: fit on a cube of this side (8 nm voxels) about the train block's centre, not all of it (less GT)
     steps: int = 10_000  # fit steps (lib.decoders.unetr.fit_unetr, batch 4), scored at 100, 200, 400, ... and the last
     freeze_encoder: bool = True  # False: train the encoder with the decoder (end-to-end finetuning)
@@ -204,7 +205,7 @@ def own_eval(t: Train) -> Eval:
 def probe_evals(t: Train) -> list[Eval]:
     """The probes run() makes of a training run's own latest checkpoint: own_eval, or, for a run probed on several sets
     (Train.probe_sets), one per set in its own savedir, <savedir>probe_<set>/."""
-    if t.probe_sets == ("hemibrain_eb",):
+    if t.probe_sets == (DEFAULT_DATA,):
         return [own_eval(t)]
     return [Eval(savedir=f"{t.savedir}probe_{s}/", train=t, probe_on=s) for s in t.probe_sets]
 

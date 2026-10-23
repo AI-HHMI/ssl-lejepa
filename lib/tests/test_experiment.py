@@ -55,7 +55,7 @@ def test_pca_releases_its_milestone(tmp_path, monkeypatch):
     (Path(par.savedir) / "probe.json").write_text("{}\n")  # the probe finished first
     monkeypatch.setattr(experiment, "load_checkpoint", lambda p: (SimpleNamespace(encoder=None), 100))
     monkeypatch.setattr(experiment, "record", lambda *a: None)
-    monkeypatch.setattr(evals, "pca_maps", lambda encoder, par, savedir, step: (savedir / "pca.json").write_text("{}\n"))
+    monkeypatch.setattr(evals, "pca_maps", lambda encoder, par, savedir, step, data: (savedir / "pca.json").write_text("{}\n"))
     experiment.pca(par)
     assert not milestone.exists()
 

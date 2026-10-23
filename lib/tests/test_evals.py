@@ -17,7 +17,7 @@ def test_pca_sizes_maps_one_crop_at_each_test_tile(tmp_path, monkeypatch):
     torch.manual_seed(0)
     model = Lejepa(LejepaConfig(encoder=EncoderConfig(depth=1, embed_dim=16, num_heads=2, patch_size=(4, 4, 4)), projector=ProjectorConfig(dim=8, hidden=16))).eval()
     monkeypatch.setattr(evals, "TEST_TILES", (8, 16))
-    monkeypatch.setattr(evals, "eb_val_crop", lambda shape: torch.rand(1, *shape))
+    monkeypatch.setattr(evals, "held_out_crop", lambda data, shape: torch.rand(1, *shape))
     e = Eval(savedir=f"{tmp_path}/", train=Train(), init_from="outdir/e00/x/d0", jobs=("pca_sizes",))
     assert load(str(dump(e)), Eval) == e  # the spec round-trips, jobs and all
     evals.pca_sizes(e, model, 7)

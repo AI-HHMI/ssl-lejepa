@@ -11,17 +11,17 @@ from pathlib import Path
 
 import numpy as np
 
-from lib.data import HEMIBRAIN_EB_LABELS, HEMIBRAIN_EB_PROBE_ANNOTATED, HEMIBRAIN_EB_PROBE_BOXES, PROBE_SETS, ProbeVolume
+from lib.data import ProbeVolume, probe_set
 from lib.inference import boundary_png, mean_scores, pca_rgb, score_block, tile_features, tile_logits, write_affinities
-from lib.readers import PROBE_SIDE, eb_val_crop, inner, read_block
+from lib.readers import PROBE_SIDE, held_out_crop, inner, read_block
 from lib.specs import Eval, Finetune, Train
 from lib.util import *
 
 TEST_TILES = (16, 32, 64, 128, 256, 512)  # pca_sizes: the tile sides an encoder is run at, test time (2^3 to 64^3 tokens)
 
 
-def pca_maps(encoder, par: Train, savedir: Path, step: int):
-    """PCA maps of patch-token embeddings on a held-out EB val crop -> savedir/pca2.png, pca.json.
+def pca_maps(encoder, par: Train, savedir: Path, step: int, data: str):
+    """PCA maps of patch-token embeddings on a crop of dataset data's held-out region (lib.data.held_out) -> savedir/pca2.png, pca.json.
 
     pca2.png rows: the middle z-slice of each of the crop's 3 tile layers (a token's tile is the 96^3 view the encoder
     saw at once, so rows from one layer would share one tile code). Columns: EM | PCA of tokens | PCA after subtracting
@@ -35,7 +35,7 @@ def pca_maps(encoder, par: Train, savedir: Path, step: int):
 
     # 3 tiles deep in z so each row of pca2.png is a different tile.
     shape = (3 * par.global_size[0], 4 * par.global_size[1], 4 * par.global_size[2])
-    img = eb_val_crop(shape)
+    img = held_out_crop(data, shape)
 
     # Tokens from non-overlapping tiles at the training global-view size, stitched into one grid.
     tile, patch = par.global_size, encoder.patch_embed.patch_size
@@ -91,7 +91,7 @@ def pca_maps(encoder, par: Train, savedir: Path, step: int):
           f"between-tile variance {between_tile:.2f}, norm outliers (>2x median) {stats['norm_outliers']}/{norms.numel()}; wrote pca2.png")
 
 def pca_sizes(e: Eval, model, step: int):
-    """The input size at test time: e's model's encoder (weights from step) run on one held-out EB val crop in non-overlapping cubic tiles
+    """The input size at test time: e's model's encoder (weights from step) run on one crop of its probe set's dataset's held-out region in non-overlapping cubic tiles
     of each TEST_TILES side, the crop 2 x 2 tiles of the largest in y x and one deep (so the smallest are many), ->
     savedir/pca_tile_<side>.png and a pca_sizes.json row per side. Each png is one z-slice, the same voxels at every side:
     EM | PCA of its tokens | PCA after subtracting each tile's mean token, fitted on that slice. The row's effective rank
@@ -103,7 +103,7 @@ def pca_sizes(e: Eval, model, step: int):
     p = encoder.patch_embed.patch_size
     big = max(TEST_TILES)
     shape = (big, 2 * big, 2 * big)
-    img = eb_val_crop(shape)[0].to(device)  # Z Y X
+    img = held_out_crop(e.probe_on, shape)[0].to(device)  # Z Y X
     zt = shape[0] // 2 // p[0]  # the slice shown: the middle of a token row near the crop's middle
     em = np.repeat((img[zt * p[0] + p[0] // 2].cpu().numpy() * 255).astype(np.uint8)[..., None], 3, axis=2)
     up = lambda a: a[0].repeat(p[1], axis=0).repeat(p[2], axis=1)  # 1 Gy Gx 3 tokens -> Y X 3 voxels
@@ -138,7 +138,7 @@ def probe(par: Eval, model, step: int):
       savedir/probe_fit.json      the fit curve every 100 steps: training loss, and BCE and boundary AP on a
                                   fixed held-out sample (monitoring only, nothing selects on it)
     Weights: par.init_from (load_checkpoint): this run's checkpoint, an older run's, or random (the baseline).
-      savedir/probe/{fit,test}/hemibrain_eb_{split}.zarr   mia-evals affinity artifacts, (6, X, Y, Z) float16, for
+      savedir/probe/{fit,test}/<probe_on>_{split}.zarr   mia-evals affinity artifacts, (6, X, Y, Z) float16, for
                                   `mia-evals score` with truth_kind = "instances" (reads the GT from the store)
       savedir/probe.png           test block, middle z: EM | true boundaries | predicted boundaries (probe_<block>.png
                                   for any further test blocks)
@@ -150,8 +150,8 @@ def probe(par: Eval, model, step: int):
     tile = par.train.global_size
     encoder, device = model.encoder, next(model.parameters()).device
     p = encoder.patch_embed.patch_size
-    sets = PROBE_SETS[par.probe_on]
-    assert not par.score or par.probe_on == "hemibrain_eb", f"{par.savedir}: score is hemibrain_eb's (its artifacts and boxes), not {par.probe_on}'s"
+    sets = probe_set(par.probe_on)
+    assert not par.score or "fit" in sets, f"{par.savedir}: no mia-evals fit block for {par.probe_on} (a probe set with a \"fit\" split), to score"
     assert len(sets["train"]) == 1, f"{par.probe_on}: the probe fits on one block"
     assert len(set(p)) == 1, f"patch {p} must be cubic"
     offsets = [o[::-1] for o in AFFINITY_OFFSETS_XYZ]  # x y z offsets; the model sees z y x
@@ -184,10 +184,10 @@ def probe(par: Eval, model, step: int):
 
     def artifact(split: str, vol: ProbeVolume, pred):  # for score
         (x0, _), (y0, _), (z0, _) = vol.box
-        write_affinities(Path(par.savedir) / "probe" / split / f"hemibrain_eb_{split}.zarr", pred.permute(0, 3, 2, 1).cpu().numpy(),
+        write_affinities(Path(par.savedir) / "probe" / split / f"{par.probe_on}_{split}.zarr", pred.permute(0, 3, 2, 1).cpu().numpy(),
                          origin=[x0, y0, z0], convention="sigmoid(logit), linear decoder",
-                         run=run_name, step=step, axes="xyz", source_path=vol.path, source_label_key=HEMIBRAIN_EB_LABELS,
-                         native_box=vol.box, scale=[1, 1, 1], annotated_box=HEMIBRAIN_EB_PROBE_ANNOTATED[split], covers_full_box=False)
+                         run=run_name, step=step, axes="xyz", source_path=vol.path, source_label_key=f"labels/{vol.label_key}",
+                         native_box=vol.box, scale=[1, 1, 1], annotated_box=vol.annotated, covers_full_box=False)
 
     (Path(par.savedir) / "probe_fit.json").write_text("".join(json.dumps({"tbl": "probe_fit", **c}) + "\n" for c in curve))
     per_block = []
@@ -197,8 +197,8 @@ def probe(par: Eval, model, step: int):
         boundary_png(Path(par.savedir) / ("probe.png" if k == 0 else f"probe_{vol.name}.png"), inner(img, m, size), labels, pred)
         if par.score:
             artifact("test", vol, pred)
-    if par.score:  # also hemibrain_eb's mia-evals fit block, whose predictions only feed the artifacts
-        vol = ProbeVolume("hemibrain_eb_fit", sets["test"][0].path, sets["test"][0].label_key, HEMIBRAIN_EB_PROBE_BOXES["fit"])
+    if par.score:  # also the set's mia-evals fit block, whose predictions only feed the artifacts
+        vol = sets["fit"][0]
         img, _, m, size = read_block(vol, tile, p, device)
         artifact("fit", vol, predict(img, m, size))
     stats = {"tbl": "probe", "step": step, "run": run_name, "probe_on": par.probe_on, "test_blocks": [v.name for v in sets["test"]],
@@ -217,7 +217,7 @@ def fit_decoder(par: Finetune, model, score=None):
     tile = par.train.global_size
     encoder, device = model.encoder, next(model.parameters()).device
     p = encoder.patch_embed.patch_size
-    sets = PROBE_SETS[par.probe_on]
+    sets = probe_set(par.probe_on)
     side = par.fit_side or PROBE_SIDE
     assert len(sets["train"]) == 1, f"{par.probe_on}: the fit is on one block"
     assert side % p[0] == 0, f"{par.savedir}: fit_side {side} must be whole patches of {p[0]}"
@@ -248,7 +248,7 @@ def finetune(par: Finetune, model, step: int):
                               (finetune_<block>.png for any further test blocks), written last: the job finished
     """
     tile, p, device = par.train.global_size, model.encoder.patch_embed.patch_size, next(model.parameters()).device
-    sets = PROBE_SETS[par.probe_on]
+    sets = probe_set(par.probe_on)
     tests = [read_block(v, tile, p, device, context=True) for v in sets["test"]]  # (img, labels, m, size) each
 
     def test_scores(unetr) -> dict:
@@ -268,7 +268,7 @@ def tiles(par: Finetune, model, step: int):
     predictions, redone with the current tiling; nothing else is written."""
     unetr, _, _ = fit_decoder(par, model)
     tile, p, device = par.train.global_size, model.encoder.patch_embed.patch_size, next(model.parameters()).device
-    img, labels, m, size = read_block(PROBE_SETS[par.probe_on]["test"][0], tile, p, device, context=True)
+    img, labels, m, size = read_block(probe_set(par.probe_on)["test"][0], tile, p, device, context=True)
     boundary_png(Path(par.savedir) / "tiles.png", inner(img, m, size), labels, predict_block(unetr, tile, img, m, size))
     print(f"{par.savedir}: wrote tiles.png, finetune of step {step} for {par.steps} steps", flush=True)
 

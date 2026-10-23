@@ -1,15 +1,19 @@
-"""Training/eval volume definitions (lmd catalog + miao): hemibrain, and the four families of mia-evals' lmd_ssl_v1."""
+"""Training/eval volume definitions (lmd catalog + miao): hemibrain, and the four families of mia-evals' lmd_ssl_v1.
+A dataset is a few crops, each with raw and labels, and has the same three views here, by its name:
+  TRAIN_BOXES / train_volumes(name)   its crops' images that pretraining samples (never its eval blocks)
+  PROBE_SETS / probe_set(name)        labelled blocks: "train" (the probe or decoder fits on it), "test" (scored), and for a set
+                                      mia-evals scores, "fit" (tunes its post-processing)
+  HELD_OUT / held_out(name)           a region no training sees, and the window of it that PCA maps are drawn on"""
 
 from __future__ import annotations
 
 from typing import NamedTuple
 
-import lmd_catalog as lmd
-from miao.config import MiaoConfig
-
 # from lib.types import TrainData
 from typing import Literal
 TrainData = Literal["hemibrain_eb", "hemibrain_wide", "fish2", "liconn_mouse", "microns", "lmd4"]  # keys of lib.data.TRAIN_BOXES, or JOINT_DATA
+
+DEFAULT_DATA = "hemibrain_eb"  # the dataset a spec trains on, probes and maps unless it says otherwise (every run so far)
 
 LMD_DATA = "/groups/miaai/miaai/lmd-v0.0.1/data"  # the catalog's stores, <catalog name>.zarr
 
@@ -92,6 +96,7 @@ class ProbeVolume(NamedTuple):
     box: list[list[int]]  # [lo, hi) level-0 voxels, x y z
     clip: tuple[float, float] | None = None  # uint16 images: the [lo, hi] mapped to [0, 1] (miao's normalize_min / _max)
     sparse: bool = False  # its labels are whole cells but not every cell: labelled against unlabelled is a boundary (lib.probe.affinities)
+    annotated: list[list[int]] | None = None  # mia-evals' annotated box around a fit or test block (its artifact's provenance), x y z
 
 
 def _lmd_ssl_v1(name: str, catalog: str, label_key: str, box: list[list[int]], clip: tuple[float, float] | None = None) -> ProbeVolume:
@@ -105,7 +110,8 @@ def _lmd_ssl_v1(name: str, catalog: str, label_key: str, box: list[list[int]], c
 # copied 2026-10-18): its fit half the probe's train, its test half the test, boxes and clip ranges as there.
 PROBE_SETS: dict[str, dict[str, list[ProbeVolume]]] = {
     "hemibrain_eb": {split: [ProbeVolume(f"hemibrain_eb_{split}", f"{LMD_DATA}/{HEMIBRAIN_EB}.zarr", HEMIBRAIN_EB_LABELS.removeprefix("labels/"),
-                                         HEMIBRAIN_EB_PROBE_BOXES[split])] for split in ("train", "test")},
+                                         HEMIBRAIN_EB_PROBE_BOXES[split], annotated=HEMIBRAIN_EB_PROBE_ANNOTATED.get(split))]
+                     for split in ("train", "fit", "test")},
     "kasthuri15": {
         "train": [_lmd_ssl_v1("kasthuri15_ac3", "em-mouse-Kasthuri15-ac3ac4-cortex/crop-001_ac3_100slices", "public_gt-cell-kasthuri15", [[0, 1024], [0, 1024], [0, 100]])],
         "test": [_lmd_ssl_v1("kasthuri15_ac4", "em-mouse-Kasthuri15-ac3ac4-cortex/crop-002_ac4_100slices", "public_gt-cell-kasthuri15", [[0, 1024], [0, 1024], [0, 100]])],
@@ -123,33 +129,25 @@ PROBE_SETS: dict[str, dict[str, list[ProbeVolume]]] = {
     },
 }
 
-def hemibrain_eb_config(split: str) -> MiaoConfig:
-    """MiaoConfig equivalent to gary_comparison's hemibrain_eb_{split}.yaml (minus defer_image_ops)."""
-    assert split in HEMIBRAIN_EB_BOXES, f"split must be one of {list(HEMIBRAIN_EB_BOXES)}, got {split!r}"
-    vol = lmd.get(HEMIBRAIN_EB).to_miao(
-        spatial_axes="xyz",
-        label_key="labels/proofread-cell-hemibrain-v1.2",
-        bounding_box=HEMIBRAIN_EB_BOXES[split],
-    )
-    return MiaoConfig(
-        volumes=[vol],
-        resolutions=[[8.0, 8.0, 8.0]],
-        patch_size=[256, 256, 256],
-        output_axes="lcxyz",
-        samples_per_epoch=100000 if split == "train" else 32,
-    )
 
-def hemibrain_wide_config(split: str) -> MiaoConfig:
-    """MiaoConfig over TRAIN_BOXES["hemibrain_wide"]'s volumes (crop-002 + crop-003, ~2.1 Tvox combined).
+def probe_set(name: str) -> dict[str, list[ProbeVolume]]:
+    """The labelled blocks of probe set name: "train", "test" and, if mia-evals scores it, "fit"."""
+    assert name in PROBE_SETS, f"no probe set {name!r}: {list(PROBE_SETS)}"
+    return PROBE_SETS[name]
 
-    Only "train" is defined: no held-out region has been carved out of this corpus, so training loss here reflects
-    repeated passes over a fixed corpus at the smaller end of a compute budget, not a genuine held-out metric."""
-    assert split == "train", f"split must be 'train' (no val/test defined for hemibrain_wide yet), got {split!r}"
-    volumes = [lmd.get(name).to_miao(spatial_axes="xyz", bounding_box=box) for name, box in TRAIN_BOXES["hemibrain_wide"].items()]
-    return MiaoConfig(
-        volumes=volumes,
-        resolutions=[[8.0, 8.0, 8.0]],
-        patch_size=[256, 256, 256],
-        output_axes="lcxyz",
-        samples_per_epoch=100000,
-    )
+
+class HeldOut(NamedTuple):
+    """A region of one crop that no training sees, and where PCA maps look in it."""
+    path: str  # catalog name of the crop
+    region: list[list[int]]  # [lo, hi) level-0 voxels, z y x
+    origin: tuple[int, int, int]  # z y x: a window's low corner
+
+
+HELD_OUT: dict[str, HeldOut] = {
+    "hemibrain_eb": HeldOut(HEMIBRAIN_EB, [[3000, 4000], [0, 5000], [0, 5000]], (3400, 2000, 2000)),  # its val slab, EB z 3000-4000
+}
+
+
+def held_out(name: str) -> HeldOut:
+    assert name in HELD_OUT, f"no held-out region for {name!r} (add it to lib.data.HELD_OUT): {list(HELD_OUT)}"
+    return HELD_OUT[name]

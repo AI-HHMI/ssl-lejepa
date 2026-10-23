@@ -36,11 +36,9 @@ def synthetic_store(tmp_path, monkeypatch, sets=None):
         img = torch.nn.functional.pad(raw[a[0]:b[0], a[1]:b[1], a[2]:b[2]][None, None], pad, mode="replicate")[0, 0]
         return img, torch.nn.functional.pad(lab[a[0]:b[0], a[1]:b[1], a[2]:b[2]], pad, value=0)
 
-    vol = lambda name, box: lib.data.ProbeVolume(name, str(tmp_path / "crop.zarr"), "cells", box)
-    monkeypatch.setattr(evals, "PROBE_SETS", {"hemibrain_eb": {s: [vol(f"hemibrain_eb_{s}", BOXES[s])] for s in ("train", "test")},
-                                                   **{name: {s: [vol(*v) for v in vs] for s, vs in splits.items()} for name, splits in (sets or {}).items()}})
-    monkeypatch.setattr(evals, "HEMIBRAIN_EB_PROBE_BOXES", BOXES)
-    monkeypatch.setattr(evals, "HEMIBRAIN_EB_PROBE_ANNOTATED", {k: v for k, v in BOXES.items() if k != "train"})
+    vol = lambda name, box, annotated=None: lib.data.ProbeVolume(name, str(tmp_path / "crop.zarr"), "cells", box, annotated=annotated)
+    monkeypatch.setattr(lib.data, "PROBE_SETS", {"hemibrain_eb": {s: [vol(f"hemibrain_eb_{s}", BOXES[s], BOXES[s] if s != "train" else None)] for s in BOXES},
+                                                 **{name: {s: [vol(*v) for v in vs] for s, vs in splits.items()} for name, splits in (sets or {}).items()}})
     monkeypatch.setattr(lib.readers, "volume_grid", lambda vol: (np.array([8.0, 8.0, 8.0]), np.array([64, 64, 64])))
     monkeypatch.setattr(lib.readers, "read_window", read_window)
     monkeypatch.setattr(lib.probe, "FIT_STEPS", 300)  # the linear probe's fit: plenty for the store's one split
@@ -63,8 +61,8 @@ def test_sparse_labels_score_a_labelled_cell_against_unlabelled_as_a_boundary():
     assert aff[0, 0, 0].tolist() == [True, False, False, False, False, False]  # same object only within cell 1
     assert dense[0, 0, 0].tolist() == [True, False, False, False, False, False]  # both labelled: cell 1's inside only
     assert sparse[0, 0, 0].tolist() == [True, True, True, True, False, False]  # one labelled: its edges too, not 0 vs 0
-    assert all(v.sparse for s in evals.PROBE_SETS.values() for vs in s.values() for v in vs if not v.name.startswith("hemibrain"))
-    assert not any(v.sparse for vs in evals.PROBE_SETS["hemibrain_eb"].values() for v in vs)  # dense proofread: unchanged
+    assert all(v.sparse for s in lib.data.PROBE_SETS.values() for vs in s.values() for v in vs if not v.name.startswith("hemibrain"))
+    assert not any(v.sparse for vs in lib.data.PROBE_SETS["hemibrain_eb"].values() for v in vs)  # dense proofread: unchanged
 
 
 def test_tokens_voxels_round_trip():
@@ -100,7 +98,6 @@ def test_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch, score):
     synthetic_store(tmp_path, monkeypatch)
     par = specs.Eval(savedir=str(tmp_path / "run"), train=specs.Train(global_size=(24, 24, 24)), score=score)  # 32^3 boxes -> 48^3 of context
     (tmp_path / "run").mkdir()
-    monkeypatch.setattr(evals, "HEMIBRAIN_EB_LABELS", "labels/cells")
     model = Lejepa(TINY)
     evals.probe(par, model.eval(), 7)
 
@@ -168,8 +165,18 @@ def test_probe_on_another_set_averages_its_test_blocks(tmp_path, monkeypatch):
     frac = stats["boundary_frac_(1, 0, 0)"]
     assert abs(frac - 1 / 31) < 0.003 and stats["boundary_frac_(0, 1, 0)"] == 0
     assert (tmp_path / "run/probe.png").is_file() and (tmp_path / "run/probe_two_b.png").is_file()
-    with pytest.raises(AssertionError, match="hemibrain_eb's"):
+    with pytest.raises(AssertionError, match="no mia-evals fit block for two"):
         evals.probe(specs.Eval(savedir=str(tmp_path / "run"), train=par.train, probe_on="two", score=True), model, 7)
+
+
+def test_score_artifacts_of_any_set_with_a_fit_block_are_named_for_it(tmp_path, monkeypatch):
+    box = [[24, 56], [24, 56], [24, 56]]
+    synthetic_store(tmp_path, monkeypatch, {"three": {"train": [("three_train", box)], "fit": [("three_fit", box, [[20, 60]] * 3)], "test": [("three_test", box, [[22, 58]] * 3)]}})
+    (tmp_path / "run").mkdir()
+    evals.probe(specs.Eval(savedir=str(tmp_path / "run"), train=specs.Train(global_size=(24, 24, 24)), probe_on="three", score=True), Lejepa(TINY).eval(), 7)
+    art = zarr.open_array(str(tmp_path / "run/probe/test/three_test.zarr"), mode="r")
+    assert dict(art.attrs)["annotated_box"] == [[22, 58]] * 3 and dict(art.attrs)["source_label_key"] == "labels/cells"
+    assert (tmp_path / "run/probe/fit/three_fit.zarr").is_dir()
 
 
 def test_load_checkpoint_init_from(tmp_path, monkeypatch):

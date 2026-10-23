@@ -9,19 +9,20 @@ import lmd_catalog as lmd
 from miao import VolumeDataset
 from miao.config import MiaoConfig
 
-from lib.data import HEMIBRAIN_EB, ProbeVolume
+from lib.data import ProbeVolume, held_out
 
-PROBE_SIDE = 896  # probe: a block's largest side, 8 nm voxels (its box cut to it about its centre; hemibrain_eb's are exactly it)
+PROBE_SIDE = 896  # a probe block's largest side, 8 nm voxels (its box cut to it about its centre)
 PROBE_MARGIN = 16  # read_window: the extra read around a window, 8 nm voxels (miao's resampling and label-quantization slack)
 
 
-def eb_val_crop(shape: tuple[int, ...]):
-    """A shape (Z Y X) window of EB at (3400, 2000, 2000) z y x, inside its val slab (EB z 3000-4000), held out from
-    training: 1 Z Y X in [0, 1], through miao (training's data path and normalization). miao needs the box strictly larger
-    than the patch: one extra voxel per axis leaves exactly one window."""
-    origin = (3400, 2000, 2000)
-    assert origin[0] + shape[0] <= 4000, f"crop {shape} leaves EB's val slab"
-    vol = lmd.get(HEMIBRAIN_EB).to_miao(bounding_box=[[o, o + s + 1] for o, s in zip(origin, shape)])
+def held_out_crop(data: str, shape: tuple[int, ...]):
+    """A shape (Z Y X) window of dataset data's held-out region (lib.data.held_out), held out from training: 1 Z Y X in [0, 1],
+    through miao (training's data path and normalization). miao needs the box strictly larger than the patch: one extra
+    voxel per axis leaves exactly one window."""
+    h = held_out(data)
+    box = [[o, o + s + 1] for o, s in zip(h.origin, shape)]
+    assert all(lo <= b[0] and b[1] <= hi for b, (lo, hi) in zip(box, h.region)), f"crop {shape} at {h.origin} leaves {data}'s held-out region {h.region}"
+    vol = lmd.get(h.path).to_miao(bounding_box=box)
     mcfg = MiaoConfig(volumes=[vol], patch_size=list(shape), resolutions=[[8.0, 8.0, 8.0]],
                       samples_per_epoch=1, sampling="random", output_axes="lzyx")
     return VolumeDataset(mcfg)[0]["img"]

@@ -199,7 +199,7 @@ def pca(job: Eval | str):
     e = load(job, Eval)
     model, step = load_checkpoint(e)
     record(e, "pca")  # argv says whether it ran inside `run` or on its own
-    evals.pca_maps(model.encoder, e.train, Path(e.savedir), step)
+    evals.pca_maps(model.encoder, e.train, Path(e.savedir), step, e.probe_on)
     release_milestone(e)
 
 def pca_sizes(job: Eval | str):

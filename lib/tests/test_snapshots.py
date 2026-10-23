@@ -79,10 +79,10 @@ def test_unetr_snapshot(tmp_path, monkeypatch, fn, files):
 
 def test_pca_snapshot(tmp_path, monkeypatch):
     model = small_encoder()
-    monkeypatch.setattr(evals, "eb_val_crop", lambda shape: torch.rand(1, *shape, generator=torch.Generator().manual_seed(1)))
+    monkeypatch.setattr(evals, "held_out_crop", lambda data, shape: torch.rand(1, *shape, generator=torch.Generator().manual_seed(1)))
     monkeypatch.setattr(evals, "TEST_TILES", (8, 16))
     e = specs.Eval(savedir=f"{tmp_path}/", train=specs.Train(global_size=(16, 16, 16)))
-    evals.pca_maps(model.encoder, e.train, tmp_path, 7)
+    evals.pca_maps(model.encoder, e.train, tmp_path, 7, "hemibrain_eb")
     evals.pca_sizes(e, model, 7)
     for f in ("pca2.png", "pca.json", "pca_tile_008.png", "pca_tile_016.png", "pca_sizes.json"):
         check(tmp_path / f, f"pca/{f}")
