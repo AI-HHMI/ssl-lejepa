@@ -38,7 +38,6 @@ from lib.types import *
 # the experiment starts depending on others. Dependencies (pyproject.toml / uv.lock) are not frozen.
 SNAPSHOT_PATHS = ["experiment.py", "lib", "mia_evals"]
 CPUS_PER_GPU = 12  # LSF slots per GPU: 8 GPUs -> all 96 cores; training processes need cores beyond the data workers
-WORKERS_PER_CPU = 3  # data workers mostly wait on NFS reads (e11 d1: 88 workers kept ~20 of 96 cores busy), so more than cores
 # mia-evals scoring (score): CPU only. mia-evals: ~1 h and ~200 GB peak for the mutex watershed at 896^3, "give it a
 # whole node". The shortest CPU queue; check its run limit and memory per slot with `bqueues -l short`.
 SCORE_QUEUE, SCORE_SLOTS, SCORE_MINUTES = "local", 16, 4*60
@@ -53,12 +52,13 @@ EXPERIMENT = "e00/e11-pretrain-b300-48h"
 def roots() -> list[Spec]:
     """This experiment: the runs it starts from nothing (trunks, other training runs, evals of another experiment's weights).
     Each trunk evaluates its own milestones as it saves them (eval_milestone)."""
-    # e10's four pretraining runs, unchanged except the hardware and the budget: each on a full node of 8 B300s for 48 h (e10: 6 h
-    # on one H200), to see what the best of each objective reaches with 8x the GPUs for 8x the time: e08's MAE (decoder 512x8, view
+    # e10's four pretraining runs, unchanged except the hardware and the budget: 48 h each (e10: 6 h on one H200) on a node's
+    # GPUs, to see what the best of each objective reaches with 7-8x the GPUs for 8x the time: e08's MAE (decoder 512x8, view
     # 96 of 128), e06's masked tokens at view 64 (shift 24, block 0.6, pull 10, SIGReg "both") and e06's multi-view invariance
     # (input 128, globals and locals 96) on hemibrain_wide, and the masked recipe on lmd4 (all four families, as e09). Model m
-    # (12x512), batch 32 per GPU (256 global), linear-probe evals at doubling steps from 5k, as e10. No finetunes: e10's gap is
-    # measured on its own trunks. 4 jobs x 8 GPUs = 4 nodes.
+    # (12x512), batch 32 per GPU, linear-probe evals at doubling steps from 5k, as e10. No finetunes: e10's gap is measured on
+    # its own trunks. B300 nodes were full: d1 took the one free (8 GPUs, global batch 256), the others 7 GPUs of each of three
+    # H200 nodes that had one GPU taken (global batch 224, ~0.7x a B300's speed).
     BATCH, STEPS, HOURS = 32, 2_560_000, 48
 
     def trunk(objective: Literal["views", "mask", "mae"], data: TrainData, input_size: int, view: int) -> Train:
@@ -76,9 +76,9 @@ def roots() -> list[Spec]:
         p.weight_decay = 0.05
         p.adam_beta2 = 0.95
         p.cudagraphs = True
-        p.n_workers = 32  # e11's benchmark with 11: 0.29 s/step, 875 samples/s, 11% of the cores busy: a worker reads its batch's 32 samples one after another from NFS
-        p.n_gpus = 8
-        p.queue = "gpu_b300"
+        p.n_workers = 11  # 12 cores per GPU
+        p.n_gpus = 7  # H200 nodes with one GPU taken by someone else's job
+        p.queue = "gpu_h200"
         return p
 
     def masked(data: TrainData) -> Train:
@@ -96,6 +96,8 @@ def roots() -> list[Spec]:
     views.batch_views = True
     views.lamb = 0.1
     runs: list[Spec] = [mae, masked("hemibrain_wide"), views, masked("lmd4")]
+    runs[1].n_gpus = 8  # d1 was started first, on the one free B300 node
+    runs[1].queue = "gpu_b300"
     for i, p in enumerate(runs):
         p.savedir = f"outdir/{EXPERIMENT}/d{i}/"
     return runs
@@ -291,7 +293,7 @@ def submit(fn: str, job: Spec):
     b3 = fn in ("finetune", "tiles") and isinstance(job, Finetune)
     assert b1 or b2 or b3, (f"{job.savedir}: no LSF job {fn!r} for a {type(job).__name__} (run and benchmark take a Train; pca, pca_sizes, "
                             f"probe and score an Eval; finetune a Finetune)")
-    assert not isinstance(job, Train) or job.n_workers <= WORKERS_PER_CPU * CPUS_PER_GPU, f"n_workers={job.n_workers} is over {WORKERS_PER_CPU} per slot ({CPUS_PER_GPU} per GPU)"
+    assert not isinstance(job, Train) or job.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={job.n_workers} leaves no core for the training process"
     spec = dump(job)
     if isinstance(job, Train):
         # Slack: startup, final checkpoint, pca + probe. A run without max_hours (a fixed step count) or a benchmark: 15 min.
