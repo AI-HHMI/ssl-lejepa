@@ -315,7 +315,8 @@ def start(p: Spec):
 def lsf(fn: str, target: int | str):
     """Redo one job on LSF, of roots()[target] or of the spec file target names (any run's, e.g. a milestone eval's
     outdir/.../d3/step_0005000/eval.json): `lsf probe 3` after changing probe. pca, probe or score of an eval, or of a training
-    run's own checkpoint (own_eval), in place; finetune of a finetune, in place; run restarts a training run fresh (start), its
+    run's own checkpoint (own_eval), in place; finetune of a finetune, in place; benchmark of a training run, in place (its
+    savedir gets a train.json, so submitall skips it: `lsf run` it after); run restarts a training run fresh (start), its
     milestone evals with it."""
     assert_committed()
     if isinstance(target, int):
@@ -324,6 +325,8 @@ def lsf(fn: str, target: int | str):
         p = load(target, Eval if target.endswith("eval.json") else Finetune if target.endswith("finetune.json") else Train)
     if fn == "run":
         start(p)
+    elif fn == "benchmark":
+        submit(fn, p)
     else:
         submit(fn, own_eval(p) if isinstance(p, Train) else p)
 
