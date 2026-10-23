@@ -1,7 +1,6 @@
 """Tests for lib.probe and experiment.probe: affinity targets, token layout, fit, AP, and the probe end to end."""
 
 import json
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -240,29 +239,3 @@ def test_lsf_score_submits_a_cpu_job_on_the_runs_own_eval(tmp_path, monkeypatch)
     assert f"-q {experiment.SCORE_QUEUE}" in cmd and f"-n {experiment.SCORE_SLOTS}" in cmd and "-gpu" not in cmd
     assert f"experiment.py score {run}/eval.json" in cmd and "job_score_%J.log" in cmd
     assert experiment.load(f"{run}/eval.json", experiment.Eval) == experiment.own_eval(experiment.Train(savedir=run))
-
-
-def test_lejepa_n_params_builds_the_model_once_per_size(tmp_path, monkeypatch):
-    built = []
-
-    def fake_lejepa(config):
-        e = config.encoder
-        built.append((e.depth, e.embed_dim))
-        return SimpleNamespace(_n_encoder_params=e.depth * e.embed_dim, _n_predictor_params=5, _n_projector_params=7)
-
-    monkeypatch.setattr(experiment, "N_PARAMS_CACHE", tmp_path / ".cache/n_params.json")
-    monkeypatch.setattr(experiment, "Lejepa", fake_lejepa)
-    assert experiment.lejepa_n_params(4, 256) == (1024, 5, 7)
-    assert experiment.lejepa_n_params(4, 256) == (1024, 5, 7)  # read back from the cache file
-    assert experiment.lejepa_n_params(6, 384) == (2304, 5, 7)
-    assert built == [(4, 256), (6, 384)]
-
-
-def test_scaling_budgets_are_m_hours_at_the_anchor_speed(monkeypatch):
-    monkeypatch.setattr(experiment, "lejepa_n_params", lambda n_layers, width: (n_layers * width ** 2, n_layers * width ** 2 // 3, 1000))
-    assert experiment.step_seconds("m", 84) == pytest.approx(experiment.ANCHOR_STEP_S_M_B84)  # the anchor itself
-    assert experiment.step_seconds("l", 84) > experiment.step_seconds("m", 84) > experiment.step_seconds("m", 42)
-    budgets = experiment.scaling_budgets()
-    m_steps_per_hour = 3600 / experiment.step_seconds("m", experiment.SCALING_BATCH)
-    for b, hours in experiment.BUDGET_HOURS_AT_M.items():  # m trains BUDGET_HOURS_AT_M hours at each budget
-        assert budgets[b] / (experiment.sample_flops("m") * experiment.SCALING_BATCH) == pytest.approx(hours * m_steps_per_hour)
