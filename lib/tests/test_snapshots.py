@@ -1,4 +1,4 @@
-"""Snapshot tests: each experiment entrypoint run on a seeded synthetic store with a tiny model, its artifacts (images, json rows)
+"""Snapshot tests: each eval (lib.evals) run on a seeded synthetic store with a tiny model, its artifacts (images, json rows)
 compared with the ones saved in lib/tests/snapshots/. A refactor of the model or inference code that keeps them keeps its
 results. Images match to within a little numeric noise, numbers to a relative 1e-3. After a change that should alter them,
 review the new artifacts and save them with `UPDATE_SNAPSHOTS=1 pytest lib/tests/test_snapshots.py`."""
@@ -13,8 +13,8 @@ import pytest
 import torch
 from PIL import Image
 
-import experiment
 import lib.decoders
+from lib import evals, specs
 from lib.encoders import EncoderConfig
 from lib.models import Lejepa
 from test_probe import TINY, synthetic_store
@@ -58,8 +58,7 @@ def test_probe_snapshot(tmp_path, monkeypatch):
     synthetic_store(tmp_path, monkeypatch)
     (tmp_path / "run").mkdir()
     model = small_encoder()
-    monkeypatch.setattr(experiment, "load_checkpoint", lambda p: (model, 7))
-    experiment.probe(experiment.Eval(savedir=str(tmp_path / "run"), train=experiment.Train(global_size=(24, 24, 24))))
+    evals.probe(specs.Eval(savedir=str(tmp_path / "run"), train=specs.Train(global_size=(24, 24, 24))), model, 7)
     for f in ("probe.png", "probe.json", "probe_fit.json"):
         check(tmp_path / "run" / f, f"probe/{f}")
 
@@ -70,23 +69,20 @@ def test_unetr_snapshot(tmp_path, monkeypatch, fn, files):
     config = lib.decoders.UnetrConfig
     monkeypatch.setattr(lib.decoders, "UnetrConfig", lambda out_dim: config(out_dim=out_dim, hidden_dim=8))
     model = small_encoder(patch=2)  # Unetr: one block per upsample stage
-    monkeypatch.setattr(experiment, "load_checkpoint", lambda p: (model, 7))
-    par = experiment.Finetune(savedir=str(tmp_path / "run"), train=experiment.Train(global_size=(24, 24, 24)), fit_side=24, steps=100)
+    par = specs.Finetune(savedir=str(tmp_path / "run"), train=specs.Train(global_size=(24, 24, 24)), fit_side=24, steps=100)
     (tmp_path / "run").mkdir()
     torch.manual_seed(0)  # the decoder's init
-    getattr(experiment, fn)(par)
+    getattr(evals, fn)(par, model, 7)
     for f in files:
         check(tmp_path / "run" / f, f"{fn}/{f}")
 
 
 def test_pca_snapshot(tmp_path, monkeypatch):
     model = small_encoder()
-    monkeypatch.setattr(experiment, "eb_val_crop", lambda shape: torch.rand(1, *shape, generator=torch.Generator().manual_seed(1)))
-    monkeypatch.setattr(experiment, "load_checkpoint", lambda e: (model, 7))
-    monkeypatch.setattr(experiment, "record", lambda *a: None)
-    monkeypatch.setattr(experiment, "TEST_TILES", (8, 16))
-    e = experiment.Eval(savedir=f"{tmp_path}/", train=experiment.Train(global_size=(16, 16, 16)))
-    experiment.pca(e)
-    experiment.pca_sizes(e)
+    monkeypatch.setattr(evals, "eb_val_crop", lambda shape: torch.rand(1, *shape, generator=torch.Generator().manual_seed(1)))
+    monkeypatch.setattr(evals, "TEST_TILES", (8, 16))
+    e = specs.Eval(savedir=f"{tmp_path}/", train=specs.Train(global_size=(16, 16, 16)))
+    evals.pca_maps(model.encoder, e.train, tmp_path, 7)
+    evals.pca_sizes(e, model, 7)
     for f in ("pca2.png", "pca.json", "pca_tile_008.png", "pca_tile_016.png", "pca_sizes.json"):
         check(tmp_path / f, f"pca/{f}")
