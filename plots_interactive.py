@@ -86,7 +86,8 @@ document.addEventListener("click", function(e) {
 });
 
 // Image viewer: click a grid thumbnail to open its cell full-screen. Every layer of the cell is drawn at the first
-// layer's size, stacked in order; the lowest visible layer is opaque, the ones above it at the slider's opacity.
+// layer's size, stacked in order; the lowest visible layer is opaque, the ones above it at the slider's opacity. A grid with
+// data-off starts with only each cell's first layer shown.
 // Sized via width/height, not a CSS transform, which the GPU bilinear-filters at high zoom.
 (function() {
   var V = document.getElementById("viewer"), BAR = document.getElementById("viewer-bar");
@@ -138,6 +139,7 @@ document.addEventListener("click", function(e) {
       return Array.prototype.slice.call(tr.cells).map(function(td) { return Array.prototype.slice.call(td.querySelectorAll("img")); });
     });
     grid.forEach(function(cells, i) { cells.forEach(function(imgs, j) { if (imgs[0] === el) { row = i; col = j; } }); });
+    on = {}; if (el.closest("table").dataset.off) { for (var k = 1; k < 9; k++) on[k] = false; }
     curW = 0; curH = 0; V.classList.add("open"); show();
   }
   function move(dr, dc) {  // the next nonempty cell in that direction; stop at the edge
@@ -312,11 +314,12 @@ def img(path: Path, base: Path | None, **attrs) -> str:
     return "<img " + " ".join(f"{k}='{html.escape(str(v), quote=True)}'" for k, v in attrs.items()) + f" src='{html.escape(src, quote=True)}'>"
 
 
-def images(grid: dict, base: Path | None = None) -> str:
+def images(grid: dict, base: Path | None = None, layers_off: bool = False) -> str:
     """grid: row label -> {column label: [image paths]}. A cell's first image is its thumbnail; the rest are layers drawn
     over it in the viewer, toggled by checkbox or 1-9 (layer names: file stems). An empty or absent cell shows a dash.
     Images are embedded in the page, or, with base (the page's dir), linked relative to it: for images too big to
-    embed (MBs each), at the price of a page that works only beside them (e.g. results/ next to outdir/)."""
+    embed (MBs each), at the price of a page that works only beside them (e.g. results/ next to outdir/).
+    layers_off: the viewer opens a cell with only its first layer shown (the rest are toggled on)."""
     cols = list(dict.fromkeys(c for cells in grid.values() for c in cells))
     head = "<tr><th></th>" + "".join(f"<th>{html.escape(str(c))}</th>" for c in cols) + "</tr>"
     rows = []
@@ -330,4 +333,4 @@ def images(grid: dict, base: Path | None = None) -> str:
             note = f"<br><small>{len(paths)} layers</small>" if len(paths) > 1 else ""
             tds.append(f"<td>{''.join(layers)}{note}</td>" if paths else "<td>–</td>")
         rows.append(f"<tr><th>{html.escape(str(r))}</th>{''.join(tds)}</tr>")
-    return f"<table class='imggrid' {MARK}><thead>{head}</thead><tbody>{''.join(rows)}</tbody></table>"
+    return f"<table class='imggrid' {'data-off=1' * layers_off} {MARK}><thead>{head}</thead><tbody>{''.join(rows)}</tbody></table>"

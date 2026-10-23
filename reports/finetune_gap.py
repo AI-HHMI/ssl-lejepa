@@ -67,6 +67,37 @@ def existing(path: Path) -> list:
     return [path] if path.is_file() else []
 
 
+def panels(run: Path) -> dict[str, Path]:
+    """The panels of run's tiles.png (EM | true boundaries | predicted, 8 px gaps), cut out beside it in run/tiles/ as raw.png,
+    true.png and predicted.png (the layers of the Predictions panel); {} where the job wrote none."""
+    from PIL import Image
+    src, out = run / "tiles.png", run / "tiles"
+    if not src.is_file():
+        return {}
+    out.mkdir(exist_ok=True)
+    im = Image.open(src)
+    w = (im.width - 16) // 3
+    files = {name: out / f"{name}.png" for name in ("raw", "true", "predicted")}
+    for k, f in enumerate(files.values()):
+        if not f.is_file() or f.stat().st_mtime < src.stat().st_mtime:
+            im.crop((k * (w + 8), 0, k * (w + 8) + w, im.height)).save(f)
+    return files
+
+
+def prediction_grid(runs: dict) -> str:
+    """Rows: the raw EM and the true boundaries (the test blocks are the encoders' common ground), then each encoder's predicted
+    boundaries; columns the sets. In the viewer a cell's layers are its own image first, then the others (1-3 toggle them)."""
+    cut = {(e, s): panels(runs[(e, s, "frozen", 256)]["run"]) for e in ENCODERS for s in SETS.values()}
+    rows = {"raw EM": {}, "true boundaries": {}}
+    for s in SETS.values():
+        p = next((cut[(e, s)] for e in ENCODERS if cut[(e, s)]), {})
+        rows["raw EM"][s] = [p["raw"], p["true"]] if p else []
+        rows["true boundaries"][s] = [p["true"], p["raw"]] if p else []
+    for e in ENCODERS:
+        rows[e] = {s: [p["predicted"], p["raw"], p["true"]] if (p := cut[(e, s)]) else [] for s in SETS.values()}
+    return pi.images(rows, base=page.out_path(SWEEP).parent, layers_off=True)
+
+
 def curve(d: Path) -> list[dict]:
     """A finetune's finetune_curve.json rows; [] without results. e10's first jobs wrote theirs to finetune.json, over their
     spec (the same name then), so there it is results only if it isn't still the spec."""
@@ -164,9 +195,8 @@ def build() -> tuple:
         ("Curves: short AP", page.wide([lines(SHORT, s, side) for s, side in cells])),
         ("Curves: long AP", page.wide([lines(LONG, s, side) for s, side in cells])),
         ("Encoders", trunk_cards()),
-        ("Predictions", [("Test block after 10k steps, frozen encoder, 256^3 of GT: EM | true boundaries | predicted, blended overlapping tiles (rows the encoder)",
-                          pi.images({e: {s: existing(runs[(e, s, "frozen", 256)]["run"] / "tiles.png") for s in SETS.values()} for e in ENCODERS},
-                                    base=page.out_path(SWEEP).parent))]),
+        ("Predictions", [("Test block after 10k steps, frozen encoder, 256^3 of GT, blended overlapping tiles; full screen: toggle raw, true and predicted as layers",
+                          prediction_grid(runs))]),
         ("All finetunes", [("AP at 10k fit steps, the GT it fit (labelled voxels) and its job's minutes",
                             pi.table(["run", "encoder", "set", "mode", "side", "labelled", SHORT, LONG, "minutes"],
                                      [[f["run"].name, *k, f["labelled"], f["curve"][10000][SHORT], f["curve"][10000][LONG], f["minutes"]]
