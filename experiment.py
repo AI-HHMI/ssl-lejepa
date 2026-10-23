@@ -1002,6 +1002,35 @@ def probe(job: Eval | str):
     print(f"{par.savedir}: probe at step {step}: boundary AP (short-range mean) {stats['boundary_ap_short']:.3f}{'; wrote probe/' * par.score}", flush=True)
     release_milestone(par)
 
+def fit_decoder(par: Finetune, model, score=None):
+    """finetune's fit: a UNETR on model's encoder (trained too unless par.freeze_encoder), fitted to the affinities of par's probe set's
+    train block or of its par.fit_side cube, on crops of the encoder's view size: (the UNETR, fit_unetr's curve, the fit's
+    finetune_data row without the weights' step). score(unetr) -> dict is fit_unetr's scoring, at its doubling steps."""
+    import torch
+    from lib.decoders import Unetr, UnetrConfig, fit_unetr
+    from lib.probe import AFFINITY_OFFSETS_XYZ, affinities
+    torch.set_float32_matmul_precision(par.train.f32mode)  # as the encoder trained: TF32 matmuls ("high"), not full fp32
+    tile = par.train.global_size
+    encoder, device = model.encoder, next(model.parameters()).device
+    p = encoder.patch_embed.patch_size
+    sets = PROBE_SETS[par.probe_on]
+    side = par.fit_side or PROBE_SIDE
+    assert len(sets["train"]) == 1, f"{par.probe_on}: the fit is on one block"
+    assert side % p[0] == 0, f"{par.savedir}: fit_side {side} must be whole patches of {p[0]}"
+    unetr = Unetr(encoder, UnetrConfig(out_dim=len(AFFINITY_OFFSETS_XYZ))).to(device)
+    encoder.requires_grad_(not par.freeze_encoder)
+    img, labels, m, size = read_block(sets["train"][0], tile, p, device, side)
+    assert all(s >= t for s, t in zip(size, tile)), f"{par.savedir}: the fit cube {size} is smaller than a crop {tile}"
+    aff, valid = affinities(labels, [o[::-1] for o in AFFINITY_OFFSETS_XYZ], sets["train"][0].sparse)  # x y z offsets; the model sees z y x
+    data = {"tbl": "finetune_data", "fit_size": size, "fit_labelled": int((labels != 0).sum()), "test_blocks": [v.name for v in sets["test"]]}
+    curve = fit_unetr(unetr, inner(img, m, size)[None], aff, valid, tile, (lambda: score(unetr)) if score else None, steps=par.steps)
+    return unetr, curve, data
+
+def predict_block(unetr, tile, img, m, size):
+    """C Z Y X sigmoid probabilities of unetr over the box (m, size) of img, tiled with context (tile_logits)."""
+    import torch
+    return torch.sigmoid(inner(tile_logits(unetr, img, tile), m, size)).half()
+
 def finetune(job: Finetune | str):
     """A UNETR (lib.decoders.unetr: skip connections into the encoder's own blocks) on the spec job's weights (or those of the
     finetune.json it names), fitted to mia-evals' 6 affinity channels of its probe set's (par.probe_on) train block, or of the
@@ -1014,67 +1043,34 @@ def finetune(job: Finetune | str):
       savedir/finetune.png    test block after the fit, middle z: EM | true boundaries | predicted boundaries
                               (finetune_<block>.png for any further test blocks), written last: the job finished
     """
-    import torch
-    from lib.decoders import Unetr, UnetrConfig, fit_unetr
-    from lib.probe import AFFINITY_OFFSETS_XYZ, affinities
     par = load(job, Finetune)
-    torch.set_float32_matmul_precision(par.train.f32mode)  # as the encoder trained: TF32 matmuls ("high"), not full fp32
-    tile = par.train.global_size
     model, step = load_checkpoint(par)
     record(par, "finetune")
-    encoder, device = model.encoder, next(model.parameters()).device
-    p = encoder.patch_embed.patch_size
+    tile, p, device = par.train.global_size, model.encoder.patch_embed.patch_size, next(model.parameters()).device
     sets = PROBE_SETS[par.probe_on]
-    side = par.fit_side or PROBE_SIDE
-    assert len(sets["train"]) == 1, f"{par.probe_on}: the fit is on one block"
-    assert side % p[0] == 0, f"{par.savedir}: fit_side {side} must be whole patches of {p[0]}"
-    unetr = Unetr(encoder, UnetrConfig(out_dim=len(AFFINITY_OFFSETS_XYZ))).to(device)
-    encoder.requires_grad_(not par.freeze_encoder)
-    img, labels, m, size = read_block(sets["train"][0], tile, p, device, side)
-    assert all(s >= t for s, t in zip(size, tile)), f"{par.savedir}: the fit cube {size} is smaller than a crop {tile}"
-    aff, valid = affinities(labels, [o[::-1] for o in AFFINITY_OFFSETS_XYZ], sets["train"][0].sparse)  # x y z offsets; the model sees z y x
-    data = {"tbl": "finetune_data", "step": step, "fit_size": size, "fit_labelled": int((labels != 0).sum()),
-            "test_blocks": [v.name for v in sets["test"]]}
-    del labels
     tests = [read_block(v, tile, p, device, context=True) for v in sets["test"]]  # (img, labels, m, size) each
 
-    def predict(img, m, size):  # C Z Y X sigmoid probabilities over the box
-        return torch.sigmoid(inner(tile_logits(unetr, img, tile), m, size)).half()
+    def test_scores(unetr) -> dict:
+        return mean_scores([score_block(predict_block(unetr, tile, t_img, t_m, t_size), t_labels, v.sparse) for v, (t_img, t_labels, t_m, t_size) in zip(sets["test"], tests)])
 
-    def test_scores() -> dict:
-        return mean_scores([score_block(predict(t_img, t_m, t_size), t_labels, v.sparse) for v, (t_img, t_labels, t_m, t_size) in zip(sets["test"], tests)])
-
-    curve = fit_unetr(unetr, inner(img, m, size)[None], aff, valid, tile, test_scores, steps=par.steps)
-    del img, aff, valid
-    rows = [data] + [{"tbl": "finetune", **c} for c in curve]
+    unetr, curve, data = fit_decoder(par, model, test_scores)
+    rows = [{**data, "step": step}] + [{"tbl": "finetune", **c} for c in curve]
     (Path(par.savedir) / "finetune_curve.json").write_text("".join(json.dumps(r) + "\n" for r in rows))
     for k, (vol, (img, labels, m, size)) in enumerate(zip(sets["test"], tests)):
-        boundary_png(Path(par.savedir) / ("finetune.png" if k == 0 else f"finetune_{vol.name}.png"), inner(img, m, size), labels, predict(img, m, size))
-    print(f"{par.savedir}: finetune of step {step} on {size} voxels of {par.probe_on}: boundary AP (short-range mean) "
+        boundary_png(Path(par.savedir) / ("finetune.png" if k == 0 else f"finetune_{vol.name}.png"), inner(img, m, size), labels, predict_block(unetr, tile, img, m, size))
+    print(f"{par.savedir}: finetune of step {step} on {data['fit_size']} voxels of {par.probe_on}: boundary AP (short-range mean) "
           f"{curve[-1]['boundary_ap_short']:.3f} after {par.steps} steps", flush=True)
 
 def tiles(job: Finetune | str):
     """finetune's fit, without its scoring, and tile_logits' blended prediction on its first test block: savedir/tiles.png,
     finetune.png's panels (middle z: EM | true boundaries | predicted boundaries). The fit is seeded, so these are finetune's
     predictions, redone with the current tiling; nothing else is written."""
-    import torch
-    from lib.decoders import Unetr, UnetrConfig, fit_unetr
-    from lib.probe import AFFINITY_OFFSETS_XYZ, affinities
     par = load(job, Finetune)
-    torch.set_float32_matmul_precision(par.train.f32mode)
-    tile = par.train.global_size
     model, step = load_checkpoint(par)
-    encoder, device = model.encoder, next(model.parameters()).device
-    p = encoder.patch_embed.patch_size
-    sets = PROBE_SETS[par.probe_on]
-    unetr = Unetr(encoder, UnetrConfig(out_dim=len(AFFINITY_OFFSETS_XYZ))).to(device)
-    encoder.requires_grad_(not par.freeze_encoder)
-    img, labels, m, size = read_block(sets["train"][0], tile, p, device, par.fit_side or PROBE_SIDE)
-    aff, valid = affinities(labels, [o[::-1] for o in AFFINITY_OFFSETS_XYZ], sets["train"][0].sparse)  # x y z offsets; the model sees z y x
-    fit_unetr(unetr, inner(img, m, size)[None], aff, valid, tile, steps=par.steps)
-    img, labels, m, size = read_block(sets["test"][0], tile, p, device, context=True)
-    pred = torch.sigmoid(inner(tile_logits(unetr, img, tile), m, size)).half()
-    boundary_png(Path(par.savedir) / "tiles.png", inner(img, m, size), labels, pred)
+    unetr, _, _ = fit_decoder(par, model)
+    tile, p, device = par.train.global_size, model.encoder.patch_embed.patch_size, next(model.parameters()).device
+    img, labels, m, size = read_block(PROBE_SETS[par.probe_on]["test"][0], tile, p, device, context=True)
+    boundary_png(Path(par.savedir) / "tiles.png", inner(img, m, size), labels, predict_block(unetr, tile, img, m, size))
     print(f"{par.savedir}: wrote tiles.png, finetune of step {step} for {par.steps} steps", flush=True)
 
 def job_name(savedir: str, job: str) -> str:
