@@ -55,7 +55,7 @@ def roots() -> list[Spec]:
     # e10's four pretraining runs, unchanged except the hardware and the budget: 48 h each (e10: 6 h on one H200) on a node's
     # GPUs, to see what the best of each objective reaches with 7-8x the GPUs for 8x the time: e08's MAE (decoder 512x8, view
     # 96 of 128), e06's masked tokens at view 64 (shift 24, block 0.6, pull 10, SIGReg "both") and e06's multi-view invariance
-    # (input 128, globals and locals 96) on hemibrain_wide, and the masked recipe on lmd4 (all four families, as e09). Model m
+    # (input 128, globals and locals 96) on hemibrain_wide, and the masked recipe on lmd4 (all four families, as e09, but sampled by voxel count ^ 0.4, not equally: lib.data). Model m
     # (12x512), batch 32 per GPU, linear-probe evals at doubling steps from 5k, as e10. No finetunes: e10's gap is measured on
     # its own trunks. B300 nodes were full: d1 took the one free (8 GPUs, global batch 256), the others 7 GPUs of each of three
     # H200 nodes that had one GPU taken (global batch 224, ~0.7x a B300's speed).
@@ -96,8 +96,9 @@ def roots() -> list[Spec]:
     views.batch_views = True
     views.lamb = 0.1
     runs: list[Spec] = [mae, masked("hemibrain_wide"), views, masked("lmd4")]
-    runs[1].n_gpus = 8  # d1 was started first, on the one free B300 node
-    runs[1].queue = "gpu_b300"
+    r:Train = runs[1]
+    r.n_gpus = 8  # d1 was started first, on the one free B300 node
+    r.queue = "gpu_b300"
     for i, p in enumerate(runs):
         p.savedir = f"outdir/{EXPERIMENT}/d{i}/"
     return runs

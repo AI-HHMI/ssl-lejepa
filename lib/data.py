@@ -7,6 +7,7 @@ A dataset is a few crops, each with raw and labels, and has the same three views
 
 from __future__ import annotations
 
+import math
 from typing import NamedTuple
 
 # from lib.types import TrainData
@@ -77,15 +78,21 @@ TRAIN_BOXES: dict[TrainData, dict[str, list[list[int]]]] = {
         "em-mouse-MICrONS-minnie65/crop-001": [[0, 8192], [0, 8192], [0, 1024]],
     },
 }
-# A joint set: its families' volumes, the families weighted equally (as lmd_ssl_v1 weights its volumes), each family's
-# volumes equally within it.
+# A joint set: its families' volumes. A family's share of the samples goes as its voxel count ^ FAMILY_WEIGHT_EXPONENT (0: equal,
+# as lmd_ssl_v1 weights its volumes; 1: by size, which hemibrain_wide would take 3/4 of); each family's volumes equally within it.
 JOINT_DATA: dict[TrainData, tuple[TrainData, ...]] = {"lmd4": ("hemibrain_wide", "fish2", "liconn_mouse", "microns")}
+FAMILY_WEIGHT_EXPONENT = 0.4
+
+
+def family_voxels(family: TrainData) -> int:
+    return sum(math.prod(hi - lo for lo, hi in box) for box in TRAIN_BOXES[family].values())
 
 
 def train_volumes(data: TrainData) -> list[tuple[str, list[list[int]], float]]:
-    """(catalog name, [lo, hi) box x y z, sampling weight) of each training volume of data."""
+    """(catalog name, [lo, hi) box x y z, sampling weight) of each training volume of data; the weights sum to 1."""
     families = JOINT_DATA.get(data, (data,))
-    return [(name, box, 1 / len(families) / len(TRAIN_BOXES[f])) for f in families for name, box in TRAIN_BOXES[f].items()]
+    shares = {f: family_voxels(f) ** FAMILY_WEIGHT_EXPONENT for f in families}
+    return [(name, box, shares[f] / sum(shares.values()) / len(TRAIN_BOXES[f])) for f in families for name, box in TRAIN_BOXES[f].items()]
 
 
 class ProbeVolume(NamedTuple):

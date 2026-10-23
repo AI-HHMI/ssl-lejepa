@@ -122,12 +122,13 @@ def test_a_run_probed_on_several_sets_probes_each_in_its_own_dir(tmp_path, monke
     assert all(Path(d).is_dir() for _, d in probed)
 
 
-def test_train_volumes_weigh_a_joint_sets_families_equally():
-    from lib.data import JOINT_DATA, TRAIN_BOXES, train_volumes
+def test_train_volumes_weigh_a_joint_sets_families_by_voxel_count_to_the_exponent():
+    from lib.data import FAMILY_WEIGHT_EXPONENT, JOINT_DATA, TRAIN_BOXES, family_voxels, train_volumes
     vols = train_volumes("lmd4")
     assert sum(w for _, _, w in vols) == pytest.approx(1)
-    for f in JOINT_DATA["lmd4"]:  # each family a quarter, split equally among its volumes
-        assert sum(w for n, _, w in vols if n in TRAIN_BOXES[f]) == pytest.approx(1 / 4)
+    share = {f: sum(w for n, _, w in vols if n in TRAIN_BOXES[f]) for f in JOINT_DATA["lmd4"]}  # split equally among its volumes
+    assert share["fish2"] / share["hemibrain_wide"] == pytest.approx((family_voxels("fish2") / family_voxels("hemibrain_wide")) ** FAMILY_WEIGHT_EXPONENT)
+    assert share["fish2"] < share["microns"] < share["liconn_mouse"] < share["hemibrain_wide"]
     assert [w for _, _, w in train_volumes("fish2")] == [0.25] * 4 and train_volumes("hemibrain_eb")[0][2] == 1
 
 
