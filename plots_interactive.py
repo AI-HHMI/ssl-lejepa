@@ -262,12 +262,13 @@ def splom(groups: dict, dims: list) -> str:
     return figure(data, {"height": 170 * (len(dims) - 1) + 80, "dragmode": "select"})
 
 
-def lines(series: dict, xlabel: str, ylabel: str, logx: bool = False, logy: bool = False) -> str:
+def lines(series: dict, xlabel: str, ylabel: str, logx: bool = False, logy: bool = False, colors: dict | None = None) -> str:
     """series: label -> (xs, ys), one line each; a (label, subset) key puts the line in a subset (figure: a radio per
-    subset, one shown at a time), coloured as its label is in every subset. The tooltip shows only the nearest point: a
+    subset, one shown at a time), coloured as its label is in every subset. colors: label -> colour, to keep a label's colour
+    across figures that don't all have it (default: in order of appearance). The tooltip shows only the nearest point: a
     tooltip listing every line at the hovered x hid most of the plot."""
     keys = [k if isinstance(k, tuple) else (k, None) for k in series]
-    colors = dict(zip(dict.fromkeys(label for label, _ in keys), itertools.cycle(COLORS)))
+    colors = colors or dict(zip(dict.fromkeys(label for label, _ in keys), itertools.cycle(COLORS)))
     data = [{"type": "scatter", "mode": "lines+markers", "marker": {"size": 5}, "name": label, "meta": subset, "x": list(xs), "y": list(ys),
              "line": {"color": colors[label], "width": 1.8},
              "hovertemplate": f"{html.escape(str(label))}<br>{html.escape(xlabel)}: %{{x}}<br>{html.escape(ylabel)}: %{{y:.4g}}<extra></extra>"}

@@ -4,6 +4,7 @@ results/<sweep>/*.csv. Imports no experiment code, so every builder works on any
 is one card per facet.
 """
 
+import itertools
 import json
 import re
 from pathlib import Path
@@ -39,11 +40,12 @@ def loss_curves(sweep: str) -> list:
 def trunk_loss_curves(curves: dict, terms: list) -> list:
     """Loss trajectories of a trunk sweep: one card per term, one line per run. curves: label -> trunk_metrics frame. Each line
     is the mean over 20 logged rows, thinned to every 20th, to 4 significant digits (e02's 72 trunks of ~8.6k rows each made
-    1.7 MB a card at every 10th); log y."""
+    1.7 MB a card at every 10th); log y. A run keeps its colour in every card, though a card leaves out runs without its term."""
     def smooth(m: pandas.DataFrame, t: str) -> tuple:
         return m.step.iloc[19::20].tolist(), [float(f"{v:.4g}") for v in m[t].rolling(20).mean().iloc[19::20]]
+    colors = dict(zip(curves, itertools.cycle(pi.COLORS)))
     return [(f"{t} vs step (mean of 20 logged rows), one line per trunk",
-             pi.lines({k: smooth(m, t) for k, m in curves.items() if t in m}, "step", t, logy=True)) for t in terms]
+             pi.lines({k: smooth(m, t) for k, m in curves.items() if t in m}, "step", t, logy=True, colors=colors)) for t in terms]
 
 def bench_table(sweep: str, *compare: str) -> list:
     """A benchmark sweep's per-run table (analysis.bench_rows), next to any reference sweeps it's compared with.
