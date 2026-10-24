@@ -12,7 +12,7 @@ from typing import NamedTuple
 
 # from lib.types import TrainData
 from typing import Literal
-TrainData = Literal["hemibrain_eb", "hemibrain_wide", "fish2", "liconn_mouse", "microns", "lmd4"]  # keys of lib.data.TRAIN_BOXES, or JOINT_DATA
+TrainData = Literal["hemibrain_eb", "hemibrain_wide", "fish2", "liconn_mouse", "microns", "lmd4", "lmd4_pow04"]  # keys of lib.data.TRAIN_BOXES, or JOINT_DATA
 
 DEFAULT_DATA = "hemibrain_eb"  # the dataset a spec trains on, probes and maps unless it says otherwise (every run so far)
 
@@ -78,10 +78,11 @@ TRAIN_BOXES: dict[TrainData, dict[str, list[list[int]]]] = {
         "em-mouse-MICrONS-minnie65/crop-001": [[0, 8192], [0, 8192], [0, 1024]],
     },
 }
-# A joint set: its families' volumes. A family's share of the samples goes as its voxel count ^ FAMILY_WEIGHT_EXPONENT (0: equal,
-# as lmd_ssl_v1 weights its volumes; 1: by size, which hemibrain_wide would take 3/4 of); each family's volumes equally within it.
-JOINT_DATA: dict[TrainData, tuple[TrainData, ...]] = {"lmd4": ("hemibrain_wide", "fish2", "liconn_mouse", "microns")}
-FAMILY_WEIGHT_EXPONENT = 0.4
+# A joint set: its families' volumes, and the exponent e of its family weights: a family's share of the samples goes as its
+# voxel count ^ e (0: equal, as lmd_ssl_v1 weights its volumes, and as e09 and e11's d3 ran; 1: by size, which hemibrain_wide would
+# take 3/4 of); each family's volumes equally within it.
+LMD4 = ("hemibrain_wide", "fish2", "liconn_mouse", "microns")
+JOINT_DATA: dict[TrainData, tuple[tuple[TrainData, ...], float]] = {"lmd4": (LMD4, 0.0), "lmd4_pow04": (LMD4, 0.4)}
 
 
 def family_voxels(family: TrainData) -> int:
@@ -90,8 +91,8 @@ def family_voxels(family: TrainData) -> int:
 
 def train_volumes(data: TrainData) -> list[tuple[str, list[list[int]], float]]:
     """(catalog name, [lo, hi) box x y z, sampling weight) of each training volume of data; the weights sum to 1."""
-    families = JOINT_DATA.get(data, (data,))
-    shares = {f: family_voxels(f) ** FAMILY_WEIGHT_EXPONENT for f in families}
+    families, exponent = JOINT_DATA.get(data, ((data,), 0.0))
+    shares = {f: family_voxels(f) ** exponent for f in families}
     return [(name, box, shares[f] / sum(shares.values()) / len(TRAIN_BOXES[f])) for f in families for name, box in TRAIN_BOXES[f].items()]
 
 

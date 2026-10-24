@@ -88,7 +88,7 @@ def dataloader(par: Train):
     import torch
     # Training volumes (lib/data.py), images only. Boxes are x y z; output is z y x.
     # miao samples each volume by its weight alone (size_weighting_exponent=0): equally within a family (lib.data.train_volumes),
-    # and a joint set's families by their voxel count ^ 0.4. Every volume is read at 8 nm (resolutions below), resampled where it is stored otherwise.
+    # and a joint set's families by their voxel count ^ its exponent (lmd4: 0, lmd4_pow04: 0.4). Every volume is read at 8 nm (resolutions below), resampled where it is stored otherwise.
     volumes = [lmd.get(name).to_miao(bounding_box=box[::-1], weight=w) for name, box, w in train_volumes(par.data)]
     mcfg = MiaoConfig(
         volumes=volumes,

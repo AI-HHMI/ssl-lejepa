@@ -122,13 +122,15 @@ def test_a_run_probed_on_several_sets_probes_each_in_its_own_dir(tmp_path, monke
     assert all(Path(d).is_dir() for _, d in probed)
 
 
-def test_train_volumes_weigh_a_joint_sets_families_by_voxel_count_to_the_exponent():
-    from lib.data import FAMILY_WEIGHT_EXPONENT, JOINT_DATA, TRAIN_BOXES, family_voxels, train_volumes
-    vols = train_volumes("lmd4")
+@pytest.mark.parametrize("data,exponent", [("lmd4", 0), ("lmd4_pow04", 0.4)])
+def test_train_volumes_weigh_a_joint_sets_families_by_voxel_count_to_its_exponent(data, exponent):
+    from lib.data import JOINT_DATA, TRAIN_BOXES, family_voxels, train_volumes
+    vols = train_volumes(data)
     assert sum(w for _, _, w in vols) == pytest.approx(1)
-    share = {f: sum(w for n, _, w in vols if n in TRAIN_BOXES[f]) for f in JOINT_DATA["lmd4"]}  # split equally among its volumes
-    assert share["fish2"] / share["hemibrain_wide"] == pytest.approx((family_voxels("fish2") / family_voxels("hemibrain_wide")) ** FAMILY_WEIGHT_EXPONENT)
-    assert share["fish2"] < share["microns"] < share["liconn_mouse"] < share["hemibrain_wide"]
+    families = JOINT_DATA[data][0]
+    share = {f: sum(w for n, _, w in vols if n in TRAIN_BOXES[f]) for f in families}  # split equally among its volumes
+    for f in families:
+        assert share[f] / share["hemibrain_wide"] == pytest.approx((family_voxels(f) / family_voxels("hemibrain_wide")) ** exponent)
     assert [w for _, _, w in train_volumes("fish2")] == [0.25] * 4 and train_volumes("hemibrain_eb")[0][2] == 1
 
 
