@@ -3,6 +3,7 @@ lmd4), the same recipes at 7-8x the GPUs for 48 h instead of 6 h on one H200: a 
 every doubling-step milestone probed and PCA-mapped as saved. A fifth run, d4, samples lmd4's families by voxel count ^ 0.4
 instead of equally. Does the linear probe keep improving with 8x the samples and 8x the steps?"""
 
+import itertools
 from pathlib import Path
 
 import plots_interactive as pi
@@ -77,6 +78,30 @@ def against_e10() -> list:
     return out
 
 
+def probe_fits() -> list:
+    """The probe's fit curve at each milestone (probe_fit.json, every 100 steps: training BCE, and BCE and boundary AP on the
+    test block's tokens, monitoring only), one card per metric with a radio for the trunk and a line per milestone; then each
+    fit's last point against the milestone's step."""
+    fits = {}  # trunk label -> {milestone step: probe_fit rows}
+    for d in run_dirs(SWEEP):
+        if run_params(d):
+            fits[f"{d.name} {label(run_params(d))}"] = {int(e.name.removeprefix("step_")): read_jsonl(e / "probe_fit.json")
+                                                        for e in sorted(d.glob("step_*/")) if (e / "probe_fit.json").is_file()}
+    steps = sorted({k for f in fits.values() for k in f})
+    colors = dict(zip(map(str, steps), itertools.cycle(pi.COLORS)))  # a milestone keeps its colour in every trunk
+    cards = [(f"Probe fit: {m} over the probe's steps, a line per milestone (the radio picks the trunk)",
+              pi.lines({(str(k), t): ([r["step"] for r in rows], [r[m] for r in rows]) for t, f in fits.items() for k, rows in f.items()},
+                       "probe fit step", m, colors=colors))
+             for m in ("loss", "held_bce", "held_boundary_ap")]
+    last = {t: ([k for k in f], [f[k][-1] for k in f]) for t, f in fits.items() if f}
+    cards += [(f"Probe fit's last {m} against the milestone's trunk step (a probe that overfit would fit better as it tested worse)",
+               pi.lines({t: (ks, [r[m] for r in rows]) for t, (ks, rows) in last.items()}, "trunk step", m, logx=True))
+              for m in ("loss", "held_bce")]
+    cards.append(("Test-block BCE minus training BCE at the end of the fit, against the milestone's trunk step",
+                  pi.lines({t: (ks, [r["held_bce"] - r["loss"] for r in rows]) for t, (ks, rows) in last.items()}, "trunk step", "held_bce - loss", logx=True)))
+    return cards
+
+
 def throughput() -> tuple:
     """Each run's speed over its last 300 steps."""
     rows = []
@@ -93,7 +118,7 @@ def throughput() -> tuple:
 
 def main():
     tiles, sections = anticollapse.build(SWEEP, label=label)
-    sections = [("Findings", [("What e11 shows so far", FINDINGS)]), ("Against e10", against_e10() + [throughput()]), *sections]
+    sections = [("Findings", [("What e11 shows so far", FINDINGS)]), ("Against e10", against_e10() + [throughput()]), ("Probe fit trajectories", probe_fits()), *sections]
     page.write(SWEEP, __doc__, tiles, sections)
 
 
