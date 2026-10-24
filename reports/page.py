@@ -17,6 +17,7 @@ h1{margin-bottom:4px} h2{margin-top:36px;border-bottom:1px solid #ddd;padding-bo
 table{border-collapse:collapse;font-size:13px} th,td{padding:3px 10px;border-bottom:1px solid #eee;text-align:left}
 td.n,th{text-align:right} th:first-child{text-align:left}
 h1,h2{scroll-margin-top:16px} nav.toc{display:none}
+a.home{font-size:13px;color:#0072B2;text-decoration:none} a.home:hover{text-decoration:underline}
 @media (min-width:1100px){
   body{max-width:none}
   .layout{display:grid;grid-template-columns:230px minmax(0,1200px);gap:32px;max-width:1500px;margin:0 auto}
@@ -77,17 +78,19 @@ def write(sweep: str, intro: str | None, tiles: list, sections: list, interactiv
     assert intro, f"{sweep}: a report's docstring is its page's intro: say what the experiment asks"
     out = out_path(sweep)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(html(f"{sweep} report", intro, tiles, sections, interactive))
+    home = "../" * len(out.parent.parts) + "index.html"  # site/index.html, as served: site/results/ is a link to results/
+    out.write_text(html(f"{sweep} report", intro, tiles, sections, interactive, home))
     print(f"wrote {out}")
     return out
 
 
-def html(title: str, intro: str, tiles: list, sections: list, interactive: bool = True) -> str:
-    """A whole page: title and intro, tiles, then sections of cards, with the contents bar on the side (write())."""
+def html(title: str, intro: str, tiles: list, sections: list, interactive: bool = True, home: str = "") -> str:
+    """A whole page: title and intro, tiles, then sections of cards, with the contents bar on the side (write()). home: the
+    link, if any, back to the index page, above the title."""
     toc = [("overview", "Overview")] + [(anchor(t), t) for t, _ in sections]
     nav = "<nav class='toc'><b>Contents</b>" + "".join(f"<a href='#{a}'>{t}</a>" for a, t in toc) + "</nav>"
     main_html = (
-        f"<main><h1 id='overview'>{title}</h1><p>{intro}</p><div class='tiles'>"
+        f"<main>{f'<a class=home href={home!r}>&larr; All reports</a>' if home else ''}<h1 id='overview'>{title}</h1><p>{intro}</p><div class='tiles'>"
         + "".join(f"<div class='tile'><b>{n}</b>{label}</div>" for n, label in tiles) + "</div>"
         + "".join(f"<h2 id='{anchor(t)}'>{t}</h2><div class='grid'>" + "".join(card(ct, c) for ct, c in cards) + "</div>" for t, cards in sections)
         + "</main>"
