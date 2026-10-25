@@ -19,6 +19,7 @@ LINKED = ["results", "outdir"]  # all the site serves, besides its index
 # The index's sections: research threads and their pages, by key (a report's sweep, or a top-level page's name), shown
 # newest first. A page no thread lists goes under "Unsorted": add it here.
 THREADS = {
+    "Overview": ["diagrams"],
     "Performance optimization": ["perf_journey", "e00/b300-compile", "e00/cudagraph-fix", "e00/nanhunt_flash"],
     "View creation": ["e00/e01-viewsizes-2d", "e00/viewsizes-v2", "e00/viewsizes-pca"],
     "Architecture and scaling": ["e00/b300-train8h-dynamic", "e00/scaling-law-calib", "e00/scaling-law", "e00/scaling-law-pca"],

@@ -1,0 +1,15 @@
+erDiagram
+    EXPERIMENT ||--|{ TRAIN : lists
+    EXPERIMENT ||--o{ EVAL : lists
+    EXPERIMENT ||--o{ FINETUNE : lists
+    TRAIN }o--|| DATASET : "samples"
+    TRAIN ||--o{ MILESTONE : "saves"
+    MILESTONE ||--o| EVAL : "pca + probe"
+    MILESTONE ||--o{ FINETUNE : "initialises"
+    EVAL }o--|| PROBE_SET : "scored on"
+    FINETUNE }o--|| PROBE_SET : "scored on"
+    DATASET ||--o| PROBE_SET : "may have"
+    TRAIN ||--o{ RESULT : "metrics"
+    EVAL ||--o{ RESULT : "json"
+    FINETUNE ||--o{ RESULT : "json"
+    RESULT }o--o{ REPORT : "plotted in"

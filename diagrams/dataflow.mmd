@@ -1,0 +1,32 @@
+flowchart LR
+    subgraph store["Storage (NFS /groups/miaai)"]
+        Z[("EM volumes<br/>zarr, 8 nm")]
+        L[("GT labels<br/>probe blocks")]
+    end
+    subgraph load["CPU: miao loader"]
+        S["sampler<br/>family weights ^ 0.4"] --> W["workers<br/>uint8 crops"]
+    end
+    subgraph gpu["GPU: DDP trunk"]
+        V["views / mask<br/>normalise"] --> M["model<br/>encoder + head"] --> LO["loss"]
+    end
+    CK[("checkpoints<br/>milestones")]
+    subgraph ev["Milestone evals"]
+        P["pca maps"]
+        PR["linear probe<br/>boundary AP"]
+    end
+    FT["finetune<br/>UNETR decoder"]
+    J[("outdir<br/>json + png")]
+    R["reports<br/>site/index.html"]
+    Z --> S
+    W --> V
+    LO -. metrics .-> J
+    M --> CK
+    CK --> P
+    CK --> PR
+    CK --> FT
+    L --> PR
+    L --> FT
+    P --> J
+    PR --> J
+    FT --> J
+    J -- "pull.sh" --> R

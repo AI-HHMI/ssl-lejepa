@@ -1,0 +1,115 @@
+<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Diagrams</title><style>
+body{font:15px system-ui,sans-serif;max-width:1200px;margin:0 auto;padding:16px;color:#222;background:#fff}
+h1{margin-bottom:4px} h2{margin-top:36px;border-bottom:1px solid #ddd;padding-bottom:4px}
+.tiles{display:flex;flex-wrap:wrap;gap:12px} .tile{border:1px solid #ddd;border-radius:6px;padding:10px 16px}
+.tile b{display:block;font-size:24px} .grid{display:flex;flex-wrap:wrap;gap:20px}
+.card{flex:1 1 460px;min-width:0} .card.wide{flex-basis:100%} .card svg{max-width:100%;height:auto} h3{margin:8px 0 4px;font-size:15px}
+table{border-collapse:collapse;font-size:13px} th,td{padding:3px 10px;border-bottom:1px solid #eee;text-align:left}
+td.n,th{text-align:right} th:first-child{text-align:left}
+h1,h2{scroll-margin-top:16px} nav.toc{display:none}
+a.home{font-size:13px;color:#0072B2;text-decoration:none} a.home:hover{text-decoration:underline}
+@media (min-width:1100px){
+  body{max-width:none}
+  .layout{display:grid;grid-template-columns:230px minmax(0,1200px);gap:32px;max-width:1500px;margin:0 auto}
+  nav.toc{display:block;position:sticky;top:16px;align-self:start;max-height:calc(100vh - 32px);overflow:auto;font-size:14px}
+  nav.toc b{display:block;margin:0 0 8px 12px;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:#888}
+  nav.toc a{display:block;padding:5px 10px 5px 12px;color:#555;text-decoration:none;border-left:2px solid #eee}
+  nav.toc a:hover{color:#222;border-left-color:#bbb} nav.toc a.on{color:#0072B2;border-left-color:#0072B2;font-weight:600}
+}
+
+ul.entries{list-style:none;margin:6px 0 0;padding:0}
+ul.entries li{display:grid;grid-template-columns:96px 1fr;column-gap:16px;padding:10px 14px;margin:0 0 8px;
+  border-left:3px solid #0072B2;border-radius:0 6px 6px 0;background:#fafafa;transition:background .15s}
+ul.entries li:hover{background:#eef5fb}
+ul.entries time{grid-row:span 2;color:#888;font:12px ui-monospace,monospace;padding-top:3px;line-height:1.5}
+ul.entries time code{color:#aaa;font-size:11px}
+ul.entries a{font-weight:600;color:#0072B2;text-decoration:none} ul.entries a:hover{text-decoration:underline}
+ul.entries p{margin:3px 0 0;color:#555;font-size:13.5px;line-height:1.45;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+</style></head><body><div class='layout'><nav class='toc'><b>Contents</b><a href='#overview'>Overview</a><a href='#entities'>Entities</a><a href='#dataflow'>Dataflow</a><a href='#models'>Models</a></nav><main><a class=home href='../index.html'>&larr; All reports</a><h1 id='overview'>Diagrams</h1><p>High-level diagrams of how the project fits together: what an experiment is made of, how data flows through it, and what each pretraining objective trains.</p><div class='tiles'></div><h2 id='entities'>Entities</h2><div class='grid'><div class='card wide'><h3>An experiment's entities and how they relate (erDiagram)</h3><div class='wide'><pre class='pele'>erDiagram
+    EXPERIMENT ||--|{ TRAIN : lists
+    EXPERIMENT ||--o{ EVAL : lists
+    EXPERIMENT ||--o{ FINETUNE : lists
+    TRAIN }o--|| DATASET : &quot;samples&quot;
+    TRAIN ||--o{ MILESTONE : &quot;saves&quot;
+    MILESTONE ||--o| EVAL : &quot;pca + probe&quot;
+    MILESTONE ||--o{ FINETUNE : &quot;initialises&quot;
+    EVAL }o--|| PROBE_SET : &quot;scored on&quot;
+    FINETUNE }o--|| PROBE_SET : &quot;scored on&quot;
+    DATASET ||--o| PROBE_SET : &quot;may have&quot;
+    TRAIN ||--o{ RESULT : &quot;metrics&quot;
+    EVAL ||--o{ RESULT : &quot;json&quot;
+    FINETUNE ||--o{ RESULT : &quot;json&quot;
+    RESULT }o--o{ REPORT : &quot;plotted in&quot;
+</pre></div></div></div><h2 id='dataflow'>Dataflow</h2><div class='grid'><div class='card wide'><h3>From volumes on disk to the report (flowchart)</h3><div class='wide'><pre class='pele'>flowchart LR
+    subgraph store[&quot;Storage (NFS /groups/miaai)&quot;]
+        Z[(&quot;EM volumes&lt;br/&gt;zarr, 8 nm&quot;)]
+        L[(&quot;GT labels&lt;br/&gt;probe blocks&quot;)]
+    end
+    subgraph load[&quot;CPU: miao loader&quot;]
+        S[&quot;sampler&lt;br/&gt;family weights ^ 0.4&quot;] --&gt; W[&quot;workers&lt;br/&gt;uint8 crops&quot;]
+    end
+    subgraph gpu[&quot;GPU: DDP trunk&quot;]
+        V[&quot;views / mask&lt;br/&gt;normalise&quot;] --&gt; M[&quot;model&lt;br/&gt;encoder + head&quot;] --&gt; LO[&quot;loss&quot;]
+    end
+    CK[(&quot;checkpoints&lt;br/&gt;milestones&quot;)]
+    subgraph ev[&quot;Milestone evals&quot;]
+        P[&quot;pca maps&quot;]
+        PR[&quot;linear probe&lt;br/&gt;boundary AP&quot;]
+    end
+    FT[&quot;finetune&lt;br/&gt;UNETR decoder&quot;]
+    J[(&quot;outdir&lt;br/&gt;json + png&quot;)]
+    R[&quot;reports&lt;br/&gt;site/index.html&quot;]
+    Z --&gt; S
+    W --&gt; V
+    LO -. metrics .-&gt; J
+    M --&gt; CK
+    CK --&gt; P
+    CK --&gt; PR
+    CK --&gt; FT
+    L --&gt; PR
+    L --&gt; FT
+    P --&gt; J
+    PR --&gt; J
+    FT --&gt; J
+    J -- &quot;pull.sh&quot; --&gt; R
+</pre></div></div></div><h2 id='models'>Models</h2><div class='grid'><div class='card wide'><h3>MAE: encode a quarter of the tokens, decode the rest to voxels</h3><div class='wide'><pre class='pele'>flowchart LR
+    I[&quot;view&lt;br/&gt;Batch 1 Z Y X&quot;] --&gt; T[&quot;patchify&lt;br/&gt;tokens&quot;]
+    T -- &quot;25% visible&quot; --&gt; E[&quot;ViT encoder&lt;br/&gt;12 x 512&quot;]
+    T -- &quot;75% hidden&quot; --&gt; Q[&quot;mask tokens&lt;br/&gt;+ position&quot;]
+    E --&gt; D[&quot;decoder&lt;br/&gt;2 x 192&quot;]
+    Q --&gt; D
+    D --&gt; P[&quot;predicted voxels&lt;br/&gt;of hidden patches&quot;]
+    T -. &quot;normalised target&quot; .-&gt; L([&quot;MSE loss&quot;])
+    P --&gt; L
+</pre></div></div><div class='card wide'><h3>Masked tokens: predict a hidden cube of a shifted view</h3><div class='wide'><pre class='pele'>flowchart LR
+    R[&quot;region&lt;br/&gt;view + shift&quot;] --&gt; C[&quot;context view&quot;]
+    R --&gt; G[&quot;target view&lt;br/&gt;offset by &lt; 24 vox&quot;]
+    C -- &quot;visible tokens&lt;br/&gt;cube removed&quot; --&gt; E[&quot;ViT encoder&lt;br/&gt;12 x 512&quot;]
+    G -- &quot;all tokens&quot; --&gt; E2[&quot;same encoder&lt;br/&gt;(shared weights)&quot;]
+    E --&gt; PR[&quot;predictor&lt;br/&gt;4 blocks&lt;br/&gt;+ mask tokens&quot;]
+    PR --&gt; PJ[&quot;projector&lt;br/&gt;MLP&quot;]
+    E2 --&gt; PJ2[&quot;projector&lt;br/&gt;MLP&quot;]
+    PJ --&gt; INV([&quot;prediction error&lt;br/&gt;masked tokens&quot;])
+    PJ2 --&gt; INV
+    PJ --&gt; SG([&quot;SIGReg&quot;])
+    PJ2 --&gt; SG
+</pre></div></div><div class='card wide'><h3>Views: invariance across crops of one volume</h3><div class='wide'><pre class='pele'>flowchart LR
+    V[&quot;volume&quot;] --&gt; G[&quot;2 global crops&lt;br/&gt;88^3&quot;]
+    V --&gt; LC[&quot;4 local crops&lt;br/&gt;56^3&quot;]
+    G --&gt; E[&quot;ViT encoder&lt;br/&gt;12 x 512&lt;br/&gt;shared weights&quot;]
+    LC --&gt; E
+    E --&gt; PJ[&quot;projector MLP&lt;br/&gt;pooled embedding&quot;]
+    PJ --&gt; INV([&quot;invariance&lt;br/&gt;pull to mean of globals&quot;])
+    PJ --&gt; SG([&quot;SIGReg&lt;br/&gt;per view, over the batch&quot;])
+</pre></div></div></div></main></div><script>
+const links = [...document.querySelectorAll('nav.toc a')];
+const targets = links.map(a => document.querySelector(a.getAttribute('href')));
+function mark() {
+  let cur = 0;
+  targets.forEach((t, i) => { if (t.getBoundingClientRect().top <= 120) cur = i; });
+  links.forEach((a, i) => a.classList.toggle('on', i === cur));
+}
+addEventListener('scroll', mark, {passive: true});
+mark();
+</script><script src='https://cdn.jsdelivr.net/npm/pele@1.10.0/dist/pele.global.js'></script><script>document.querySelectorAll('pre.pele').forEach(p => { p.outerHTML = pele.render(p.textContent).svg; });</script></body></html>

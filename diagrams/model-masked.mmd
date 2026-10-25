@@ -1,0 +1,12 @@
+flowchart LR
+    R["region<br/>view + shift"] --> C["context view"]
+    R --> G["target view<br/>offset by < 24 vox"]
+    C -- "visible tokens<br/>cube removed" --> E["ViT encoder<br/>12 x 512"]
+    G -- "all tokens" --> E2["same encoder<br/>(shared weights)"]
+    E --> PR["predictor<br/>4 blocks<br/>+ mask tokens"]
+    PR --> PJ["projector<br/>MLP"]
+    E2 --> PJ2["projector<br/>MLP"]
+    PJ --> INV(["prediction error<br/>masked tokens"])
+    PJ2 --> INV
+    PJ --> SG(["SIGReg"])
+    PJ2 --> SG

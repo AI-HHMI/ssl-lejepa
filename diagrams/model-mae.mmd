@@ -1,0 +1,9 @@
+flowchart LR
+    I["view<br/>Batch 1 Z Y X"] --> T["patchify<br/>tokens"]
+    T -- "25% visible" --> E["ViT encoder<br/>12 x 512"]
+    T -- "75% hidden" --> Q["mask tokens<br/>+ position"]
+    E --> D["decoder<br/>2 x 192"]
+    Q --> D
+    D --> P["predicted voxels<br/>of hidden patches"]
+    T -. "normalised target" .-> L(["MSE loss"])
+    P --> L

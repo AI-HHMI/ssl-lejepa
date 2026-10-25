@@ -1,0 +1,8 @@
+flowchart LR
+    V["volume"] --> G["2 global crops<br/>88^3"]
+    V --> LC["4 local crops<br/>56^3"]
+    G --> E["ViT encoder<br/>12 x 512<br/>shared weights"]
+    LC --> E
+    E --> PJ["projector MLP<br/>pooled embedding"]
+    PJ --> INV(["invariance<br/>pull to mean of globals"])
+    PJ --> SG(["SIGReg<br/>per view, over the batch"])
