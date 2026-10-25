@@ -1,15 +1,15 @@
 erDiagram
-    EXPERIMENT ||--|{ TRAIN : lists
-    EXPERIMENT ||--o{ EVAL : lists
-    EXPERIMENT ||--o{ FINETUNE : lists
-    TRAIN }o--|| DATASET : "samples"
+    EXPERIMENT ||--|{ TRAIN : "lists"
+    EXPERIMENT ||--o{ EVAL : "lists"
+    EXPERIMENT ||--o{ FINETUNE : "lists"
+    TRAIN }o--|| DATASET : "samples from"
     TRAIN ||--o{ MILESTONE : "saves"
-    MILESTONE ||--o| EVAL : "pca + probe"
+    MILESTONE ||--o| EVAL : "is measured by"
     MILESTONE ||--o{ FINETUNE : "initialises"
-    EVAL }o--|| PROBE_SET : "scored on"
-    FINETUNE }o--|| PROBE_SET : "scored on"
+    EVAL }o--|| PROBE_SET : "is scored on"
+    FINETUNE }o--|| PROBE_SET : "is scored on"
     DATASET ||--o| PROBE_SET : "may have"
-    TRAIN ||--o{ RESULT : "metrics"
-    EVAL ||--o{ RESULT : "json"
-    FINETUNE ||--o{ RESULT : "json"
-    RESULT }o--o{ REPORT : "plotted in"
+    TRAIN ||--o{ RESULT : "logs"
+    EVAL ||--o{ RESULT : "writes"
+    FINETUNE ||--o{ RESULT : "writes"
+    RESULT }o--o{ REPORT : "is plotted in"

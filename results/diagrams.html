@@ -27,20 +27,20 @@ ul.entries a{font-weight:600;color:#0072B2;text-decoration:none} ul.entries a:ho
 ul.entries p{margin:3px 0 0;color:#555;font-size:13.5px;line-height:1.45;
   display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
 </style></head><body><div class='layout'><nav class='toc'><b>Contents</b><a href='#overview'>Overview</a><a href='#entities'>Entities</a><a href='#dataflow'>Dataflow</a><a href='#models'>Models</a></nav><main><a class=home href='../index.html'>&larr; All reports</a><h1 id='overview'>Diagrams</h1><p>High-level diagrams of how the project fits together: what an experiment is made of, how data flows through it, and what each pretraining objective trains.</p><div class='tiles'></div><h2 id='entities'>Entities</h2><div class='grid'><div class='card wide'><h3>An experiment's entities and how they relate (erDiagram)</h3><div class='wide'><pre class='pele'>erDiagram
-    EXPERIMENT ||--|{ TRAIN : lists
-    EXPERIMENT ||--o{ EVAL : lists
-    EXPERIMENT ||--o{ FINETUNE : lists
-    TRAIN }o--|| DATASET : &quot;samples&quot;
+    EXPERIMENT ||--|{ TRAIN : &quot;lists&quot;
+    EXPERIMENT ||--o{ EVAL : &quot;lists&quot;
+    EXPERIMENT ||--o{ FINETUNE : &quot;lists&quot;
+    TRAIN }o--|| DATASET : &quot;samples from&quot;
     TRAIN ||--o{ MILESTONE : &quot;saves&quot;
-    MILESTONE ||--o| EVAL : &quot;pca + probe&quot;
+    MILESTONE ||--o| EVAL : &quot;is measured by&quot;
     MILESTONE ||--o{ FINETUNE : &quot;initialises&quot;
-    EVAL }o--|| PROBE_SET : &quot;scored on&quot;
-    FINETUNE }o--|| PROBE_SET : &quot;scored on&quot;
+    EVAL }o--|| PROBE_SET : &quot;is scored on&quot;
+    FINETUNE }o--|| PROBE_SET : &quot;is scored on&quot;
     DATASET ||--o| PROBE_SET : &quot;may have&quot;
-    TRAIN ||--o{ RESULT : &quot;metrics&quot;
-    EVAL ||--o{ RESULT : &quot;json&quot;
-    FINETUNE ||--o{ RESULT : &quot;json&quot;
-    RESULT }o--o{ REPORT : &quot;plotted in&quot;
+    TRAIN ||--o{ RESULT : &quot;logs&quot;
+    EVAL ||--o{ RESULT : &quot;writes&quot;
+    FINETUNE ||--o{ RESULT : &quot;writes&quot;
+    RESULT }o--o{ REPORT : &quot;is plotted in&quot;
 </pre></div></div></div><h2 id='dataflow'>Dataflow</h2><div class='grid'><div class='card wide'><h3>From volumes on disk to the report (flowchart)</h3><div class='wide'><pre class='pele'>flowchart LR
     subgraph store[&quot;Storage (NFS /groups/miaai)&quot;]
         Z[(&quot;EM volumes&lt;br/&gt;zarr, 8 nm&quot;)]
