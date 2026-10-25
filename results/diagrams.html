@@ -73,35 +73,47 @@ ul.entries p{margin:3px 0 0;color:#555;font-size:13.5px;line-height:1.45;
     PR --&gt; J
     FT --&gt; J
     J -- &quot;pull.sh&quot; --&gt; R
-</pre></div></div></div><h2 id='models'>Models</h2><div class='grid'><div class='card wide'><h3>MAE: encode a quarter of the tokens, decode the rest to voxels</h3><div class='wide'><pre class='pele'>flowchart LR
-    I[&quot;view&lt;br/&gt;Batch 1 Z Y X&quot;] --&gt; T[&quot;patchify&lt;br/&gt;tokens&quot;]
-    T -- &quot;25% visible&quot; --&gt; E[&quot;ViT encoder&lt;br/&gt;12 x 512&quot;]
-    T -- &quot;75% hidden&quot; --&gt; Q[&quot;mask tokens&lt;br/&gt;+ position&quot;]
-    E --&gt; D[&quot;decoder&lt;br/&gt;2 x 192&quot;]
-    Q --&gt; D
-    D --&gt; P[&quot;predicted voxels&lt;br/&gt;of hidden patches&quot;]
-    T -. &quot;normalised target&quot; .-&gt; L([&quot;MSE loss&quot;])
-    P --&gt; L
-</pre></div></div><div class='card wide'><h3>Masked tokens: predict a hidden cube of a shifted view</h3><div class='wide'><pre class='pele'>flowchart LR
-    R[&quot;region&lt;br/&gt;view + shift&quot;] --&gt; C[&quot;context view&quot;]
-    R --&gt; G[&quot;target view&lt;br/&gt;offset by &lt; 24 vox&quot;]
-    C -- &quot;visible tokens&lt;br/&gt;cube removed&quot; --&gt; E[&quot;ViT encoder&lt;br/&gt;12 x 512&quot;]
-    G -- &quot;all tokens&quot; --&gt; E2[&quot;same encoder&lt;br/&gt;(shared weights)&quot;]
-    E --&gt; PR[&quot;predictor&lt;br/&gt;4 blocks&lt;br/&gt;+ mask tokens&quot;]
-    PR --&gt; PJ[&quot;projector&lt;br/&gt;MLP&quot;]
-    E2 --&gt; PJ2[&quot;projector&lt;br/&gt;MLP&quot;]
-    PJ --&gt; INV([&quot;prediction error&lt;br/&gt;masked tokens&quot;])
-    PJ2 --&gt; INV
-    PJ --&gt; SG([&quot;SIGReg&quot;])
-    PJ2 --&gt; SG
-</pre></div></div><div class='card wide'><h3>Views: invariance across crops of one volume</h3><div class='wide'><pre class='pele'>flowchart LR
-    V[&quot;volume&quot;] --&gt; G[&quot;2 global crops&lt;br/&gt;88^3&quot;]
-    V --&gt; LC[&quot;4 local crops&lt;br/&gt;56^3&quot;]
-    G --&gt; E[&quot;ViT encoder&lt;br/&gt;12 x 512&lt;br/&gt;shared weights&quot;]
-    LC --&gt; E
-    E --&gt; PJ[&quot;projector MLP&lt;br/&gt;pooled embedding&quot;]
-    PJ --&gt; INV([&quot;invariance&lt;br/&gt;pull to mean of globals&quot;])
-    PJ --&gt; SG([&quot;SIGReg&lt;br/&gt;per view, over the batch&quot;])
+</pre></div></div></div><h2 id='models'>Models</h2><div class='grid'><div class='card wide'><h3>MAE: encode a quarter of the tokens, decode the rest to voxels</h3><div class='wide'><pre class='pele'>flowchart TB
+    DL[&quot;miao loader&quot;] --&gt;|&quot;vol: Batch C Z Y X&quot;| VM[&quot;ViewMaker&quot;]
+    VM --&gt;|&quot;view: Batch C Z Y X&quot;| ENC[&quot;ViT3DEncoder&lt;br/&gt;forward_features(keep)&quot;]
+    VM --&gt;|&quot;view: Batch C Z Y X&quot;| PAT[&quot;patchify&lt;br/&gt;gather hidden&quot;]
+    ORD[&quot;random order&lt;br/&gt;mask_ratio 0.75&quot;] --&gt;|&quot;keep: Batch Nvis&quot;| ENC
+    ORD --&gt;|&quot;order: Batch N&quot;| DEC[&quot;decoder&lt;br/&gt;mask tokens + sincos&lt;br/&gt;2 TransformerBlocks&quot;]
+    ORD --&gt;|&quot;hidden: Batch M&quot;| PAT
+    ENC --&gt;|&quot;latent: Batch Nvis D&quot;| DEC
+    DEC --&gt;|&quot;pred: Batch M Vox&quot;| MSE[&quot;MSE&quot;]
+    PAT --&gt;|&quot;patches: Batch M Vox&quot;| NP[&quot;norm_pix&quot;]
+    NP --&gt;|&quot;target: Batch M Vox&quot;| MSE
+    MSE --&gt;|&quot;loss: scalar&quot;| OPT[&quot;backward&lt;br/&gt;AdamW&quot;]
+</pre></div></div><div class='card wide'><h3>Masked tokens: predict a hidden cube of a shifted view</h3><div class='wide'><pre class='pele'>flowchart TB
+    DL[&quot;miao loader&quot;] --&gt;|&quot;vol: Batch C Z Y X&quot;| VM[&quot;ViewMaker&quot;]
+    VM --&gt;|&quot;region: Batch C Z+s Y+s X+s&quot;| CR[&quot;crop x 2&lt;br/&gt;random origins&quot;]
+    CR --&gt;|&quot;view: Batch C Z Y X&quot;| ENC[&quot;ViT3DEncoder&lt;br/&gt;forward_features(keep)&quot;]
+    CR --&gt;|&quot;target_view: Batch C Z Y X&quot;| ENC2[&quot;ViT3DEncoder&lt;br/&gt;(same weights)&quot;]
+    CR --&gt;|&quot;offset: Batch 3&quot;| MB[&quot;mask_block&quot;]
+    MB --&gt;|&quot;visible: Batch Nvis&quot;| ENC
+    MB --&gt;|&quot;masked, masked_coords: Batch M&quot;| PRED
+    ENC --&gt;|&quot;context: Batch Nvis D&quot;| PRED[&quot;Predictor&lt;br/&gt;mask tokens + sincos&lt;br/&gt;4 TransformerBlocks&quot;]
+    PRED --&gt;|&quot;hidden: Batch M D&quot;| PJ[&quot;projector MLP&quot;]
+    ENC2 --&gt;|&quot;tokens: Batch N D&quot;| PJ2[&quot;projector MLP&lt;br/&gt;(same weights)&quot;]
+    PJ --&gt;|&quot;pred: Batch M Dproj&quot;| LOSS[&quot;lejepa_loss&lt;br/&gt;error + lamb x SIGReg&quot;]
+    PJ2 --&gt;|&quot;emb: Batch N Dproj&quot;| G[&quot;gather masked&quot;]
+    G --&gt;|&quot;target: Batch M Dproj&quot;| LOSS
+    PJ2 --&gt;|&quot;emb: Batch N Dproj&quot;| SG[&quot;sigreg_term&quot;]
+    SG --&gt;|&quot;sig: scalar&quot;| LOSS
+    MB --&gt;|&quot;masked: Batch M&quot;| G
+    LOSS --&gt;|&quot;loss: scalar&quot;| OPT[&quot;backward&lt;br/&gt;AdamW&quot;]
+</pre></div></div><div class='card wide'><h3>Views: invariance across crops of one volume</h3><div class='wide'><pre class='pele'>flowchart TB
+    DL[&quot;miao loader&quot;] --&gt;|&quot;vol: Batch C Z Y X&quot;| VM[&quot;ViewMaker&quot;]
+    VM --&gt;|&quot;g_views: 2 x Batch C Zg Yg Xg&quot;| ENC[&quot;ViT3DEncoder&lt;br/&gt;(one set of weights)&quot;]
+    VM --&gt;|&quot;l_views: 4 x Batch C Zl Yl Xl&quot;| ENC
+    ENC --&gt;|&quot;emb: View Batch D&quot;| PJ[&quot;projector MLP&quot;]
+    PJ --&gt;|&quot;proj_globals: Global Batch Dproj&quot;| MEAN[&quot;mean over globals&quot;]
+    PJ --&gt;|&quot;proj_all: View Batch Dproj&quot;| SG[&quot;sigreg&quot;]
+    MEAN --&gt;|&quot;pred: View Batch Dproj&quot;| LOSS[&quot;lejepa_loss&lt;br/&gt;error + lamb x SIGReg&quot;]
+    PJ --&gt;|&quot;target: View Batch Dproj&quot;| LOSS
+    SG --&gt;|&quot;sig: scalar&quot;| LOSS
+    LOSS --&gt;|&quot;loss: scalar&quot;| OPT[&quot;backward&lt;br/&gt;AdamW&quot;]
 </pre></div></div></div></main></div><script>
 const links = [...document.querySelectorAll('nav.toc a')];
 const targets = links.map(a => document.querySelector(a.getAttribute('href')));

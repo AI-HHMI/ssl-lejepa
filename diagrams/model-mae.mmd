@@ -1,9 +1,12 @@
-flowchart LR
-    I["view<br/>Batch 1 Z Y X"] --> T["patchify<br/>tokens"]
-    T -- "25% visible" --> E["ViT encoder<br/>12 x 512"]
-    T -- "75% hidden" --> Q["mask tokens<br/>+ position"]
-    E --> D["decoder<br/>2 x 192"]
-    Q --> D
-    D --> P["predicted voxels<br/>of hidden patches"]
-    T -. "normalised target" .-> L(["MSE loss"])
-    P --> L
+flowchart TB
+    DL["miao loader"] -->|"vol: Batch C Z Y X"| VM["ViewMaker"]
+    VM -->|"view: Batch C Z Y X"| ENC["ViT3DEncoder<br/>forward_features(keep)"]
+    VM -->|"view: Batch C Z Y X"| PAT["patchify<br/>gather hidden"]
+    ORD["random order<br/>mask_ratio 0.75"] -->|"keep: Batch Nvis"| ENC
+    ORD -->|"order: Batch N"| DEC["decoder<br/>mask tokens + sincos<br/>2 TransformerBlocks"]
+    ORD -->|"hidden: Batch M"| PAT
+    ENC -->|"latent: Batch Nvis D"| DEC
+    DEC -->|"pred: Batch M Vox"| MSE["MSE"]
+    PAT -->|"patches: Batch M Vox"| NP["norm_pix"]
+    NP -->|"target: Batch M Vox"| MSE
+    MSE -->|"loss: scalar"| OPT["backward<br/>AdamW"]
