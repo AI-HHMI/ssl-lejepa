@@ -21,7 +21,7 @@ def provenance(monkeypatch):  # run records independent of git state
 def test_pca_keeps_its_milestone(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")
-    par = experiment.eval_params(experiment.Train(savedir="outdir/e00/e01-test/d0/", steps_per_epoch=1000), 100)
+    par = experiment.eval_params(experiment.Train(savedir="outdir/e00/e01-test/d0/", total_steps=1000), 100)
     milestone = Path(par.init_from)
     milestone.parent.mkdir(parents=True)
     milestone.touch()
@@ -112,7 +112,7 @@ def test_train_volumes_weigh_a_joint_sets_families_by_voxel_count_to_its_exponen
 def test_a_trunk_evaluates_its_end_only_off_a_milestone(tmp_path, monkeypatch, final_step, evals):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")
-    trunk = experiment.Train(savedir="outdir/e00/e01-test/d0/", steps_per_epoch=2000, milestone_every=1000, max_hours=1.0)
+    trunk = experiment.Train(savedir="outdir/e00/e01-test/d0/", total_steps=2000, milestone_every=1000, max_hours=1.0)
     monkeypatch.delenv("RANK", raising=False)
     calls = []
     monkeypatch.setattr(experiment.training, "train", lambda par, on_milestone: calls.append("train"))
@@ -255,7 +255,7 @@ def test_submitall_takes_a_child_of_its_parent(tmp_path, monkeypatch):
 
 
 def test_a_milestone_eval_runs_pca_then_probe_without_stopping_or_steering_training(tmp_path, monkeypatch):
-    trunk = experiment.Train(savedir=f"{tmp_path}/d0/", steps_per_epoch=100)
+    trunk = experiment.Train(savedir=f"{tmp_path}/d0/", total_steps=100)
     e = experiment.eval_params(trunk, 10)
     calls = []
     monkeypatch.setattr(experiment, "pca", lambda job: calls.append(("pca", job, torch.rand(100))))  # draws from the RNG training uses

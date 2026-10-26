@@ -79,7 +79,7 @@ def patch_training(monkeypatch):
 def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorded_steps):
     params = Train(
         savedir=str(tmp_path), patch_size=(8, 8, 8), batch_size=2,
-        steps_per_epoch=n_steps, warmup_steps=1, benchmark_steps=2, profile_steps=profile_steps,
+        total_steps=n_steps, warmup_steps=1, benchmark_steps=2, profile_steps=profile_steps,
         n_workers=0, defer_image_ops=False,  # synthetic dataset yields finished float images; loaded in-process (no worker startup)
     )
     patch_training(monkeypatch)
@@ -127,7 +127,7 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
 
 @pytest.mark.parametrize("objective", ["views", "mae"])
 def test_each_objective_trains_logs_its_terms_and_reloads_for_eval(tmp_path, monkeypatch, objective):
-    params = Train(savedir=str(tmp_path), objective=objective, patch_size=(8, 8, 8), batch_size=2, steps_per_epoch=3,
+    params = Train(savedir=str(tmp_path), objective=objective, patch_size=(8, 8, 8), batch_size=2, total_steps=3,
                               warmup_steps=1, benchmark_steps=1, profile_steps=0, n_workers=0, defer_image_ops=False)
     patch_training(monkeypatch)
     training.train(params, NO_MILESTONE_EVAL)
@@ -145,7 +145,7 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
     run = tmp_path / "d0"
     run.mkdir()
     params = Train(
-        savedir=f"{run}/", patch_size=(8, 8, 8), batch_size=2, steps_per_epoch=6,
+        savedir=f"{run}/", patch_size=(8, 8, 8), batch_size=2, total_steps=6,
         warmup_steps=1, benchmark_steps=2, profile_steps=0, n_workers=0, defer_image_ops=False,
         compile=False,  # eager on CPU, so the replay below must reproduce the step's loss exactly
     )
@@ -181,7 +181,7 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
 
 def test_benchmark_times_and_profiles_the_training_step_only(tmp_path, monkeypatch):
     params = Train(
-        savedir=str(tmp_path), patch_size=(8, 8, 8), batch_size=2, steps_per_epoch=1000, max_hours=1.0,
+        savedir=str(tmp_path), patch_size=(8, 8, 8), batch_size=2, total_steps=1000, max_hours=1.0,
         warmup_steps=1, benchmark_steps=2, profile_steps=2, n_workers=0, defer_image_ops=False,
     )
     patch_training(monkeypatch)
@@ -192,10 +192,31 @@ def test_benchmark_times_and_profiles_the_training_step_only(tmp_path, monkeypat
     assert not (tmp_path / "metrics.json").exists() and not (tmp_path / "checkpoints").exists()  # not a training run
 
 
+def test_lr_decay_falls_linearly_to_zero_after_the_warmup(tmp_path, monkeypatch):
+    monkeypatch.setattr(training, "LR_WARMUP", 100)
+    par = Train(savedir=f"{tmp_path}/d0/", patch_size=(8, 8, 8), batch_size=2, total_steps=200, max_hours=1.0, lr_decay=True, qk_norm=True,
+                warmup_steps=1, benchmark_steps=2, profile_steps=0, n_workers=0, defer_image_ops=False, compile=False)
+    patch_training(monkeypatch)
+    training.train(par, lambda par, step: None)
+    rows = [json.loads(line) for line in (Path(par.savedir) / "metrics.json").read_text().splitlines()]
+    scale = lambda s: min(1, (s + 1) / 100) * (1 - min(1, max(0, (s - 100) / 100)))
+    assert all(r["lr"] == pytest.approx(par.lr * scale(r["idx_step"] + 1)) for r in rows)
+    assert max(r["lr"] for r in rows) == pytest.approx(par.lr, rel=0.02) and rows[-1]["lr"] < 0.02 * par.lr  # up, then down to ~0
+
+
+def test_qk_norm_normalizes_each_heads_queries_and_keys():
+    from lib.encoders.vit3d import Attention
+    x = torch.randn(2, 5, 32) * 50
+    plain, normed = Attention(32, num_heads=4), Attention(32, num_heads=4, qk_norm=True)
+    assert isinstance(normed.q_norm, torch.nn.LayerNorm) and isinstance(plain.q_norm, torch.nn.Identity)
+    assert normed(x).shape == plain(x).shape == (2, 5, 32)
+    assert len(list(normed.parameters())) == len(list(plain.parameters())) + 4  # a weight and bias each, for q and k
+
+
 def test_a_trunk_hands_each_milestone_to_its_callback_and_an_anneal_continues_one(tmp_path, monkeypatch):
     monkeypatch.setattr(training, "LR_WARMUP", 100)  # a short warmup, so a short trunk gets past it
     src = Train(
-        savedir=f"{tmp_path}/d0/", patch_size=(8, 8, 8), batch_size=2, steps_per_epoch=130, max_hours=1.0,  # past LR_WARMUP
+        savedir=f"{tmp_path}/d0/", patch_size=(8, 8, 8), batch_size=2, total_steps=130, max_hours=1.0,  # past LR_WARMUP
         warmup_steps=1, benchmark_steps=2, profile_steps=0, n_workers=0, defer_image_ops=False, compile=False,
     )
     patch_training(monkeypatch)
@@ -211,7 +232,7 @@ def test_a_trunk_hands_each_milestone_to_its_callback_and_an_anneal_continues_on
     assert all(r["lr"] == pytest.approx(src.lr * min(1, (r["idx_step"] + 2) / 100)) for r in trunk)  # warmup, then constant, no decay
     assert trunk[-1]["lr"] == src.lr
 
-    par = replace(src, savedir=specs.branch_dir(src, 117), steps_per_epoch=12, anneal_from=str(specs.milestone(src, 117)))
+    par = replace(src, savedir=specs.branch_dir(src, 117), total_steps=12, anneal_from=str(specs.milestone(src, 117)))
     training.train(par, lambda par, step: pytest.fail("an anneal has no milestones"))
     start = torch.load(par.anneal_from, weights_only=False)
     metrics = [json.loads(line) for line in (Path(par.savedir) / "metrics.json").read_text().splitlines()]

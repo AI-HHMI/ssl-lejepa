@@ -95,7 +95,7 @@ def dataloader(par: Train):
         patch_size=list(par.patch_size),
         resolutions=[[8.0, 8.0, 8.0]],
         # Extra batches keep workers busy (as in real training) through the last, profiled steps.
-        samples_per_epoch=par.batch_size * (par.steps_per_epoch + par.n_workers * par.prefetch_factor),
+        samples_per_epoch=par.batch_size * (par.total_steps + par.n_workers * par.prefetch_factor),
         sampling="random",
         output_axes="lzyx",
         defer_image_ops=par.defer_image_ops,
@@ -164,13 +164,17 @@ def build(par: Train, r: Rank):
     if ckpt is not None:  # the Adam moments and step count only: the fresh param groups keep the checkpoint's lr as the schedule's start
         ckpt["opt"]["param_groups"] = opt.state_dict()["param_groups"]
         opt.load_state_dict(ckpt["opt"])
-    # By step count, so every rank uses the same lr. A trunk run warms up, then holds par.lr until it stops: it never
-    # decays, so its milestone checkpoints are branch points (Train.anneal_from). An anneal has no warmup (the loaded moments
-    # are warm) and cosine-decays from the checkpoint's lr to LR_FLOOR of it over steps_per_epoch.
+    # By step count, so every rank uses the same lr. A trunk run warms up, then holds par.lr until it stops, so its milestone
+    # checkpoints are branch points (Train.anneal_from); with par.lr_decay it falls linearly to 0 at total_steps instead. An anneal has no warmup (the loaded moments
+    # are warm) and cosine-decays from the checkpoint's lr to LR_FLOOR of it over total_steps.
     if ckpt is None:
-        lr_scale = lambda s: min(1.0, (s + 1) / LR_WARMUP)
+        def lr_scale(s):
+            warm = min(1.0, (s + 1) / LR_WARMUP)
+            b1 = par.lr_decay
+            b2 = min(1.0, max(0.0, (s - LR_WARMUP) / (par.total_steps - LR_WARMUP)))  # how far through the decay
+            return warm * (1 - b2 if b1 else 1.0)
     else:
-        lr_scale = lambda s: LR_FLOOR + (1 - LR_FLOOR) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / par.steps_per_epoch)))
+        lr_scale = lambda s: LR_FLOOR + (1 - LR_FLOOR) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / par.total_steps)))
     return model, lejepa, opt, torch.optim.lr_scheduler.LambdaLR(opt, lr_scale)
 
 def train_step(model, opt, sched, batches, par: Train, r: Rank, bench: Benchmark):
@@ -255,7 +259,7 @@ def log_metrics(f, par: Train, lejepa, x, out, grad_norm, sched, step: int, n_sk
                         "grad_norm": grad_norm.item(), "lr": sched.get_last_lr()[0],
                         "resid_norm": resid.float().norm(dim=-1).median().item(), "skipped": n_skipped}) + "\n")
     f.flush()
-    print(f"finished step {step + 1}/{par.steps_per_epoch}, loss={loss:.4f}", flush=True)
+    print(f"finished step {step + 1}/{par.total_steps}, loss={loss:.4f}", flush=True)
 
 def stop_reason(par: Train, r: Rank, out, n_skipped: int, seconds: float, step: int) -> str:
     """Why every rank stops after this step ("" to go on), agreed by one all-reduce: a non-finite loss (divergence), past
@@ -294,7 +298,7 @@ def train(par: Train, on_milestone):
     n_skipped, step = 0, -1
     try:
         with open(Path(par.savedir) / "metrics.json" if r.rank0 else os.devnull, "a") as f, Benchmark(par, r.device(), r.world, r.rank0) as bench:
-            for step in range(par.steps_per_epoch):
+            for step in range(par.total_steps):
                 bench.begin(step)
                 x, out, grad_norm, skipped, rng = train_step(model, opt, sched, batches, par, r, bench)
                 if skipped:
@@ -303,7 +307,7 @@ def train(par: Train, on_milestone):
                     if r.rank0 and n_skipped <= BAD_BATCHES_KEPT:
                         save_bad_batch(par, lejepa, x, rng, step)
                 with bench.phase("07_LOGGING"):
-                    if r.rank0 and (step % 10 == 0 or step + 1 == par.steps_per_epoch):
+                    if r.rank0 and (step % 10 == 0 or step + 1 == par.total_steps):
                         log_metrics(f, par, lejepa, x, out, grad_norm, sched, step, n_skipped, time.time() - start_time)
                 bench.end(step)
                 if step % 100 == 99 and (reason := stop_reason(par, r, out, n_skipped, time.time() - start_time, step)):
@@ -327,12 +331,12 @@ def benchmark(par: Train):
     warmup_steps untimed, benchmark_steps timed (performance.json), then profile_steps traced (profile.json, profile.out,
     trace_summary.json); no metrics, checkpoints or evals. Same setup, data and step as train(). Every DDP rank."""
     import torch.distributed as dist
-    par = replace(par, steps_per_epoch=par.warmup_steps + par.benchmark_steps + 1 + par.profile_steps)  # Benchmark's windows, no more
+    par = replace(par, total_steps=par.warmup_steps + par.benchmark_steps + 1 + par.profile_steps)  # Benchmark's windows, no more
     r = setup(par)
     batches = dataloader(par)
     model, _, opt, sched = build(par, r)
     with Benchmark(par, r.device(), r.world, r.rank0) as bench:
-        for step in range(par.steps_per_epoch):
+        for step in range(par.total_steps):
             bench.begin(step)
             train_step(model, opt, sched, batches, par, r, bench)
             bench.end(step)

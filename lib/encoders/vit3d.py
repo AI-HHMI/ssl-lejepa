@@ -133,6 +133,7 @@ class Attention(nn.Module):
         qkv_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
+        qk_norm: bool = False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -142,6 +143,8 @@ class Attention(nn.Module):
         self.scale = self.head_dim ** -0.5
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.q_norm = nn.LayerNorm(self.head_dim) if qk_norm else nn.Identity()  # bounds the attention logits
+        self.k_norm = nn.LayerNorm(self.head_dim) if qk_norm else nn.Identity()
         self.attn_drop = attn_drop
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -149,7 +152,7 @@ class Attention(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = self.q_norm(qkv[0]), self.k_norm(qkv[1]), qkv[2]  # Batch Head N HeadDim
 
         dropout_p = self.attn_drop if self.training else 0.0
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
@@ -170,6 +173,7 @@ class TransformerBlock(nn.Module):
         dropout: float = 0.0,
         attention_dropout: float = 0.0,
         qkv_bias: bool = True,
+        qk_norm: bool = False,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
@@ -179,6 +183,7 @@ class TransformerBlock(nn.Module):
             qkv_bias=qkv_bias,
             attn_drop=attention_dropout,
             proj_drop=dropout,
+            qk_norm=qk_norm,
         )
         self.norm2 = nn.LayerNorm(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
@@ -208,6 +213,7 @@ class EncoderConfig:
     dropout: float = 0.0
     attention_dropout: float = 0.0
     qkv_bias: bool = True
+    qk_norm: bool = False  # LayerNorm on each head's queries and keys (ViT-22B): the attention logits can't grow without bound
     token_dropout: float = 0.0
 
 
@@ -220,7 +226,7 @@ class ViT3DEncoder(nn.Module):
         self.patch_embed = PatchEmbed3d(patch_size=c.patch_size, in_channels=c.in_channels, embed_dim=c.embed_dim)
         self.blocks = nn.ModuleList([
             TransformerBlock(dim=c.embed_dim, num_heads=c.num_heads, mlp_ratio=c.mlp_ratio, dropout=c.dropout,
-                             attention_dropout=c.attention_dropout, qkv_bias=c.qkv_bias)
+                             attention_dropout=c.attention_dropout, qkv_bias=c.qkv_bias, qk_norm=c.qk_norm)
             for _ in range(c.depth)
         ])
         self.norm = nn.LayerNorm(c.embed_dim)

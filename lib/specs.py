@@ -24,14 +24,16 @@ class Train:
     probe_sets: tuple[str, ...] = (DEFAULT_DATA,)  # run(): the lib.data.PROBE_SETS its end of training is probed on (probe_evals)
     patch_size: Tup3Int = (104, 104, 104)  # voxels are 8 nm isotropic (the dataloader reads every volume at 8 nm)
     batch_size: int = 84
-    steps_per_epoch: int = 71  # warmup + benchmark + 1 profiler warmup + profile steps: stop right after profiling.
+    total_steps: int = 71  # warmup + benchmark + 1 profiler warmup + profile steps: stop right after profiling.
     # Training runs set it to the expected step count: milestone checkpoints are every 10% of it.
-    max_hours: float = 0.0  # >0: stop after this many hours (steps_per_epoch is then an upper bound); sets LSF walltime
-    milestone_every: int = 0  # steps between a trunk's milestone checkpoints (milestone_steps); 0: every 10% of steps_per_epoch
+    max_hours: float = 0.0  # >0: stop after this many hours (total_steps is then an upper bound); sets LSF walltime
+    milestone_every: int = 0  # steps between a trunk's milestone checkpoints (milestone_steps); 0: every 10% of total_steps
     milestone_doubling: bool = False  # milestones at milestone_every x 1, 2, 4, ...: log-spaced, a few evals however fast it steps
     n_layers: int = 12
     width: int = 512  # encoder width; heads = width // 64
-    lr: float = 1e-4  # run(): linear warmup, then held at this lr (no decay; see anneal_from)
+    lr: float = 1e-4  # run(): linear warmup, then held at this lr (or lr_decay; see anneal_from)
+    lr_decay: bool = False  # run(): after the warmup, lr falls linearly to 0 at total_steps (a run stopped by max_hours first ends mid-way)
+    qk_norm: bool = False  # LayerNorm on the encoder's queries and keys (lib.encoders.EncoderConfig.qk_norm)
     # The pre-training objective: LeJEPA's multi-view invariance ("views", every run before e02), its masked-token prediction
     # ("mask", e02-e05), or a masked autoencoder ("mae", the pixel-space baseline: lib.models.Mae). See model_config.
     objective: Literal["views", "mask", "mae"] = "mask"
@@ -66,7 +68,7 @@ class Train:
     queue: str = "gpu_h200"  # LSF queue
     n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); batch_size and n_workers are per GPU
 
-    anneal_from: str = ""  # a checkpoint .pt (e.g. a trunk's milestone): train() continues it for steps_per_epoch steps, Adam moments kept,
+    anneal_from: str = ""  # a checkpoint .pt (e.g. a trunk's milestone): train() continues it for total_steps steps, Adam moments kept,
                            # lr cosine-decaying from the checkpoint's lr to 1% of it; run() then evals the result (pca, probe)
 
     # profiling params
@@ -123,7 +125,7 @@ def lejepa_config(par: Train) -> LejepaConfig:
     (z, y, x), s = par.global_size, par.mask_shift
     n_global, n_local = (2, 4) if par.objective == "views" else (1, 0)  # "views": ViewConfig's defaults before e02
     return LejepaConfig(
-        encoder = EncoderConfig(depth=par.n_layers, embed_dim=par.width, num_heads=par.width // 64),
+        encoder = EncoderConfig(depth=par.n_layers, embed_dim=par.width, num_heads=par.width // 64, qk_norm=par.qk_norm),
         objective = par.objective,
         view = ViewConfig(views=par.views, n_global=n_global, n_local=n_local, global_size=(z + s, y + s, x + s), local_size=par.local_size),  # "mask": both views' region
         batch_views = par.batch_views,
@@ -138,7 +140,7 @@ def model_config(par: Train) -> LejepaConfig | MaeConfig:
     if par.objective != "mae":
         return lejepa_config(par)
     (dim, depth) = par.mae_decoder
-    return MaeConfig(encoder=EncoderConfig(depth=par.n_layers, embed_dim=par.width, num_heads=par.width // 64),
+    return MaeConfig(encoder=EncoderConfig(depth=par.n_layers, embed_dim=par.width, num_heads=par.width // 64, qk_norm=par.qk_norm),
                      view=ViewConfig(views=par.views, global_size=par.global_size),
                      decoder_dim=dim, decoder_depth=depth, decoder_heads=dim // 32)
 
@@ -174,16 +176,16 @@ def load_checkpoint(e: Eval | Finetune):
     return model.to(device).eval(), ckpt["step"]
 
 def milestone_steps(trunk: Train) -> list[int]:
-    """The steps whose checkpoints train() keeps in checkpoints/milestones/: every milestone_every steps up to steps_per_epoch,
+    """The steps whose checkpoints train() keeps in checkpoints/milestones/: every milestone_every steps up to total_steps,
     or, if that is 0, every 10% of it (the last is the final checkpoint of a trunk that ran to completion). A trunk stopped
-    early by max_hours never reaches the later ones: with a time budget, steps_per_epoch is just the cap that lists them.
+    early by max_hours never reaches the later ones: with a time budget, total_steps is just the cap that lists them.
     With milestone_doubling, they double from milestone_every instead."""
     if trunk.milestone_doubling:
         assert trunk.milestone_every > 0, f"{trunk.savedir}: doubling milestones start at milestone_every, which is 0"
-        return [trunk.milestone_every * 2 ** k for k in range((trunk.steps_per_epoch // trunk.milestone_every).bit_length())]
+        return [trunk.milestone_every * 2 ** k for k in range((trunk.total_steps // trunk.milestone_every).bit_length())]
     if trunk.milestone_every:
-        return list(range(trunk.milestone_every, trunk.steps_per_epoch + 1, trunk.milestone_every))
-    return sorted({round(k * trunk.steps_per_epoch / 10) for k in range(1, 11)})
+        return list(range(trunk.milestone_every, trunk.total_steps + 1, trunk.milestone_every))
+    return sorted({round(k * trunk.total_steps / 10) for k in range(1, 11)})
 
 def milestone(trunk: Train, step: int) -> Path:
     """The checkpoint train() keeps at this milestone step (0.6 GB for m: a milestone eval, or a branch, can reload it any time)."""

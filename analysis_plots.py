@@ -91,7 +91,7 @@ def probe_table(sweep: str) -> list:
         aps = {k.removeprefix("boundary_ap_"): v for k, v in st.items() if k.startswith("boundary_ap_(")}
         bce = [v for k, v in st.items() if k.startswith("bce_(")][:3]
         walltime = probe_walltime_s(d)
-        rows.append({"run": d.name, "config": config_label(params[d], varying) + f' steps={params[d].get("steps_per_epoch")}',
+        rows.append({"run": d.name, "config": config_label(params[d], varying) + f' steps={params[d].get("total_steps", params[d].get("steps_per_epoch"))}',
                      "probe steps": fit[-1]["step"] + 1 if fit else None,
                      "walltime": fmt_duration(walltime), "boundary AP short": st["boundary_ap_short"],
                      **{f"AP {k}": v for k, v in aps.items()}, "BCE short": sum(bce) / len(bce)})

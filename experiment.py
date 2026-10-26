@@ -69,7 +69,7 @@ def roots() -> list[Spec]:
         p.patch_size = (input_size, input_size, input_size)
         p.global_size = (view, view, view)
         p.batch_size = BATCH
-        p.steps_per_epoch = STEPS
+        p.total_steps = STEPS
         p.milestone_every = 5_000
         p.milestone_doubling = True
         p.max_hours = HOURS
