@@ -77,11 +77,11 @@ def test_run_trains_then_evals(tmp_path, monkeypatch, max_hours):
     monkeypatch.chdir(tmp_path)
     calls = []
     monkeypatch.setattr(experiment.training, "train", lambda par, on_milestone: calls.append("train"))
-    for fn in ["pca", "probe"]:
+    for fn in ["pca", "val", "probe"]:
         monkeypatch.setattr(experiment, fn, lambda job, fn=fn: calls.append(fn))
     monkeypatch.delenv("RANK", raising=False)
     experiment.run(experiment.Train(max_hours=max_hours))
-    assert calls == ["train", "pca", "probe"]  # evals after train() has torn down the process group; a benchmark is its own entrypoint
+    assert calls == ["train", "pca", "val", "probe"]  # evals after train() has torn down the process group; a benchmark is its own entrypoint
 
 
 def test_a_run_probed_on_several_sets_probes_each_in_its_own_dir(tmp_path, monkeypatch):
@@ -89,6 +89,7 @@ def test_a_run_probed_on_several_sets_probes_each_in_its_own_dir(tmp_path, monke
     probed = []
     monkeypatch.setattr(experiment.training, "train", lambda par, on_milestone: None)
     monkeypatch.setattr(experiment, "pca", lambda job: probed.append(("pca", job.savedir)))
+    monkeypatch.setattr(experiment, "val", lambda job: None)
     monkeypatch.setattr(experiment, "probe", lambda job: probed.append((job.probe_on, job.savedir)))
     monkeypatch.delenv("RANK", raising=False)
     experiment.run(experiment.Train(savedir="outdir/e00/x/d0/", probe_sets=("fish2", "kasthuri15")))
@@ -116,16 +117,16 @@ def test_a_trunk_evaluates_its_end_only_off_a_milestone(tmp_path, monkeypatch, f
     monkeypatch.delenv("RANK", raising=False)
     calls = []
     monkeypatch.setattr(experiment.training, "train", lambda par, on_milestone: calls.append("train"))
-    for fn in ["pca", "probe"]:
+    for fn in ["pca", "val", "probe"]:
         monkeypatch.setattr(experiment, fn, lambda job, fn=fn: calls.append(fn))
     (tmp_path / "outdir/e00/e01-test/d0/checkpoints").mkdir(parents=True)
     (tmp_path / f"outdir/e00/e01-test/d0/checkpoints/step_{final_step:07d}.pt").touch()
     experiment.run(trunk)
-    assert calls == ["train", *(["pca", "probe"] if evals else [])]  # on one, train() evaluated it
+    assert calls == ["train", *(["pca", "val", "probe"] if evals else [])]  # on one, train() evaluated it
     anneal = replace(trunk, savedir="outdir/e00/e01-test/d0/step_0001000/", anneal_from=str(specs.milestone(trunk, 1000)))
     calls.clear()
     experiment.run(anneal)  # an anneal has no milestones: it evaluates its end
-    assert calls == ["train", "pca", "probe"]
+    assert calls == ["train", "pca", "val", "probe"]
 
 
 def test_submit_refuses_a_job_its_spec_cant_run(tmp_path, monkeypatch):

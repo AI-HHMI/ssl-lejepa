@@ -11,12 +11,13 @@ from pathlib import Path
 
 import numpy as np
 
-from lib.data import ProbeVolume, probe_set
+from lib.data import JOINT_DATA, ProbeVolume, probe_set
 from lib.inference import boundary_png, mean_scores, pca_rgb, score_block, tile_features, tile_logits, write_affinities
-from lib.readers import PROBE_SIDE, held_out_crop, inner, read_block
+from lib.readers import PROBE_SIDE, grid_windows, held_out_crop, inner, read_block, train_configs, val_configs
 from lib.specs import Eval, Finetune, Train
 from lib.util import *
 
+VAL_WINDOWS = 32  # val_loss: windows per training family, evenly spaced over its held-out blocks (and over its training volumes)
 TEST_TILES = (16, 32, 64, 128, 256, 512)  # pca_sizes: the tile sides an encoder is run at, test time (2^3 to 64^3 tokens)
 
 
@@ -128,6 +129,32 @@ def pca_sizes(e: Eval, model, step: int):
         print(f"tile {side}: {row['tiles']} tiles, effective rank {erank:.1f}, between-tile variance {between:.3f}, {row['seconds']:.0f} s", flush=True)
         del feats, tiled, centered
         torch.cuda.empty_cache()
+
+def val_loss(par: Eval, model, step: int):
+    """The pretraining loss of par's weights on held-out EM, beside the same loss on the training volumes, per training family:
+    VAL_WINDOWS patch-size windows, evenly spaced on a grid, the same ones at every milestone, and the same seeded views and masks;
+    the model in train mode (the projector's BatchNorm uses each batch's statistics, as training's loss does), no gradient.
+      savedir/val.json   {"step", "val": {family: {loss, inv, sigreg}}, "train": {same, windows of the training volumes}}
+    A gap that opens between "val" and "train" is the encoder fitting the volumes it trains on."""
+    import torch
+    t, device = par.train, next(model.parameters()).device
+    patch = list(t.patch_size)
+
+    def loss(imgs) -> dict:  # Batch 1 Z Y X
+        with torch.no_grad(), torch.random.fork_rng(devices=[device] if device.type == "cuda" else []), \
+                torch.autocast(device.type, dtype=torch.bfloat16, enabled=t.amp):
+            torch.manual_seed(0)
+            model.train()
+            parts = [model(x.to(device)) for x in imgs.split(t.batch_size)]
+        model.eval()
+        return {k: float(torch.stack([p[k].float() for p in parts]).mean()) for k in ("loss", "inv", "sigreg") if k in parts[0]}
+
+    result = {"step": step, "val": {}, "train": {}}
+    for f in JOINT_DATA.get(t.data, ((t.data,), 0.0))[0]:
+        result["val"][f] = loss(grid_windows(val_configs(f, patch), VAL_WINDOWS))
+        result["train"][f] = loss(grid_windows(train_configs(f, patch), VAL_WINDOWS))
+    (Path(par.savedir) / "val.json").write_text(json.dumps(result, indent=1) + "\n")
+
 
 def probe(par: Eval, model, step: int):
     """Linear affinity probe (lib.probe) of the spec job's weights (or those of the eval.json it names), frozen: one Linear per

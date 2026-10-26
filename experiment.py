@@ -1,7 +1,7 @@
 """This experiment's sweep and its entrypoints (remote): roots() lists its runs (savedirs under outdir/e00/), the LSF code submits them,
 and each entrypoint wires one job: it loads its spec, records the run, calls the work in lib/ and does the experiment-specific
 follow-up (a trunk's milestone evals, the code snapshot check). The work is in lib/: specs.py (Train, Eval,
-Finetune, the model and weights they name), training.py, evals.py (pca, probe, finetune), readers.py (volumes) and inference.py
+Finetune, the model and weights they name), training.py, evals.py (pca, probe, val, finetune), readers.py (volumes) and inference.py
 (tiled predictions, scores). Depends on lib/, so it runs only from its experiment's commit.
 Each job is an entrypoint taking its spec or the path of the spec's json, e.g. `run outdir/.../train.json`: called in-process
 with the spec, or as an LSF job with the file that submit() writes, so any job can submit another.
@@ -47,19 +47,19 @@ SCORE_CONFIG = "mia_evals/gary_comparison_neuron_instance/mws.toml"  # ours: tru
 MIA_EVALS = Path.home() / "proj/mia-evals"
 
 # This experiment's id (README: experiment ids): its roots are outdir/<EXPERIMENT>/d<i>/, a trunk's branches in its own dir.
-EXPERIMENT = "e00/e11-pretrain-b300-48h"
+EXPERIMENT = "e00/e12-qknorm-lrdecay-48h"
 
 def roots() -> list[Spec]:
     """This experiment: the runs it starts from nothing (trunks, other training runs, evals of another experiment's weights).
     Each trunk evaluates its own milestones as it saves them (eval_milestone)."""
-    # e10's four pretraining runs, unchanged except the hardware and the budget: 48 h each (e10: 6 h on one H200) on a node's
-    # GPUs, to see what the best of each objective reaches with 7-8x the GPUs for 8x the time: e08's MAE (decoder 512x8, view
-    # 96 of 128), e06's masked tokens at view 64 (shift 24, block 0.6, pull 10, SIGReg "both") and e06's multi-view invariance
-    # (input 128, globals and locals 96) on hemibrain_wide, and the masked recipe on lmd4 (all four families sampled equally, as e09: d3) and on lmd4_pow04 (by voxel count ^ 0.4: d4). Model m
-    # (12x512), batch 32 per GPU, linear-probe evals at doubling steps from 5k, as e10. No finetunes: e10's gap is measured on
-    # its own trunks. B300 nodes were full: d1 and d4 took the free ones as they came (8 GPUs, global batch 256), the others 7 GPUs of
-    # H200 nodes that had one GPU taken (global batch 224, ~0.7x a B300's speed).
-    BATCH, STEPS, HOURS = 32, 2_560_000, 48
+    # e11's five runs again (e10's four pretraining recipes at 48 h on a node's GPUs, and d4, masked 64 on lmd4 weighted by voxel
+    # count ^ 0.4, which never started), each with the encoder's queries and keys normalized (qk_norm) and the lr falling linearly
+    # from 1e-4 to 0 over total_steps (lr_decay): e11's probes peaked by 160k steps and fell, d3 diverged at 1.2M and d0 went
+    # unstable at 1.06M, all with a constant lr. total_steps is each run's e11 pace over its 48 h less ~5% (e11 s/step: MAE 0.127,
+    # masked 64 on B300 0.23, views 0.41, masked on lmd4 H200 0.083; d4's is d1's), so the lr reaches 0 as the budget ends; a run
+    # slower than that stops before it. Milestones are kept (checkpoints/milestones/), their evals add a val loss (val.json).
+    # d1 and d4 take B300 nodes (8 GPUs, global batch 256), the others 7 GPUs of H200 nodes that had one GPU taken (global batch 224).
+    BATCH, HOURS = 32, 48
 
     def trunk(objective: Literal["views", "mask", "mae"], data: TrainData, input_size: int, view: int) -> Train:
         p = Train()
@@ -69,7 +69,8 @@ def roots() -> list[Spec]:
         p.patch_size = (input_size, input_size, input_size)
         p.global_size = (view, view, view)
         p.batch_size = BATCH
-        p.total_steps = STEPS
+        p.lr_decay = True
+        p.qk_norm = True
         p.milestone_every = 5_000
         p.milestone_doubling = True
         p.max_hours = HOURS
@@ -99,7 +100,8 @@ def roots() -> list[Spec]:
     for i in (1, 4):  # d1 was started first, on the one free B300 node; d4 on the next
         runs[i].n_gpus = 8
         runs[i].queue = "gpu_b300"
-    for i, p in enumerate(runs):
+    for i, (p, steps) in enumerate(zip(runs, [1_300_000, 700_000, 400_000, 2_000_000, 700_000])):
+        p.total_steps = steps
         p.savedir = f"outdir/{EXPERIMENT}/d{i}/"
     return runs
 
@@ -123,6 +125,7 @@ def eval_milestone(trunk: Train, step: int):
         with torch.random.fork_rng(devices=[torch.cuda.current_device()] if torch.cuda.is_available() else []):
             pca(e)
             probe(e)
+            val(e)
     except Exception:
         traceback.print_exc()
     torch.cuda.empty_cache()  # the eval's memory back for training (a no-op without CUDA)
@@ -135,7 +138,7 @@ def check_snapshot():
 
 def run(job: Train | str):
     """The LSF training job: train the spec job (or its train.json's), then rank 0 evaluates its last finite checkpoint (pca
-    of own_eval, and probe_evals).
+    of own_eval, its val loss, and probe_evals).
 
     Evals run after train() has destroyed the process group, so the other ranks exit instead of waiting at a
     collective for minutes; not for a trunk (a run with milestones: not an anneal) that stopped on a milestone: train()
@@ -151,6 +154,7 @@ def run(job: Train | str):
     b2 = not par.anneal_from and latest_step(par) in milestone_steps(par)
     if b1 and not b2:
         pca(own_eval(par))
+        val(own_eval(par))
         for e in probe_evals(par):
             Path(e.savedir).mkdir(parents=True, exist_ok=True)
             probe(e)
@@ -189,6 +193,14 @@ def pca_sizes(job: Eval | str):
     model, step = load_checkpoint(e)
     record(e, "pca_sizes")
     evals.pca_sizes(e, model, step)
+
+def val(job: Eval | str):
+    """The pretraining loss of the spec job's weights (or those of the eval.json it names) on held-out EM and on the training
+    volumes (lib.evals.val_loss): savedir/val.json. A trunk's milestone evals do it as they save a milestone."""
+    par = load(job, Eval)
+    model, step = load_checkpoint(par)
+    record(par, "val")
+    evals.val_loss(par, model, step)
 
 def probe(job: Eval | str):
     """Linear affinity probe (lib.evals.probe) of the spec job's weights (or those of the eval.json it names)."""
@@ -279,10 +291,10 @@ def submit(fn: str, job: Spec):
     unless the trunk is done (its own probe.json is written). No commit check: callers from the shared checkout (submitall,
     lsf) assert_committed() first; a job submitting one is committed code."""
     b1 = fn in ("run", "benchmark") and isinstance(job, Train)
-    b2 = fn in ("pca", "pca_sizes", "probe", "score") and isinstance(job, Eval)
+    b2 = fn in ("pca", "pca_sizes", "probe", "val", "score") and isinstance(job, Eval)
     b3 = fn in ("finetune", "tiles") and isinstance(job, Finetune)
     assert b1 or b2 or b3, (f"{job.savedir}: no LSF job {fn!r} for a {type(job).__name__} (run and benchmark take a Train; pca, pca_sizes, "
-                            f"probe and score an Eval; finetune a Finetune)")
+                            f"probe, val and score an Eval; finetune a Finetune)")
     assert not isinstance(job, Train) or job.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={job.n_workers} leaves no core for the training process"
     spec = dump(job)
     if isinstance(job, Train):
@@ -295,7 +307,7 @@ def submit(fn: str, job: Spec):
         b4 = job.init_from.startswith(f"outdir/{EXPERIMENT}/")
         b5 = not (Path(job.init_from) / "probe.json").is_file()
         after = job_name(job.init_from, "run") if isinstance(job, Finetune) and b4 and b5 else ""
-        bsub(job.savedir, fn, {"pca": 30, "pca_sizes": 60, "probe": 60, "finetune": 120, "tiles": 120}[fn], 1, job.train.queue, f"python {{code}}/experiment.py {fn} {spec}",
+        bsub(job.savedir, fn, {"pca": 30, "pca_sizes": 60, "probe": 60, "val": 30, "finetune": 120, "tiles": 120}[fn], 1, job.train.queue, f"python {{code}}/experiment.py {fn} {spec}",
              after=after)
 
 def start(p: Spec):
@@ -307,7 +319,7 @@ def start(p: Spec):
 
 def lsf(fn: str, target: int | str):
     """Redo one job on LSF, of roots()[target] or of the spec file target names (any run's, e.g. a milestone eval's
-    outdir/.../d3/step_0005000/eval.json): `lsf probe 3` after changing probe. pca, probe or score of an eval, or of a training
+    outdir/.../d3/step_0005000/eval.json): `lsf probe 3` after changing probe. pca, probe, val or score of an eval, or of a training
     run's own checkpoint (own_eval), in place; finetune of a finetune, in place; benchmark of a training run, in place (its
     savedir gets a train.json, so submitall skips it: `lsf run` it after); run restarts a training run fresh (start), its
     milestone evals with it."""
@@ -386,7 +398,7 @@ def retryall():
             start(r)
 
 
-ENTRYPOINTS = [run, benchmark, replay_bad_batch, pca, pca_sizes, probe, score, finetune, tiles, lsf, replaylsf, submitall, retryall]
+ENTRYPOINTS = [run, benchmark, replay_bad_batch, pca, pca_sizes, probe, val, score, finetune, tiles, lsf, replaylsf, submitall, retryall]
 
 if __name__ == "__main__":
     print(sys.argv)

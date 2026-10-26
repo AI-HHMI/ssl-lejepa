@@ -28,7 +28,7 @@ THREADS = {
                                 "e00/e06-viewsize-vs-baselines", "e00/e06-01-test-tile-size", "e00/e07-mask-side"],
     "MAE baseline": ["e00/e08-mae-fix"],
     "Data and modalities": ["e00/e09-data-transfer"],
-    "Pretraining vs finetuning": ["e00/e10-finetune-gap", "e00/e11-pretrain-b300-48h"],
+    "Pretraining vs finetuning": ["e00/e10-finetune-gap", "e00/e11-pretrain-b300-48h", "e00/e12-qknorm-lrdecay-48h"],
 }
 
 

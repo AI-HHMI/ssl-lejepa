@@ -26,3 +26,26 @@ def test_pca_sizes_maps_one_crop_at_each_test_tile(tmp_path, monkeypatch):
     assert all(0 <= r["between_tile_variance"] <= 1 and r["effective_rank"] > 1 for r in rows)
     for side in (8, 16):  # EM | PCA | tile-centered PCA, at voxel size
         assert Image.open(tmp_path / f"pca_tile_{side:03d}.png").size == (3 * 32 + 2 * 8, 32)
+
+
+def test_val_loss_measures_the_same_windows_every_time_on_held_out_and_training_volumes(tmp_path, monkeypatch):
+    from lib.models import Lejepa
+    torch.manual_seed(0)
+    model = Lejepa(LejepaConfig(encoder=EncoderConfig(depth=1, embed_dim=16, num_heads=2, patch_size=(4, 4, 4)), projector=ProjectorConfig(dim=8, hidden=16)))
+    seen, kinds = [], {}
+    monkeypatch.setattr(evals, "val_configs", lambda f, patch: kinds.setdefault(("val", f), f"val {f}") and [("val", f)])
+    monkeypatch.setattr(evals, "train_configs", lambda f, patch: [("train", f)])
+
+    def grid_windows(configs, n):  # a different fixed image for each (kind, family)
+        seen.append((configs, n))
+        return torch.rand(6, 1, 16, 16, 16, generator=torch.Generator().manual_seed(hash(configs[0]) % 1000))
+
+    monkeypatch.setattr(evals, "grid_windows", grid_windows)
+    e = Eval(savedir=str(tmp_path), train=Train(data="lmd4", patch_size=(16, 16, 16), batch_size=4, amp=False), init_from="random")
+    evals.val_loss(e, model, 5)
+    first = json.loads((tmp_path / "val.json").read_text())
+    evals.val_loss(e, model, 5)
+    assert json.loads((tmp_path / "val.json").read_text()) == first  # seeded views and masks, fixed windows: the same numbers
+    assert first["step"] == 5 and set(first["val"]) == set(first["train"]) == {"hemibrain_wide", "fish2", "liconn_mouse", "microns"}
+    assert all({"loss", "inv", "sigreg"} <= set(v) and v["loss"] > 0 for d in ("val", "train") for v in first[d].values())
+    assert all(n == evals.VAL_WINDOWS for _, n in seen)

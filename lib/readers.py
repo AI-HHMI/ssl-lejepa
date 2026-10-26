@@ -9,7 +9,7 @@ import lmd_catalog as lmd
 from miao import VolumeDataset
 from miao.config import MiaoConfig
 
-from lib.data import ProbeVolume, held_out
+from lib.data import TRAIN_BOXES, ProbeVolume, held_out, val_blocks
 
 PROBE_SIDE = 896  # a probe block's largest side, 8 nm voxels (its box cut to it about its centre)
 PROBE_MARGIN = 16  # read_window: the extra read around a window, 8 nm voxels (miao's resampling and label-quantization slack)
@@ -97,3 +97,22 @@ def read_block(vol: ProbeVolume, tile, p, device, side: int = PROBE_SIDE, contex
     m = [(r - s) // 2 // q * q for r, s, q in zip(region, size, p)]
     img, lab = read_window(vol, (lo + hi) / 2, region)
     return img.to(device), inner(lab, m, size).contiguous().to(device), m, size
+
+
+def val_configs(family: str, patch: list[int]) -> list[MiaoConfig]:
+    """One miao config per held-out block of a training family (lib.data.val_blocks), reading patch-size windows (Z Y X) on a grid."""
+    return [probe_volume_config(v, [list(b) for b in v.box[::-1]], patch) for v in val_blocks(family)]
+
+def train_configs(family: str, patch: list[int]) -> list[MiaoConfig]:
+    """One per training volume of a family (lib.data.TRAIN_BOXES), as val_configs, for the same loss on what the encoder trains on."""
+    return [MiaoConfig(volumes=[lmd.get(name).to_miao(bounding_box=box[::-1])], patch_size=patch, resolutions=[[8.0, 8.0, 8.0]],
+                       sampling="sequential", output_axes="lzyx") for name, box in TRAIN_BOXES[family].items()]
+
+def grid_windows(configs: list[MiaoConfig], n: int):
+    """About n windows, an equal number evenly spaced over each config's grid, always the same ones: Window 1 Z Y X in [0, 1]."""
+    import torch
+    imgs = []
+    for c in configs:
+        ds = VolumeDataset(c)
+        imgs += [torch.as_tensor(np.asarray(ds[int(i)]["img"])) for i in np.linspace(0, len(ds) - 1, max(1, n // len(configs))).astype(int)]
+    return torch.stack(imgs)

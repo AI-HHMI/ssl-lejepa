@@ -156,6 +156,17 @@ HELD_OUT: dict[str, HeldOut] = {
 }
 
 
+# A training family's validation images: the blocks of a probe set (their images: no label is read), which pretraining never
+# samples (TRAIN_BOXES leaves out every eval volume). MICrONS has none of its own: Kasthuri15 is mouse cortex EM, as it is.
+VAL_SETS = {"hemibrain_eb": "hemibrain_eb", "hemibrain_wide": "hemibrain_eb", "fish2": "fish2", "liconn_mouse": "liconn_mouse", "microns": "kasthuri15"}
+
+
+def val_blocks(family: TrainData) -> list[ProbeVolume]:
+    """The held-out blocks of a training family (not a joint set) whose validation loss is measured (VAL_SETS)."""
+    blocks = probe_set(VAL_SETS[family])
+    return blocks["train"] + blocks["test"]
+
+
 def held_out(name: str) -> HeldOut:
     assert name in HELD_OUT, f"no held-out region for {name!r} (add it to lib.data.HELD_OUT): {list(HELD_OUT)}"
     return HELD_OUT[name]
