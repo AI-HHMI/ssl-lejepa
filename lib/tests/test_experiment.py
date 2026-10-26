@@ -2,7 +2,7 @@
 
 import json
 import re
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -163,6 +163,11 @@ def test_submit_refuses_a_job_its_spec_cant_run(tmp_path, monkeypatch):
     with pytest.raises(AssertionError, match="no LSF job 'probe' for a Train"):
         experiment.submit("probe", experiment.Train(savedir="outdir/e00/x/d0/"))
     assert not (tmp_path / "outdir").exists()  # refused before writing its spec
+
+
+def test_every_root_parses_as_its_job_loads_it():
+    for r in experiment.roots():  # a job validates its json (pydantic's Literals), which building the dataclass doesn't: e11 d4 died on a data name only types.py lacked
+        assert experiment.parse(type(r), asdict(r)) == r, r.savedir
 
 
 def test_submit_writes_the_spec_its_job_loads(tmp_path, monkeypatch):
