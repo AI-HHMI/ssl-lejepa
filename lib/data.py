@@ -10,9 +10,7 @@ from __future__ import annotations
 import math
 from typing import NamedTuple
 
-# from lib.types import TrainData
-from typing import Literal
-TrainData = Literal["hemibrain_eb", "hemibrain_wide", "fish2", "liconn_mouse", "microns", "lmd4", "lmd4_pow04"]  # keys of lib.data.TRAIN_BOXES, or JOINT_DATA
+from lib.types import TrainData  # keys of TRAIN_BOXES, or JOINT_DATA
 
 DEFAULT_DATA = "hemibrain_eb"  # the dataset a spec trains on, probes and maps unless it says otherwise (every run so far)
 
@@ -77,12 +75,55 @@ TRAIN_BOXES: dict[TrainData, dict[str, list[list[int]]]] = {
     "microns": {
         "em-mouse-MICrONS-minnie65/crop-001": [[0, 8192], [0, 8192], [0, 1024]],
     },
+    # CellMap's FIB-SEM organelle volumes (HHMI Janelia: cells, tissues, 4-8 nm), ~10 Tvox at 8 nm. Each volume's largest slab (x y z,
+    # whole in the other two axes) with no manual organelle crop in it (labels/manual_gt-*), so the regions that CellMap's organelle
+    # labels cover (CELLMAP_VAL) stay out of training; the labelled-crop boxes are those in the catalog's labels, not CellMap's
+    # unreleased test crops. Left out: volumes with under 0.5 Gvox free at 8 nm (nacc-1, cos7). Native voxel sizes 4-8 nm (3.2-5.2 along z
+    # for some cell lines), read at 8 nm (miao resamples), uint8. The Gvox at 8 nm in the comments.
+    "cellmap": {
+        "em-drosophila-CellMap-jrc-fly-mb-1a/crop-001_fullvol_tissuecrop": [[1087, 3717], [0, 3430], [0, 7723]],  # 8.7 Gvox at 8 nm
+        "em-drosophila-CellMap-jrc-fly-vnc-1/crop-001_fullvol_tissuecrop": [[1363, 3488], [0, 2067], [0, 1471]],  # 0.8 Gvox at 8 nm
+        "em-human-CellMap-jrc-hela-2/crop-001_fullvol_tissuecrop": [[8580, 10333], [0, 1312], [0, 5742]],  # 2.2 Gvox at 8 nm
+        "em-human-CellMap-jrc-hela-3/crop-001_fullvol_tissuecrop": [[0, 10596], [0, 931], [5039, 8953]],  # 3.9 Gvox at 8 nm
+        "em-human-CellMap-jrc-jurkat-1/crop-001_fullvol_tissuecrop": [[3312, 5014], [0, 2840], [0, 4212]],  # 2.2 Gvox at 8 nm
+        "em-human-CellMap-jrc-macrophage-2/crop-001_fullvol_tissuecrop": [[0, 9526], [0, 1590], [5147, 6562]],  # 2.3 Gvox at 8 nm
+        "em-human-CellMap-jrc-sum159-1/crop-001_fullvol_tissuecrop": [[8334, 13515], [0, 2469], [0, 4067]],  # 7.4 Gvox at 8 nm
+        "em-human-CellMap-jrc-sum159-4/crop-001_fullvol_tissuecrop": [[2986, 6865], [0, 847], [0, 3772]],  # 12.4 Gvox at 8 nm
+        "em-human-CellMap-jrc-ut21-1413-003/crop-001_fullvol_tissuecrop": [[0, 9996], [307, 3007], [0, 16301]],  # 440.0 Gvox at 8 nm
+        "em-mouse-CellMap-jrc-ctl-id8-1/crop-001_fullvol_tissuecrop": [[693, 3593], [0, 1895], [0, 6428]],  # 3.8 Gvox at 8 nm
+        "em-mouse-CellMap-jrc-mus-heart-1/crop-001_fullvol_tissuecrop": [[0, 11226], [0, 3528], [0, 6591]],  # 261.0 Gvox at 8 nm
+        "em-mouse-CellMap-jrc-mus-kidney-3/crop-001_fullvol_tissuecrop": [[0, 6105], [0, 5202], [3674, 7530]],  # 122.5 Gvox at 8 nm
+        "em-mouse-CellMap-jrc-mus-kidney-glomerulus-2/crop-001_fullvol_tissuecrop": [[2734, 3389], [0, 3346], [0, 2421]],  # 0.7 Gvox at 8 nm
+        "em-mouse-CellMap-jrc-mus-kidney/crop-001_fullvol_tissuecrop": [[0, 9867], [0, 7190], [616, 4252]],  # 258.0 Gvox at 8 nm
+        "em-mouse-CellMap-jrc-mus-liver-3/crop-001_fullvol_tissuecrop": [[5128, 9747], [0, 7585], [0, 8778]],  # 307.5 Gvox at 8 nm
+        "em-mouse-CellMap-jrc-mus-liver-zon-1/crop-001_fullvol_tissuecrop": [[0, 20208], [0, 15828], [30060, 39660]],  # 3070.6 Gvox at 8 nm
+        "em-mouse-CellMap-jrc-mus-liver-zon-2/crop-001_fullvol_tissuecrop": [[0, 21800], [0, 18280], [6584, 17740]],  # 4445.7 Gvox at 8 nm
+        "em-mouse-CellMap-jrc-mus-liver/crop-001_fullvol_tissuecrop": [[0, 10037], [7855, 10174], [0, 8810]],  # 205.1 Gvox at 8 nm
+        "em-zebrafish-CellMap-jrc-zf-cardiac-1/crop-001_fullvol_tissuecrop": [[0, 7000], [5200, 10400], [0, 23720]],  # 863.4 Gvox at 8 nm
+    },
 }
+# CellMap's labelled crops, by volume: the first (up to) 512 voxels at 8 nm a side of its largest manual organelle crop (x y z, level-0 voxels), for the volumes where one holds a 128 window, validation images
+# for the pretraining loss (lib.evals.val_loss; CellMap's labels aren't affinities, so there is no probe set). Outside TRAIN_BOXES["cellmap"].
+CELLMAP_VAL: dict[str, list[list[int]]] = {
+    "em-human-CellMap-jrc-hela-2/crop-001_fullvol_tissuecrop": [[7454, 7854], [583, 983], [1415, 1815]],
+    "em-human-CellMap-jrc-sum159-4/crop-001_fullvol_tissuecrop": [[1006, 1518], [47, 559], [2076, 2588]],
+    "em-human-CellMap-jrc-ut21-1413-003/crop-001_fullvol_tissuecrop": [[3605, 3805], [8877, 9077], [706, 906]],
+    "em-mouse-CellMap-jrc-mus-heart-1/crop-001_fullvol_tissuecrop": [[7248, 7760], [3528, 4040], [908, 1420]],
+    "em-mouse-CellMap-jrc-mus-kidney-3/crop-001_fullvol_tissuecrop": [[2418, 2930], [1858, 2370], [2474, 2986]],
+    "em-mouse-CellMap-jrc-mus-kidney-glomerulus-2/crop-001_fullvol_tissuecrop": [[534, 1558], [632, 1656], [86, 1110]],
+    "em-mouse-CellMap-jrc-mus-kidney/crop-001_fullvol_tissuecrop": [[2820, 3332], [3178, 3690], [4252, 4764]],
+    "em-mouse-CellMap-jrc-mus-liver-3/crop-001_fullvol_tissuecrop": [[3928, 4440], [3262, 3774], [3854, 4366]],
+    "em-mouse-CellMap-jrc-mus-liver-zon-1/crop-001_fullvol_tissuecrop": [[11808, 12320], [6600, 7112], [9188, 9700]],
+    "em-mouse-CellMap-jrc-mus-liver-zon-2/crop-001_fullvol_tissuecrop": [[7000, 7512], [5480, 5992], [25740, 26252]],
+    "em-mouse-CellMap-jrc-mus-liver/crop-001_fullvol_tissuecrop": [[130, 642], [162, 674], [680, 1192]],
+    "em-zebrafish-CellMap-jrc-zf-cardiac-1/crop-001_fullvol_tissuecrop": [[2000, 2512], [0, 512], [15520, 16032]],
+}
+WITHIN_EXPONENT = {"cellmap": 0.4}  # a family's volumes sampled by voxel count ^ this (default 0: equally): CellMap's go from 0.7 to 4,400 Gvox
 # A joint set: its families' volumes, and the exponent e of its family weights: a family's share of the samples goes as its
 # voxel count ^ e (0: equal, as lmd_ssl_v1 weights its volumes, and as e09 and e11's d3 ran; 1: by size, which hemibrain_wide would
 # take 3/4 of); each family's volumes equally within it.
 LMD4 = ("hemibrain_wide", "fish2", "liconn_mouse", "microns")
-JOINT_DATA: dict[TrainData, tuple[tuple[TrainData, ...], float]] = {"lmd4": (LMD4, 0.0), "lmd4_pow04": (LMD4, 0.4)}
+JOINT_DATA: dict[TrainData, tuple[tuple[TrainData, ...], float]] = {"lmd4": (LMD4, 0.0), "lmd4_pow04": (LMD4, 0.4), "lmd5_pow04": ((*LMD4, "cellmap"), 0.4)}
 
 
 def family_voxels(family: TrainData) -> int:
@@ -90,10 +131,12 @@ def family_voxels(family: TrainData) -> int:
 
 
 def train_volumes(data: TrainData) -> list[tuple[str, list[list[int]], float]]:
-    """(catalog name, [lo, hi) box x y z, sampling weight) of each training volume of data; the weights sum to 1."""
+    """(catalog name, [lo, hi) box x y z, sampling weight) of each training volume of data; the weights sum to 1: a family's share
+    (its voxel count ^ the joint set's exponent), split among its volumes (equally, or by WITHIN_EXPONENT)."""
     families, exponent = JOINT_DATA.get(data, ((data,), 0.0))
     shares = {f: family_voxels(f) ** exponent for f in families}
-    return [(name, box, shares[f] / sum(shares.values()) / len(TRAIN_BOXES[f])) for f in families for name, box in TRAIN_BOXES[f].items()]
+    within = {name: math.prod(hi - lo for lo, hi in box) ** WITHIN_EXPONENT.get(f, 0.0) for f in families for name, box in TRAIN_BOXES[f].items()}
+    return [(name, box, shares[f] / sum(shares.values()) * within[name] / sum(within[n] for n in TRAIN_BOXES[f])) for f in families for name, box in TRAIN_BOXES[f].items()]
 
 
 class ProbeVolume(NamedTuple):

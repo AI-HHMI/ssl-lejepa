@@ -9,7 +9,7 @@ import lmd_catalog as lmd
 from miao import VolumeDataset
 from miao.config import MiaoConfig
 
-from lib.data import TRAIN_BOXES, ProbeVolume, held_out, val_blocks
+from lib.data import CELLMAP_VAL, TRAIN_BOXES, ProbeVolume, held_out, val_blocks
 
 PROBE_SIDE = 896  # a probe block's largest side, 8 nm voxels (its box cut to it about its centre)
 PROBE_MARGIN = 16  # read_window: the extra read around a window, 8 nm voxels (miao's resampling and label-quantization slack)
@@ -99,14 +99,20 @@ def read_block(vol: ProbeVolume, tile, p, device, side: int = PROBE_SIDE, contex
     return img.to(device), inner(lab, m, size).contiguous().to(device), m, size
 
 
+def image_config(name: str, box: list[list[int]], patch: list[int]) -> MiaoConfig:
+    """miao reading patch-size windows (Z Y X, 8 nm) of catalog volume name within box (x y z, level-0 voxels), images only, on a grid."""
+    return MiaoConfig(volumes=[lmd.get(name).to_miao(bounding_box=box[::-1])], patch_size=patch, resolutions=[[8.0, 8.0, 8.0]],
+                      sampling="sequential", output_axes="lzyx")
+
 def val_configs(family: str, patch: list[int]) -> list[MiaoConfig]:
-    """One miao config per held-out block of a training family (lib.data.val_blocks), reading patch-size windows (Z Y X) on a grid."""
+    """One miao config per held-out block of a training family: its probe set's blocks (lib.data.val_blocks), or CellMap's labelled crops."""
+    if family == "cellmap":
+        return [image_config(name, box, patch) for name, box in CELLMAP_VAL.items()]
     return [probe_volume_config(v, [list(b) for b in v.box[::-1]], patch) for v in val_blocks(family)]
 
 def train_configs(family: str, patch: list[int]) -> list[MiaoConfig]:
     """One per training volume of a family (lib.data.TRAIN_BOXES), as val_configs, for the same loss on what the encoder trains on."""
-    return [MiaoConfig(volumes=[lmd.get(name).to_miao(bounding_box=box[::-1])], patch_size=patch, resolutions=[[8.0, 8.0, 8.0]],
-                       sampling="sequential", output_axes="lzyx") for name, box in TRAIN_BOXES[family].items()]
+    return [image_config(name, box, patch) for name, box in TRAIN_BOXES[family].items()]
 
 def grid_windows(configs: list[MiaoConfig], n: int):
     """About n windows, an equal number evenly spaced over each config's grid, always the same ones: Window 1 Z Y X in [0, 1]."""

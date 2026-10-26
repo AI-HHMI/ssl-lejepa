@@ -1,6 +1,7 @@
 """Tests for experiment.py: the entrypoints' wiring (run, evals, milestone release), the LSF submission and the sweep's checks."""
 
 import json
+import math
 import re
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -97,7 +98,7 @@ def test_a_run_probed_on_several_sets_probes_each_in_its_own_dir(tmp_path, monke
     assert all(Path(d).is_dir() for _, d in probed)
 
 
-@pytest.mark.parametrize("data,exponent", [("lmd4", 0), ("lmd4_pow04", 0.4)])
+@pytest.mark.parametrize("data,exponent", [("lmd4", 0), ("lmd4_pow04", 0.4), ("lmd5_pow04", 0.4)])
 def test_train_volumes_weigh_a_joint_sets_families_by_voxel_count_to_its_exponent(data, exponent):
     from lib.data import JOINT_DATA, TRAIN_BOXES, family_voxels, train_volumes
     vols = train_volumes(data)
@@ -290,3 +291,13 @@ def test_lsf_submits_a_training_run_as_what_the_entrypoint_takes(tmp_path, monke
     monkeypatch.setattr(experiment, "bsub", lambda savedir, job, *a, **kw: submitted.append(job))
     experiment.lsf(fn, 1)
     assert submitted == [fn], f"lsf {fn} on a training run should submit one {job_type}-taking job"
+
+
+def test_a_families_volumes_are_sampled_by_voxel_count_to_its_within_exponent():
+    from lib.data import TRAIN_BOXES, WITHIN_EXPONENT, train_volumes
+    cellmap = {n: w for n, _, w in train_volumes("cellmap")}
+    assert sum(cellmap.values()) == pytest.approx(1) and set(cellmap) == set(TRAIN_BOXES["cellmap"])
+    size = lambda n: math.prod(hi - lo for lo, hi in TRAIN_BOXES["cellmap"][n])
+    big, small = max(cellmap, key=size), min(cellmap, key=size)
+    assert cellmap[big] / cellmap[small] == pytest.approx((size(big) / size(small)) ** WITHIN_EXPONENT["cellmap"])
+    assert not set(TRAIN_BOXES["cellmap"]) & set(TRAIN_BOXES["hemibrain_wide"])

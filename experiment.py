@@ -47,18 +47,21 @@ SCORE_CONFIG = "mia_evals/gary_comparison_neuron_instance/mws.toml"  # ours: tru
 MIA_EVALS = Path.home() / "proj/mia-evals"
 
 # This experiment's id (README: experiment ids): its roots are outdir/<EXPERIMENT>/d<i>/, a trunk's branches in its own dir.
-EXPERIMENT = "e00/e12-qknorm-lrdecay-48h"
+EXPERIMENT = "e00/e12-cellmap-qknorm-lrdecay-48h"
 
 def roots() -> list[Spec]:
     """This experiment: the runs it starts from nothing (trunks, other training runs, evals of another experiment's weights).
     Each trunk evaluates its own milestones as it saves them (eval_milestone)."""
-    # e11's five runs again (e10's four pretraining recipes at 48 h on a node's GPUs, and d4, masked 64 on lmd4 weighted by voxel
-    # count ^ 0.4, which never started), each with the encoder's queries and keys normalized (qk_norm) and the lr falling linearly
-    # from 1e-4 to 0 over total_steps (lr_decay): e11's probes peaked by 160k steps and fell, d3 diverged at 1.2M and d0 went
-    # unstable at 1.06M, all with a constant lr. total_steps is each run's e11 pace over its 48 h less ~5% (e11 s/step: MAE 0.127,
-    # masked 64 on B300 0.23, views 0.41, masked on lmd4 H200 0.083; d4's is d1's), so the lr reaches 0 as the budget ends; a run
-    # slower than that stops before it. Milestones are kept (checkpoints/milestones/), their evals add a val loss (val.json).
-    # d1 and d4 take B300 nodes (8 GPUs, global batch 256), the others 7 GPUs of H200 nodes that had one GPU taken (global batch 224).
+    # e11's recipes again, with a bigger encoder context for the masked tokens, more data, qk_norm (the encoder's queries and keys
+    # normalized) and the lr falling linearly from 1e-4 to 0 over total_steps (lr_decay): e11's probes peaked by 160k steps and fell,
+    # d3 diverged at 1.2M and d0 went unstable at 1.06M, all with a constant lr. Masked tokens now see the MAE's context: a view of 96
+    # in a region of 128 (shift 32, so 12^3 tokens a view), not 64 in 88. Data: d0-d2 (MAE, masked, views) on lmd5_pow04, e11's
+    # lmd4 families and CellMap's organelle EM (lib.data "cellmap", ~10 Tvox: 48% of the samples) weighted by voxel count ^ 0.4;
+    # d3 masked on lmd4_pow04, without CellMap, and d4 masked on CellMap alone, to tell what it adds. total_steps is the pace we
+    # expect over 48 h less ~5%, so the lr reaches 0 as the budget ends (a slower run stops before it): e11's for MAE and views
+    # (s/step 0.127 and 0.41); the masked runs' are guessed from e11's (masked 64 on lmd4, 7 H200s: 0.083; on B300: 0.23) x ~4 for
+    # 3.4x the tokens a view and a bigger share of attention: `lsf benchmark` d1 and d3 first. Milestones are kept, their evals add
+    # a val loss (val.json). d1 and d4 take B300 nodes (8 GPUs, global batch 256), the others 7 GPUs of H200 nodes (global batch 224).
     BATCH, HOURS = 32, 48
 
     def trunk(objective: Literal["views", "mask", "mae"], data: TrainData, input_size: int, view: int) -> Train:
@@ -83,24 +86,24 @@ def roots() -> list[Spec]:
         return p
 
     def masked(data: TrainData) -> Train:
-        p = trunk("mask", data, 88, 64)
+        p = trunk("mask", data, 128, 96)
         p.mask_block = 0.6
-        p.mask_shift = 24
+        p.mask_shift = 32
         p.sigreg_over = "both"
         p.lamb = 10 / BATCH
         return p
 
-    mae = trunk("mae", "hemibrain_wide", 128, 96)
+    mae = trunk("mae", "lmd5_pow04", 128, 96)
     mae.mae_decoder = (512, 8)
-    views = trunk("views", "hemibrain_wide", 128, 96)
+    views = trunk("views", "lmd5_pow04", 128, 96)
     views.local_size = (96, 96, 96)
     views.batch_views = True
     views.lamb = 0.1
-    runs: list[Spec] = [mae, masked("hemibrain_wide"), views, masked("lmd4"), masked("lmd4_pow04")]
-    for i in (1, 4):  # d1 was started first, on the one free B300 node; d4 on the next
+    runs: list[Spec] = [mae, masked("lmd5_pow04"), views, masked("lmd4_pow04"), masked("cellmap")]
+    for i in (1, 4):  # the two B300 nodes
         runs[i].n_gpus = 8
         runs[i].queue = "gpu_b300"
-    for i, (p, steps) in enumerate(zip(runs, [1_300_000, 700_000, 400_000, 2_000_000, 700_000])):
+    for i, (p, steps) in enumerate(zip(runs, [1_300_000, 250_000, 400_000, 500_000, 250_000])):
         p.total_steps = steps
         p.savedir = f"outdir/{EXPERIMENT}/d{i}/"
     return runs
