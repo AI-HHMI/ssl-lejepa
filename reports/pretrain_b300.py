@@ -1,7 +1,7 @@
 """e00/e11-pretrain-b300-48h: e10's four pretraining runs (MAE, masked tokens at view 64, multi-view invariance, masked tokens on
 lmd4), the same recipes at 7-8x the GPUs for 48 h instead of 6 h on one H200: a node of 7 H200s or 8 B300s each, batch 32 per GPU,
-every doubling-step milestone probed and PCA-mapped as saved. A fifth run, d4, samples lmd4's families by voxel count ^ 0.4
-instead of equally. Does the linear probe keep improving with 8x the samples and 8x the steps?"""
+every doubling-step milestone probed and PCA-mapped as saved. A fifth run, d4, was to sample lmd4's families by voxel count ^ 0.4
+instead of equally (it never started). Does the linear probe keep improving with 8x the samples and 8x the steps?"""
 
 import itertools
 from pathlib import Path
@@ -16,40 +16,51 @@ E10_TRUNKS = {"d0": "MAE", "d1": "masked 64", "d2": "views", "d3": "masked 64 lm
 OBJECTIVE = {"mae": "MAE", "mask": "masked 64", "views": "views"}
 SHORT, LONG = "short (+1)", "long (+10)"
 
-# Read from the runs' metrics.json, probe.json, pca.json and performance.json (2026-10-24, the trunks 19 h into their 48).
-FINDINGS = """<p><b>The linear probe peaks early and then stops improving, or declines, however many more samples it sees.</b>
-At 19 h the four runs have seen 117M (MAE), 77M (masked 64), 37M (views) and 180M (masked 64 on lmd4) samples, 9-22x e10's 6 h,
-and 0.5M, 0.3M, 0.16M and 0.8M steps.</p>
+# Read from the runs' metrics.json, probe.json and performance.json (2026-10-26, the four trunks finished: 48 h each).
+FINDINGS = """<p><b>The linear probe peaks early and then declines, however many more samples the encoder sees; and two of the four runs
+went unstable late.</b> In 48 h the runs saw 295M (MAE, 1.32M steps), 192M (masked 64, 0.75M), 93M (views, 0.42M) and 456M
+(masked 64 on lmd4, 2.04M) samples, 23-55x e10's 6 h on one GPU. d4 (lmd4 weighted by voxel count ^ 0.4) never trained: its job
+failed validating its spec 27 s in (types.py lacked the name), so the weighting is untested.</p>
 <ul>
-<li><b>MAE</b> peaks at 80k steps (0.302 short / 0.878 long AP, e10: 0.296 / 0.876 at 160k) and falls after: 0.297 at 160k,
-0.282 / 0.866 at 320k. Its loss keeps creeping down (0.534 at 50k, 0.507 at 500k) and its gradient norm stays near 0.05-0.06 after 50k:
-the reconstruction gets better and the boundary content in its tokens slightly worse.</li>
-<li><b>Masked 64 is worse here than in e10, not better.</b> Short AP peaks at 0.180 (80k) and is 0.176 at 160k, against e10's 0.205
-at 160k, though it is ahead at 5k (0.164 against 0.132). Long AP matches e10 (0.852 against 0.853 at 160k). Its loss keeps
-falling (0.505 at 50k, 0.440 at 300k) and so does its prediction error (inv 0.143 to 0.124), while the share of token variance
-that is each tile's mean token (the sample code of e03) rises 0.11 to 0.19, e10's masked run ended at 0.16. The masked-token
-runs seem to buy lower loss with more of that code. The one difference from e10 besides compute is the global batch (256, with
-the learning rate unchanged), which I haven't separated from the longer training.</li>
-<li><b>Masked 64 on lmd4</b> (equal family weights, 7 H200s) behaves the same: 0.185 short at 80k, then 0.183, 0.173 (320k)
-and 0.167 (640k); long AP flat at 0.85. It is again behind e10's short AP from 80k (0.208 at 160k) and ahead of it on long
-AP at every milestone (0.852 against 0.824 at 160k). Its grad-norm spikes are larger than the others' (max 52, p99 2.9).</li>
-<li><b>Views</b> gains most from the extra compute: 0.216 short at 40k (e10: 0.170 at 40k, when it stopped) and a long AP still
-rising at 160k (0.757, from 0.699 at 40k). It is the slowest run (0.41 s per step on 7 H200s, 826 TFLOP a step), so it has the
-fewest steps, and the only one still on its way up.</li>
-<li><b>No run was unstable.</b> No skipped steps; the largest gradient norms are 2.4 (MAE), 8.9 (masked), 4.8 (views) and 52
-(lmd4).</li>
+<li><b>MAE</b> peaks at 80k steps (0.302 short / 0.878 long AP; e10 0.296 / 0.876 at 160k) and falls after: 0.282 / 0.866 at 320k,
+0.274 / 0.862 at 640k, 0.266 / 0.862 at 1.28M. Its loss is flat from 50k (0.531 to 0.505 at 1M) and its gradient norm sits at 0.06
+until step 1.06M. Then it rises to 0.3-0.5 with spikes to 72, and the activation norm (resid_norm) climbs from 51 to 236; the loss
+does not move (0.505 to 0.513). The 1.28M milestone comes from this unstable stretch.</li>
+<li><b>Masked 64</b> (8 B300s) is worse than in e10 at every milestone after 5k. Short AP peaks at 0.180 (80k; e10 0.205 at 160k)
+and falls to 0.135 at 640k; long AP peaks at 0.852 (80-160k, e10 0.853) and falls to 0.816. Its loss falls (0.508 at 47k, 0.41 at
+750k) and its prediction error with it (inv 0.151 to 0.11-0.13), while the share of token variance that is each tile's mean token
+(the sample code of e03) rose from 0.11 to 0.19 in the first 19 h. No instability: gradient norm 0.25-0.27 throughout, no spike
+above 0.45, but its resid_norm rises steadily from 125 to 314.</li>
+<li><b>Masked 64 on lmd4</b> (equal family weights, 7 H200s) behaves the same until step 1.0M: 0.185 short at 80k, 0.167 at 640k,
+long AP 0.85 (e10: 0.208 short, 0.824 long at 160k). Gradient spikes of 100-300 begin around step 1.0M (24 h) and at step
+1,198,060 (28.4 h) it diverges for good: loss 0.37 to about 1.05, resid_norm 110 to over 1e6. It then trains 0.8M steps in that
+state. Its 1.28M milestone (0.032 short, 0.302 long) and its final weights are of the diverged model, and its run's end-of-training
+results are meaningless.</li>
+<li><b>Views</b> has the fewest steps, and its long AP peaks too: 0.757 at 160k, then 0.739 at 320k, with short AP 0.216 at 40k
+falling to 0.181. It is far ahead of e10's 40k stop (0.170 / 0.604). No instability (gradient norm 0.12 falling to 0.05), resid_norm 157 to 278.</li>
+<li><b>No step was skipped</b> (the skip applies only to a non-finite gradient; grad-norm clipping at 1.0 is always on).</li>
 </ul>
-<p><b>Throughput.</b> MAE 1760 samples/s (7 H200s), views 545 (7 H200s), masked 64 on lmd4 2630 (7 H200s, 0.085 s a step), but
-masked 64 on hemibrain_wide only 1120 on 8 B300s (0.229 s a step). The recipe is the same, with different data and one more GPU, and it is 2.3x slower. Either the B300 node
-or hemibrain_wide's storage (512^3 shards of poorly compressed 128^3 zstd chunks, about 10 MB read for each 0.7 MB patch) is the
-limit: d4 (lmd4 with new family weights, on a B300 node) separates them.</p>
-<p><b>Caveats.</b> The runs are 40% of the way through their 48 h, and these are single seeds. Steps compare across e10 and
-e11 only as a recipe's age: an e11 step sees 7-8x the samples. d3 shares a directory with a B300 job that crashed at step 5k
-(two jobs, one directory); its metrics and checkpoints are the H200 job's, as are the evals. d4 has just started and has no
-milestone yet.</p>
-<p><b>Next.</b> The probe says more compute does not help after about 80k steps on masked 64 and MAE. Finetuning is the fairer
-test of a longer-trained encoder (e10's gap, on these encoders); then lowering the learning rate or batch to see whether the
-masked drop is from the batch size.</p>"""
+<p><b>Why the probe declines.</b> The decline starts at 80k steps in every run, long before the instabilities (d0 at 1.06M, d3
+at 1.0M), so the instability does not explain it. The probe-fit curves below show it is not the probe overfitting: its training
+BCE rises with its test BCE and the gap stays at about 0.004 (MAE). The features lose boundary information that a linear readout
+can use while the pretraining loss falls. Untested: a held-out pretraining loss (is it overfitting the pretraining data?), refitting
+the probe with 10x the steps, the encoder's feature scale against the probe's loss.</p>
+<p><b>Optimizer.</b> AdamW, weight decay 0.05 on matrices, constant lr 1e-4 after a 1,000-step warmup (no decay), beta2 0.95. The
+decay's time constant is 200k steps, so the weights had been at equilibrium for 5 time constants before d0 and d3 went
+unstable. The three candidates I can name are untested: weight decay shrinking weights the loss is scale-blind to (d3's
+resid_norm fell from 150 to 110 before it diverged, but d0, d1 and d2's rise), no lr decay at all over more than 1M steps, and
+the pairing of the two. No pre-divergence checkpoint exists: milestone weights are deleted once probed (release_milestone).</p>
+<p><b>Throughput.</b> MAE 1760 samples/s (7 H200s), views 545 (7 H200s), masked 64 on lmd4 2630 (7 H200s, 0.083 s a step), but
+masked 64 on hemibrain_wide only 1120 on 8 B300s (0.230 s a step), with the same recipe and one more GPU: 2.3x slower. Either the
+B300 node or hemibrain_wide's storage (512^3 shards of poorly compressed 128^3 zstd chunks, about 10 MB read for each 0.7 MB
+patch) is the limit; d4 would have separated them.</p>
+<p><b>Caveats.</b> Single seeds. Steps compare across e10 and e11 only as a recipe's age: an e11 step sees 7-8x the samples (batch
+224-256 against 32, the learning rate unchanged, which I haven't separated from the longer training). d3 shares a directory with a
+B300 job that crashed at step 5k (two jobs, one directory); its metrics and checkpoints are the H200 job's, as are the evals.</p>
+<p><b>Next.</b> The probe says more compute does not help after about 80k steps. Finetuning is the fairer test of a longer-trained
+encoder (e10's gap, on the 80k-160k and 640k milestones, which I no longer have as weights: only d0's rolling checkpoints
+remain). Before another long run: keep the milestone checkpoints, log per-layer weight norms, and decide on an lr decay or a
+smaller weight decay or batch; then run d4.</p>"""
 
 
 def label(p: dict) -> str:
