@@ -1,6 +1,6 @@
 """This experiment's sweep and its entrypoints (remote): roots() lists its runs (savedirs under outdir/e00/), the LSF code submits them,
 and each entrypoint wires one job: it loads its spec, records the run, calls the work in lib/ and does the experiment-specific
-follow-up (a trunk's milestone evals and their release, the code snapshot check). The work is in lib/: specs.py (Train, Eval,
+follow-up (a trunk's milestone evals, the code snapshot check). The work is in lib/: specs.py (Train, Eval,
 Finetune, the model and weights they name), training.py, evals.py (pca, probe, finetune), readers.py (volumes) and inference.py
 (tiled predictions, scores). Depends on lib/, so it runs only from its experiment's commit.
 Each job is an entrypoint taking its spec or the path of the spec's json, e.g. `run outdir/.../train.json`: called in-process
@@ -175,14 +175,6 @@ def replay_bad_batch(path: str):
     record(parse(Train, dump["params"]), "replay_bad_batch")
     return training.replay_bad_batch(dump)
 
-def release_milestone(e: Eval):
-    """Delete the trunk milestone e's weights came from (see milestone_of: an eval of it, or an anneal's own eval) once nothing
-    reads it any more: e's pca and probe have both written their results (the second to finish deletes it; a failed job keeps
-    it for a retry). A milestone is a full checkpoint, 0.6 GB for m."""
-    kept = milestone_of(e) or milestone_of(e.train)
-    if kept and all((Path(e.savedir) / f).is_file() for f in ("pca.json", "probe.json")):
-        Path(kept).unlink(missing_ok=True)
-
 def pca(job: Eval | str):
     """PCA maps (lib.evals.pca_maps) of the spec job's weights (or those of the eval.json it names). run() does it at the end of
     training; `lsf pca n` redoes it."""
@@ -190,7 +182,6 @@ def pca(job: Eval | str):
     model, step = load_checkpoint(e)
     record(e, "pca")  # argv says whether it ran inside `run` or on its own
     evals.pca_maps(model.encoder, e.train, Path(e.savedir), step, e.probe_on)
-    release_milestone(e)
 
 def pca_sizes(job: Eval | str):
     """The input size at test time (lib.evals.pca_sizes) of the spec job's weights (or those of the eval.json it names)."""
@@ -200,13 +191,11 @@ def pca_sizes(job: Eval | str):
     evals.pca_sizes(e, model, step)
 
 def probe(job: Eval | str):
-    """Linear affinity probe (lib.evals.probe) of the spec job's weights (or those of the eval.json it names), then its
-    milestone released if both its evals are done."""
+    """Linear affinity probe (lib.evals.probe) of the spec job's weights (or those of the eval.json it names)."""
     par = load(job, Eval)
     model, step = load_checkpoint(par)
     record(par, "probe")
     evals.probe(par, model, step)
-    release_milestone(par)
 
 def finetune(job: Finetune | str):
     """A UNETR on the spec job's weights (or those of the finetune.json it names), fitted and scored: lib.evals.finetune."""

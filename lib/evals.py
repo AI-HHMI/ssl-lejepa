@@ -1,6 +1,6 @@
 """Evals of a set of weights, each given its model (load_checkpoint's) and writing its artifacts to its spec's savedir: PCA maps of
 an encoder's tokens (pca_maps, pca_sizes), a linear affinity probe (probe), and a UNETR fitted on labels (finetune, tiles).
-Entrypoints, their run records and milestone release are experiment.py's."""
+Entrypoints and their run records are experiment.py's."""
 
 from __future__ import annotations
 
@@ -172,7 +172,7 @@ def probe(par: Eval, model, step: int):
     aff, valid = affinities(labels, offsets, sets["train"][0].sparse)
     feats = tokens(img, m, size)
     del img, labels
-    head, curve = fit_probe(feats, to_tokens(aff, p[0]), to_tokens(valid, p[0]), held)
+    head, curve = fit_probe(feats, to_tokens(aff, p[0]), to_tokens(valid, p[0]), held, par.standardize)
     del feats, aff, valid, held
 
     def predict(img, m, size):  # C Z Y X sigmoid probabilities over the box

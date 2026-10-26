@@ -88,6 +88,18 @@ def test_fit_probe_learns_a_linear_target():
     assert curve[-1]["held_bce"] < curve[0]["held_bce"] and curve[-1]["held_boundary_ap"] > 0.9
 
 
+def test_standardized_fit_takes_raw_features_of_any_scale():
+    g = torch.Generator().manual_seed(0)
+    base, w = torch.randn(2000, 16, generator=g), torch.randn(16, 5, generator=g)
+    targets, valid = base @ w > 0, torch.ones(2000, 5, dtype=torch.bool)
+    feats = base * torch.logspace(-2, 2, 16) + 50  # channels from 0.01 to 100 wide, off zero
+    for standardize, ok in ((False, False), (True, True)):
+        head, _ = fit_probe(feats, targets, valid, standardize=standardize)
+        with torch.no_grad():
+            acc = ((head(feats) > 0) == targets).float().mean()  # the head takes the raw features either way
+        assert (acc > 0.95) == ok, (standardize, acc)
+
+
 def test_average_precision():
     assert average_precision(torch.tensor([0.9, 0.8, 0.1]), torch.tensor([1, 1, 0])) == 1.0
     assert abs(average_precision(torch.tensor([0.9, 0.8, 0.1]), torch.tensor([0, 1, 1])) - (1 / 2 + 2 / 3) / 2) < 1e-6

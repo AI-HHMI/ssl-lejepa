@@ -85,6 +85,7 @@ class Eval:
     score: bool = False  # probe() also writes the affinity artifacts `score` reads (probe/{fit,test}, GBs each; score deletes them after)
     jobs: tuple[str, ...] = ("pca", "probe")  # the entrypoints start() submits for it
     probe_on: str = DEFAULT_DATA  # probe(): the lib.data.PROBE_SETS it fits on and is scored on
+    standardize: bool = False  # probe(): fit on features standardized per channel (train block's mean and std; folded back into the Linear)
 
 @dataclass(slots=True)
 class Finetune:
@@ -185,7 +186,7 @@ def milestone_steps(trunk: Train) -> list[int]:
     return sorted({round(k * trunk.steps_per_epoch / 10) for k in range(1, 11)})
 
 def milestone(trunk: Train, step: int) -> Path:
-    """The checkpoint train() keeps (until its eval is done with it, release_milestone) at this milestone step."""
+    """The checkpoint train() keeps at this milestone step (0.6 GB for m: a milestone eval, or a branch, can reload it any time)."""
     assert step in milestone_steps(trunk), f"step {step} is not a milestone of {trunk.savedir}: {milestone_steps(trunk)}"
     return Path(trunk.savedir) / "checkpoints/milestones" / f"step_{step:07d}.pt"
 

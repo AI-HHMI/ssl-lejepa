@@ -18,33 +18,7 @@ def provenance(monkeypatch):  # run records independent of git state
     monkeypatch.setattr(specs, "code_provenance", lambda: {"commit_id": "test-commit", "subject": "test", "dirty": False, "diff_hash": "test-diff"})
 
 
-def test_a_milestone_is_deleted_once_its_eval_has_pca_and_probe_results(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")
-    foreign = experiment.Eval(savedir="outdir/e00/e01-test/d2/", train=experiment.Train(),
-                              init_from="outdir/e00/other/d0/checkpoints/step_0000100.pt")  # not our milestone
-    trunk = experiment.Train(savedir="outdir/e00/e01-test/d0/", steps_per_epoch=1000)
-    evaluated = experiment.eval_params(trunk, 100)
-    milestone = specs.milestone(trunk, 100)
-    assert experiment.milestone_of(evaluated) == str(milestone)
-    for path in (milestone, Path(foreign.init_from), Path(trunk.savedir) / "checkpoints/step_0001000.pt"):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch()
-    for p in (evaluated, foreign):
-        Path(p.savedir).mkdir(parents=True, exist_ok=True)
-        (Path(p.savedir) / "pca.json").write_text("{}\n")
-    experiment.release_milestone(evaluated)
-    assert milestone.exists()  # its probe is still to run
-    for p in (evaluated, foreign):
-        (Path(p.savedir) / "probe.json").write_text("{}\n")
-    experiment.release_milestone(foreign)
-    experiment.release_milestone(evaluated)
-    experiment.release_milestone(evaluated)  # again: nothing left, nothing to fail
-    assert not milestone.exists()
-    assert Path(foreign.init_from).exists() and (Path(trunk.savedir) / "checkpoints/step_0001000.pt").exists()  # only our milestones go
-
-
-def test_pca_releases_its_milestone(tmp_path, monkeypatch):
+def test_pca_keeps_its_milestone(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")
     par = experiment.eval_params(experiment.Train(savedir="outdir/e00/e01-test/d0/", steps_per_epoch=1000), 100)
@@ -52,12 +26,12 @@ def test_pca_releases_its_milestone(tmp_path, monkeypatch):
     milestone.parent.mkdir(parents=True)
     milestone.touch()
     Path(par.savedir).mkdir(parents=True)
-    (Path(par.savedir) / "probe.json").write_text("{}\n")  # the probe finished first
+    (Path(par.savedir) / "probe.json").write_text("{}\n")
     monkeypatch.setattr(experiment, "load_checkpoint", lambda p: (SimpleNamespace(encoder=None), 100))
     monkeypatch.setattr(experiment, "record", lambda *a: None)
     monkeypatch.setattr(evals, "pca_maps", lambda encoder, par, savedir, step, data: (savedir / "pca.json").write_text("{}\n"))
     experiment.pca(par)
-    assert not milestone.exists()
+    assert milestone.exists()  # kept: a later probe, or a branch, can reload it
 
 
 def test_start_submits_an_evals_own_jobs(tmp_path, monkeypatch):

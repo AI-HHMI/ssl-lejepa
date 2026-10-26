@@ -37,14 +37,20 @@ def to_voxels(tok: Tensor, grid: tuple[int, ...], p: int) -> Tensor:
     return tok.reshape(gz, gy, gx, C, p, p, p).permute(3, 0, 4, 1, 5, 2, 6).reshape(C, gz * p, gy * p, gx * p)
 
 def fit_probe(feats: Tensor, targets: Tensor, valid: Tensor,
-              held: tuple[Tensor, Tensor, Tensor] | None = None) -> tuple[nn.Linear, list[dict]]:
+              held: tuple[Tensor, Tensor, Tensor] | None = None, standardize: bool = False) -> tuple[nn.Linear, list[dict]]:
     """Linear(D, K) from frozen token features (N D) to binary token targets (N K), BCE over the valid entries.
     Random token batches, Adam at a fixed lr; seeded, so a refit gives the same probe.
 
     Also returns the fit curve, every 100 steps: the batch loss, and on held (feats, targets, valid of held-out
     tokens) the BCE and the AP of predicting target 0 (for affinities: boundary, different objects). Monitoring only.
+    standardize: fit on feats minus their per-channel mean over their std (the held-out ones by the same), then fold both back
+    into the returned Linear, which takes raw features either way: a fixed number of Adam steps fits features of any scale.
     """
     BATCH, LR = 4096, 1e-3
+    if standardize:
+        mu, sd = feats.float().mean(0), feats.float().std(0).clamp_min(1e-6)  # D
+        feats = (feats.float() - mu) / sd
+        held = held and ((held[0].float() - mu) / sd, held[1], held[2])
     head = nn.Linear(feats.shape[1], targets.shape[1]).to(feats.device)
     opt = torch.optim.Adam(head.parameters(), lr=LR)
     g = torch.Generator(device=feats.device).manual_seed(0)
@@ -70,6 +76,10 @@ def fit_probe(feats: Tensor, targets: Tensor, valid: Tensor,
                     row["held_bce"] = float(F.binary_cross_entropy_with_logits(z, t))
                     row["held_boundary_ap"] = average_precision(-z, 1 - t)
             curve.append(row)
+    if standardize:  # W (x - mu) / sd + b = (W / sd) x + (b - (W / sd) mu)
+        with torch.no_grad():
+            head.weight /= sd
+            head.bias -= head.weight @ mu
     return head, curve
 
 def average_precision(scores: Tensor, labels: Tensor) -> float:
