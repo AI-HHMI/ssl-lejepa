@@ -1,7 +1,7 @@
 """e00/e12-cellmap-qknorm-lrdecay-12h: e11's recipes again for 12 h, with CellMap's organelle EM added to the data (lmd5_pow04),
 masked tokens at the MAE's context (view 96 in 128), qk_norm and the lr falling linearly to 0 (lr_decay), and a validation loss
 (held-out blocks beside training volumes) at every milestone. d0 MAE, d1 masked and d2 views on lmd5_pow04; d3 masked on lmd4_pow04
-(no CellMap) and d4 masked on CellMap alone. Do the probe's early peak and fall, and e11's instabilities, survive the changes?"""
+(no CellMap), d4 masked on CellMap alone, and d5 d1 with e11's smaller masked cube (5^3 tokens, not 7^3). Do the probe's early peak and fall, and e11's instabilities, survive the changes?"""
 
 import json
 from pathlib import Path
@@ -12,7 +12,7 @@ from reports import anticollapse, page
 
 SWEEP = "e00/e12-cellmap-qknorm-lrdecay-12h"
 E11 = "e00/e11-pretrain-b300-48h"
-NAMES = {"d0": "MAE", "d1": "masked 96", "d2": "views"}  # e11's d0-d2 are the same recipes: masked 64 and hemibrain_wide only
+NAMES = {"d0": "MAE", "d1": "masked 96 mask 7", "d2": "views", "d5": "masked 96 mask 5"}  # e11's d0-d2 are the same objectives: masked 64 and hemibrain_wide only
 SHORT, LONG = "short (+1)", "long (+10)"
 FAMILIES = ["hemibrain_wide", "fish2", "liconn_mouse", "microns", "cellmap"]
 
@@ -34,9 +34,8 @@ against e11's spikes to 72-300 late. The MAE's resid_norm falls from 32 to 19-35
 <li><b>Masked 96</b> is worse than e11's masked 64 at every milestone: short AP 0.151 at 20k and 0.128 at the end (e11: 0.172 at
 20k, 0.177 at 40k), long AP 0.752 at 40k (e11: 0.841). It peaks at 20k and falls although the lr decays, so the fall is not the
 constant lr. It differs from e11's in three ways: a bigger view (12^3 tokens against 8^3), a bigger masked cube (mask_block 0.6 of
-12 is 7^3 tokens, 343 predicted, against e11's 5^3, 125: an unintended change, since the aim was e11's mask in more context)
-and a quarter hemibrain_wide, the probe's own family. Confounded: it does not say which of the three costs the probe. The
-spec now has mask_block 5/12 (5^3 tokens); d1 needs rerunning with it.</li>
+12 is 7^3 tokens, 343 predicted, against e11's 5^3, 125) and a quarter hemibrain_wide, the probe's own family. Confounded: it
+does not say which of the three costs the probe. d5 (d1 with a 5^3 cube) is added to separate the mask's size; it has not run.</li>
 <li><b>Views</b> at 80k steps: 0.180 short, 0.667 long, against e11's 0.213 and 0.721. Its long AP is still rising at 80k.</li>
 <li><b>Validation loss</b> (32 fixed windows a family; the held-out blocks against training volumes). MAE: no gap on hemibrain_wide
 (0.510 against 0.525 at 160k), microns (0.417 both) or CellMap (0.632 against 0.600); on liconn_mouse the gap widens from 0.07

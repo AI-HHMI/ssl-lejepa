@@ -55,13 +55,15 @@ def roots() -> list[Spec]:
     # e11's recipes again, with a bigger encoder context for the masked tokens, more data, qk_norm (the encoder's queries and keys
     # normalized) and the lr falling linearly from 1e-4 to 0 over total_steps (lr_decay): e11's probes peaked by 160k steps and fell,
     # d3 diverged at 1.2M and d0 went unstable at 1.06M, all with a constant lr. Masked tokens now see the MAE's context: a view of 96
-    # in a region of 128 (shift 32, so 12^3 tokens a view), not 64 in 88, with e11's masked cube of 5^3 tokens (mask_block 5/12). Data: d0-d2 (MAE, masked, views) on lmd5_pow04, e11's
+    # in a region of 128 (shift 32, so 12^3 tokens a view), not 64 in 88.
+    # The masked cube is 7^3 tokens (mask_block 0.6) in d1-d4; d5 is d1 with e11's 5^3 (mask_block 5/12), to separate the mask's size
+    # from the context's. Data: d0-d2 (MAE, masked, views) on lmd5_pow04, e11's
     # lmd4 families and CellMap's organelle EM (lib.data "cellmap", ~10 Tvox: 48% of the samples) weighted by voxel count ^ 0.4;
     # d3 masked on lmd4_pow04, without CellMap, and d4 masked on CellMap alone, to tell what it adds. total_steps is the pace we
     # expect over 12 h less ~5%, so the lr reaches 0 as the budget ends (a slower run stops before it): e11's for MAE and views
     # (s/step 0.127 and 0.41); the masked runs' are guessed from e11's (masked 64 on lmd4, 7 H200s: 0.083; on B300: 0.23) x ~4 for
     # 3.4x the tokens a view and a bigger share of attention: `lsf benchmark` d1 and d3 first. Milestones are kept, their evals add
-    # a val loss (val.json). d1 and d4 take B300 nodes (8 GPUs, global batch 256), the others 7 GPUs of H200 nodes (global batch 224).
+    # a val loss (val.json). d1, d4 and d5 take B300 nodes (8 GPUs, global batch 256), the others 7 GPUs of H200 nodes (global batch 224).
     BATCH, HOURS = 32, 12
 
     def trunk(objective: Literal["views", "mask", "mae"], data: TrainData, input_size: int, view: int) -> Train:
@@ -87,7 +89,7 @@ def roots() -> list[Spec]:
 
     def masked(data: TrainData) -> Train:
         p = trunk("mask", data, 128, 96)
-        p.mask_block = 5 / 12  # a 5^3-token cube in the 12^3 grid: e11's mask (0.6 of 8^3) at the MAE's bigger context
+        p.mask_block = 0.6  # 7^3 tokens in the 12^3 grid
         p.mask_shift = 32
         p.sigreg_over = "both"
         p.lamb = 10 / BATCH
@@ -99,11 +101,13 @@ def roots() -> list[Spec]:
     views.local_size = (96, 96, 96)
     views.batch_views = True
     views.lamb = 0.1
-    runs: list[Spec] = [mae, masked("lmd5_pow04"), views, masked("lmd4_pow04"), masked("cellmap")]
-    for i in (1, 4):  # the two B300 nodes
+    small = masked("lmd5_pow04")
+    small.mask_block = 5 / 12  # d5: d1's recipe with e11's masked cube, 5^3 tokens (0.6 of its 8^3), not 7^3: only the mask's size differs
+    runs: list[Spec] = [mae, masked("lmd5_pow04"), views, masked("lmd4_pow04"), masked("cellmap"), small]
+    for i in (1, 4, 5):  # the three B300 nodes
         runs[i].n_gpus = 8
         runs[i].queue = "gpu_b300"
-    for i, (p, steps) in enumerate(zip(runs, [325_000, 62_500, 100_000, 125_000, 62_500])):
+    for i, (p, steps) in enumerate(zip(runs, [325_000, 62_500, 100_000, 125_000, 62_500, 62_500])):
         p.total_steps = steps
         p.savedir = f"outdir/{EXPERIMENT}/d{i}/"
     return runs
