@@ -229,8 +229,8 @@ def tiles(job: Finetune | str):
     model, step = load_checkpoint(par)
     evals.tiles(par, model, step)
 
-def score(job: Eval | str):
-    """Score probe(job)'s affinities as mia-evals' neuron-instance task (SCORE_CONFIG: mutex watershed + size filter,
+def score(job: Eval | Finetune | str):
+    """Score probe(job)'s (or finetune(job)'s: a Finetune, or the finetune.json) affinities as mia-evals' neuron-instance task (SCORE_CONFIG: mutex watershed + size filter,
     fitted on the fit block, reported on the test block; panoptic quality ranks, VOI and ARE reported).
 
     Writes the record into the run's own dir, savedir/mia_evals/<task>/records/*.json (pull.sh brings it down;
@@ -240,9 +240,9 @@ def score(job: Eval | str):
     commit's SCORE_CONFIG (`lsf score n`). Deletes savedir/probe/ (the artifacts it read) once the record is written.
     """
     import subprocess
-    par = load(job, Eval)
+    par = load(job, Finetune if isinstance(job, Finetune) or str(job).endswith("finetune.json") else Eval)
     savedir = Path(par.savedir)
-    assert (savedir / "probe/test").is_dir() and (savedir / "probe/fit").is_dir(), f"no probe artifacts in {savedir}: probe first (a run with score=False writes none)"
+    assert (savedir / "probe/test").is_dir() and (savedir / "probe/fit").is_dir(), f"no probe artifacts in {savedir}: probe or finetune first (a run with score=False writes none)"
     exe = MIA_EVALS / ".venv/bin/mia-evals"
     assert exe.is_file(), f"no mia-evals CLI at {exe}: clone github.com/AI-HHMI/mia-evals to {MIA_EVALS} and `uv sync` there"
     record(par, "score")
@@ -290,18 +290,18 @@ def bsub(savedir: str, job: str, minutes: int, n_gpus: int, queue: str, cmd: str
     subprocess.run(full, shell=True, stdin=subprocess.DEVNULL, check=True)  # waits: a later job may name this one in its after
     print(f"Submitted {name} (code {code}) to LSF.")
 
-def submit(fn: str, job: Spec):
+def submit(fn: str, job: Spec, after: str = ""):
     """Run the entrypoint fn on the spec job as an LSF job: job written to its savedir (dump: train.json, eval.json or
     finetune.json), and `experiment.py <fn> <that file>` submitted (bsub), which loads it. Resources by fn: run and benchmark,
     a training job on job's queue and GPUs (torchrun); pca, pca_sizes, probe, finetune and tiles, one GPU on the trained run's queue;
     score, a CPU job on SCORE_QUEUE. A finetune of one of this experiment's own trunks waits in LSF for the trunk's run job,
     unless the trunk is done (its own probe.json is written). No commit check: callers from the shared checkout (submitall,
-    lsf) assert_committed() first; a job submitting one is committed code."""
+    lsf) assert_committed() first; a job submitting one is committed code. after: the name of an LSF job a score waits for (start)."""
     b1 = fn in ("run", "benchmark") and isinstance(job, Train)
     b2 = fn in ("pca", "pca_sizes", "probe", "val", "score") and isinstance(job, Eval)
-    b3 = fn in ("finetune", "tiles") and isinstance(job, Finetune)
+    b3 = fn in ("finetune", "tiles", "score") and isinstance(job, Finetune)
     assert b1 or b2 or b3, (f"{job.savedir}: no LSF job {fn!r} for a {type(job).__name__} (run and benchmark take a Train; pca, pca_sizes, "
-                            f"probe, val and score an Eval; finetune a Finetune)")
+                            f"probe, val and score an Eval; finetune, tiles and score a Finetune)")
     assert not isinstance(job, Train) or job.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={job.n_workers} leaves no core for the training process"
     spec = dump(job)
     if isinstance(job, Train):
@@ -309,7 +309,7 @@ def submit(fn: str, job: Spec):
         minutes = int(job.max_hours * 60) + 60 if job.max_hours and fn == "run" else 15
         bsub(job.savedir, fn, minutes, job.n_gpus, job.queue, f"torchrun --standalone --nproc_per_node={job.n_gpus} {{code}}/experiment.py {fn} {spec}")
     elif fn == "score":
-        bsub(job.savedir, fn, SCORE_MINUTES, 0, SCORE_QUEUE, f"python {{code}}/experiment.py score {spec}", slots=SCORE_SLOTS)
+        bsub(job.savedir, fn, SCORE_MINUTES, 0, SCORE_QUEUE, f"python {{code}}/experiment.py score {spec}", slots=SCORE_SLOTS, after=after)
     else:
         b4 = job.init_from.startswith(f"outdir/{EXPERIMENT}/")
         b5 = not (Path(job.init_from) / "probe.json").is_file()
@@ -319,10 +319,12 @@ def submit(fn: str, job: Spec):
 
 def start(p: Spec):
     """Submit p fresh: its savedir emptied (old contents -> outdir/.trash/), then its jobs: a training run (which evals itself
-    after), an eval's jobs (Eval.jobs: pca and probe, unless it says otherwise), or a finetune."""
+    after), an eval's jobs (Eval.jobs: pca and probe, unless it says otherwise), or a finetune (with Finetune.score, its score job after it)."""
     trash(p.savedir)
     for fn in ["run"] if isinstance(p, Train) else ["finetune"] if isinstance(p, Finetune) else p.jobs:
         submit(fn, p)
+    if isinstance(p, Finetune) and p.score:  # its artifacts are scored once the finetune has written them
+        submit("score", p, after=job_name(p.savedir, "finetune"))
 
 def lsf(fn: str, target: int | str):
     """Redo one job on LSF, of roots()[target] or of the spec file target names (any run's, e.g. a milestone eval's

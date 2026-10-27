@@ -163,6 +163,22 @@ def test_finetune_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch, freeze,
         evals.finetune(specs.Finetune(savedir=par.savedir, train=par.train, fit_side=16), model.eval(), 7)
 
 
+def test_finetune_writes_the_score_artifacts_only_when_asked(tmp_path, monkeypatch):
+    import lib.decoders
+    synthetic_store(tmp_path, monkeypatch)
+    config = lib.decoders.UnetrConfig
+    monkeypatch.setattr(lib.decoders, "UnetrConfig", lambda out_dim: config(out_dim=out_dim, hidden_dim=8))
+    model = Lejepa(TINY, encoder=EncoderConfig(depth=2, embed_dim=16, num_heads=2, patch_size=(2, 2, 2)))
+    for score in (False, True):
+        par = specs.Finetune(savedir=str(tmp_path / f"run{score}"), train=specs.Train(global_size=(24, 24, 24)), steps=100, score=score)
+        (tmp_path / f"run{score}").mkdir()
+        evals.finetune(par, model.eval(), 7)
+        assert (tmp_path / f"run{score}/probe").exists() == score
+    art = zarr.open_array(str(tmp_path / "runTrue/probe/test/hemibrain_eb_test.zarr"), mode="r")
+    assert dict(art.attrs)["kind"] == "affinity" and dict(art.attrs)["step"] == 7 and np.asarray(art[:]).shape == (6, 32, 32, 32)
+    assert (tmp_path / "runTrue/probe/fit/hemibrain_eb_fit.zarr").is_dir()
+
+
 def test_probe_on_another_set_averages_its_test_blocks(tmp_path, monkeypatch):
     """A probe set with two test blocks: scored on each, averaged; one png each. Its boxes are cut to whole patches."""
     synthetic_store(tmp_path, monkeypatch, {"two": {"train": [("two_train", [[24, 56], [24, 56], [24, 56]])],

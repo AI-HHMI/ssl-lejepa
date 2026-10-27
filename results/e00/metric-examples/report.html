@@ -26,11 +26,9 @@ ul.entries time code{color:#aaa;font-size:11px}
 ul.entries a{font-weight:600;color:#0072B2;text-decoration:none} ul.entries a:hover{text-decoration:underline}
 ul.entries p{margin:3px 0 0;color:#555;font-size:13.5px;line-height:1.45;
   display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
-</style></head><body><div class='layout'><nav class='toc'><b>Contents</b><a href='#overview'>Overview</a><a href='#findings'>Findings</a><a href='#metrics-by-mistake'>Metrics by mistake</a><a href='#examples'>Examples</a></nav><main><a class=home href='../../../index.html'>&larr; All reports</a><h1 id='overview'>e00/metric-examples report</h1><p>Instance-segmentation metrics on a real crop with one kind of mistake added at a time. `make` (on the cluster, where the
-data is) reads a hemibrain EB test crop, corrupts its ground-truth labels in eight ways, scores each corrupted labelling
-with mia-evals' voxel_instance metrics (PQ, SQ, RQ, VOI split and merge, adapted Rand error) and with boundary AP as a
-hard prediction (the probe's metric: short is the mean of the +1 channels, long of the +10), and draws each against the
-EM; `main` builds the page. Which mistake costs which metric?</p><div class='tiles'><div class='tile'><b>15</b>objects in the crop</div></div><h2 id='findings'>Findings</h2><div class='grid'><div class='card wide'><h3>What each metric penalizes, in this crop</h3><ul>
+</style></head><body><div class='layout'><nav class='toc'><b>Contents</b><a href='#overview'>Overview</a><a href='#findings'>Findings</a><a href='#metrics-by-mistake'>Metrics by mistake</a><a href='#examples'>Examples</a></nav><main><a class=home href='../../../index.html'>&larr; All reports</a><h1 id='overview'>e00/metric-examples report</h1><p>e00/metric-examples: instance-segmentation metrics on a real crop with one kind of mistake added at a time. The crop, its
+eight corrupted labellings and their scores (PQ, SQ, RQ, VOI split and merge, adapted Rand error, and boundary AP of the hard
+labelling) come from the top-level metric_examples.py, run on the cluster; this builds the page. Which mistake costs which metric?</p><div class='tiles'><div class='tile'><b>15</b>objects in the crop</div></div><h2 id='findings'>Findings</h2><div class='grid'><div class='card wide'><h3>What each metric penalizes, in this crop</h3><ul>
 <li><b>PQ and RQ count objects; VOI and Rand error count voxels.</b> 300 specks cost PQ 0.999 to 0.091 (RQ 0.091: each speck is a false
 object) and VOI 0.02, Rand error 0.001. Deleting the smaller half of the objects costs PQ 0.636 (RQ) and Rand error 0.001. This is
 why the size filter decides PQ in mws.toml while VOI barely moves. SQ is 0.999 and 1.0 in both: the matched objects are exact.</li>

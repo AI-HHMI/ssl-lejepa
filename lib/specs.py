@@ -91,7 +91,7 @@ class Eval:
 
 @dataclass(slots=True)
 class Finetune:
-    """The spec of finetune: a dense decoder (lib.decoders.unetr.Unetr) trained on a probe set's GT affinities on top of one
+    """The spec of finetune (and of score, on its artifacts): a dense decoder (lib.decoders.unetr.Unetr) trained on a probe set's GT affinities on top of one
     set of weights, frozen or trained with it, and scored on the set's test blocks as it trains: AP against fit compute
     (steps) at one amount of GT (fit_side)."""
     savedir: str
@@ -101,6 +101,7 @@ class Finetune:
     fit_side: int = 0  # >0: fit on a cube of this side (8 nm voxels) about the train block's centre, not all of it (less GT)
     steps: int = 10_000  # fit steps (lib.decoders.unetr.fit_unetr, batch 4), scored at 100, 200, 400, ... and the last
     freeze_encoder: bool = True  # False: train the encoder with the decoder (end-to-end finetuning)
+    score: bool = False  # finetune() also writes the affinity artifacts `score` reads (probe/{fit,test}, GBs each; score deletes them after)
 
 Spec = Train | Eval | Finetune  # a job's spec: what roots() lists and start() submits
 

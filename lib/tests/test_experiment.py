@@ -173,6 +173,19 @@ def test_submit_writes_the_spec_its_job_loads(tmp_path, monkeypatch):
         experiment.load("extra.json", experiment.Eval)
 
 
+def test_a_scored_finetune_is_followed_by_its_score_job(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    submitted = []
+    monkeypatch.setattr(experiment, "bsub", lambda savedir, job, minutes, n_gpus, queue, cmd, **kw: submitted.append((job, n_gpus, queue, kw.get("after", ""))))
+    trunk = experiment.Train(savedir="outdir/e00/x/d0/", queue="gpu_b300")
+    for score in (False, True):
+        submitted.clear()
+        experiment.start(experiment.Finetune(savedir=f"outdir/e00/x/d{int(score)}/", train=trunk, init_from="random", score=score))
+        assert [j for j, *_ in submitted] == ["finetune"] + ["score"] * score
+    assert submitted[1] == ("score", 0, experiment.SCORE_QUEUE, "e00-x-d1-finetune")  # a CPU job, held for the finetune
+    assert experiment.load("outdir/e00/x/d1/finetune.json", experiment.Finetune).score  # what score loads
+
+
 def test_a_finetune_of_a_trunk_here_waits_in_lsf_for_its_training(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")
