@@ -86,8 +86,8 @@ class Eval:
     init_from: str = ""  # the weights: "" train's own latest checkpoint; a run dir, its latest; a checkpoint .pt; "random" untrained
     score: bool = False  # probe() also writes the affinity artifacts `score` reads (probe/{fit,test}, GBs each; score deletes them after)
     jobs: tuple[str, ...] = ("pca", "probe")  # the entrypoints start() submits for it
-    probe_on: str = DEFAULT_DATA  # probe(): the lib.data.PROBE_SETS it fits on and is scored on
-    standardize: bool = False  # probe(): fit on features standardized per channel (train block's mean and std; folded back into the Linear)
+    probe_on: str = DEFAULT_DATA  # probe(): the lib.data.PROBE_SETS whose fit block it fits on and whose test blocks score it
+    standardize: bool = False  # probe(): fit on features standardized per channel (fit block's mean and std; folded back into the Linear)
 
 @dataclass(slots=True)
 class Finetune:
@@ -97,8 +97,8 @@ class Finetune:
     savedir: str
     train: Train  # the weights' run, as Eval.train: its architecture, and its view size (the crops the decoder fits and predicts on)
     init_from: str = ""  # the weights, as Eval.init_from ("random": the from-scratch baseline)
-    probe_on: str = DEFAULT_DATA  # the lib.data.PROBE_SETS whose train block it fits and whose test blocks score it
-    fit_side: int = 0  # >0: fit on a cube of this side (8 nm voxels) about the train block's centre, not all of it (less GT)
+    probe_on: str = DEFAULT_DATA  # the lib.data.PROBE_SETS whose fit block it fits and whose test blocks score it
+    fit_side: int = 0  # >0: fit on a cube of this side (8 nm voxels) about the fit block's centre, not all of it (less GT)
     steps: int = 10_000  # fit steps (lib.decoders.unetr.fit_unetr, batch 4), scored at 100, 200, 400, ... and the last
     freeze_encoder: bool = True  # False: train the encoder with the decoder (end-to-end finetuning)
     score: bool = False  # finetune() also writes the affinity artifacts `score` reads (probe/{fit,test}, GBs each; score deletes them after)

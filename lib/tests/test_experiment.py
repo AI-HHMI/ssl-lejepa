@@ -38,11 +38,23 @@ def test_pca_keeps_its_milestone(tmp_path, monkeypatch):
 def test_start_submits_an_evals_own_jobs(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     submitted = []
-    monkeypatch.setattr(experiment, "submit", lambda fn, p: submitted.append(fn))
+    monkeypatch.setattr(experiment, "submit", lambda fn, p, after="": submitted.append(fn))
     monkeypatch.setattr(experiment, "trash", lambda savedir: None)
     experiment.start(experiment.Eval(savedir="outdir/e00/x/d0/", train=experiment.Train()))
     experiment.start(experiment.Eval(savedir="outdir/e00/x/d1/", train=experiment.Train(), jobs=("pca_sizes",)))
     assert submitted == ["pca", "probe", "pca_sizes"]
+
+
+def test_every_task_is_an_entrypoint_and_its_where_is_known():
+    entrypoints = {f.__name__ for f in experiment.ENTRYPOINTS}
+    assert set(experiment.TASKS) <= entrypoints, set(experiment.TASKS) - entrypoints
+    assert {t.where for t in experiment.TASKS.values()} <= {"train", "gpu", "cpu"}
+
+
+def test_submit_refuses_a_task_for_a_spec_it_does_not_take(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(AssertionError, match="no LSF job 'probe' for a Train"):
+        experiment.submit("probe", experiment.Train(savedir="outdir/e00/x/d0/"))
 
 
 def test_submitall_starts_each_root_not_submitted_before(tmp_path, monkeypatch):

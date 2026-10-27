@@ -160,8 +160,12 @@ def run_name(par: Eval | Finetune) -> str:
     """mia-evals' row name for par's run: its savedir's parts, letters, digits, _ and - only."""
     return "-".join(Path(par.savedir).parts[1:])
 
-def write_artifact(par: Eval | Finetune, step: int, split: str, vol: ProbeVolume, pred):
-    """vol's predictions pred (C Z Y X probabilities) as the mia-evals affinity artifact `score` reads: savedir/probe/<split>/."""
+MIA_EVALS_SPLIT = {"tune": "fit", "test": "test"}  # mia-evals' names for the blocks it tunes on and scores on ([data.fit], [data.test])
+
+def write_artifact(par: Eval | Finetune, step: int, role: str, vol: ProbeVolume, pred):
+    """vol's predictions pred (C Z Y X probabilities) as the mia-evals affinity artifact `score` reads, savedir/probe/<split>/,
+    vol being the probe set's tune or test block (role) and split mia-evals' name for it."""
+    split = MIA_EVALS_SPLIT[role]
     (x0, _), (y0, _), (z0, _) = vol.box
     write_affinities(Path(par.savedir) / "probe" / split / f"{par.probe_on}_{split}.zarr", pred.permute(0, 3, 2, 1).cpu().numpy(),
                      origin=[x0, y0, z0], convention="sigmoid(logit), linear decoder",
@@ -171,9 +175,10 @@ def write_artifact(par: Eval | Finetune, step: int, split: str, vol: ProbeVolume
 
 def probe(par: Eval, model, step: int):
     """Linear affinity probe (lib.probe) of the spec job's weights (or those of the eval.json it names), frozen: one Linear per
-    token to mia-evals' 6 affinity channels at every voxel of its patch, fitted on the train block of its probe set
+    token to mia-evals' 6 affinity channels at every voxel of its patch, fitted on the fit block of its probe set
     (par.probe_on, lib.data.PROBE_SETS) against its instance labels, scored on its test blocks (averaged) as mia-evals'
-    neuron-instance task. Every block read at 8 nm, as training reads (read_block).
+    neuron-instance task. Data: the set's fit block fits the Linear; its test blocks score it; with par.score its tune block's
+    predictions are also written (`score` picks the post-processing on them). Every block read at 8 nm, as training reads (read_block).
       savedir/probe.json          test-block BCE and boundary AP per channel (cheap, immediate)
       savedir/probe_fit.json      the fit curve every 100 steps: training loss, and BCE and boundary AP on a
                                   fixed held-out sample (monitoring only, nothing selects on it)
@@ -190,9 +195,8 @@ def probe(par: Eval, model, step: int):
     tile = par.train.global_size
     encoder, device = model.encoder, next(model.parameters()).device
     p = encoder.patch_embed.patch_size
-    sets = probe_set(par.probe_on)
-    assert not par.score or "fit" in sets, f"{par.savedir}: no mia-evals fit block for {par.probe_on} (a probe set with a \"fit\" split), to score"
-    assert len(sets["train"]) == 1, f"{par.probe_on}: the probe fits on one block"
+    blocks = probe_set(par.probe_on)
+    assert not par.score or blocks.tune, f"{par.savedir}: no mia-evals tune block for {par.probe_on} (a probe set with a tune block), to score"
     assert len(set(p)) == 1, f"patch {p} must be cubic"
     offsets = [o[::-1] for o in AFFINITY_OFFSETS_XYZ]  # x y z offsets; the model sees z y x
 
@@ -201,15 +205,15 @@ def probe(par: Eval, model, step: int):
         t0, n = [mi // q for mi, q in zip(m, p)], [s // q for s, q in zip(size, p)]
         return f[t0[0]:t0[0] + n[0], t0[1]:t0[1] + n[1], t0[2]:t0[2] + n[2]].reshape(-1, f.shape[-1])
 
-    tests = [read_block(v, tile, p, device) for v in sets["test"]]  # (img, labels, m, size) each
+    tests = [read_block(v, tile, p, device) for v in blocks.test]  # (img, labels, m, size) each
     img, labels, m, size = tests[0]
-    aff, valid = affinities(labels, offsets, sets["test"][0].sparse)
+    aff, valid = affinities(labels, offsets, blocks.test[0].sparse)
     feats = tokens(img, m, size)
     g = torch.Generator(device=device).manual_seed(0)
     i = torch.randperm(len(feats), device=device, generator=g)[:16384]  # held-out tokens, fit curve only
     held = (feats[i], to_tokens(aff, p[0])[i], to_tokens(valid, p[0])[i])
-    img, labels, m, size = read_block(sets["train"][0], tile, p, device)
-    aff, valid = affinities(labels, offsets, sets["train"][0].sparse)
+    img, labels, m, size = read_block(blocks.fit, tile, p, device)
+    aff, valid = affinities(labels, offsets, blocks.fit.sparse)
     feats = tokens(img, m, size)
     del img, labels
     head, curve = fit_probe(feats, to_tokens(aff, p[0]), to_tokens(valid, p[0]), held, par.standardize)
@@ -222,24 +226,23 @@ def probe(par: Eval, model, step: int):
 
     (Path(par.savedir) / "probe_fit.json").write_text("".join(json.dumps({"tbl": "probe_fit", **c}) + "\n" for c in curve))
     per_block = []
-    for k, (vol, (img, labels, m, size)) in enumerate(zip(sets["test"], tests)):
+    for k, (vol, (img, labels, m, size)) in enumerate(zip(blocks.test, tests)):
         pred = predict(img, m, size)
         per_block.append(score_block(pred, labels, vol.sparse))
         boundary_png(Path(par.savedir) / ("probe.png" if k == 0 else f"probe_{vol.name}.png"), inner(img, m, size), labels, pred)
         if par.score:
             write_artifact(par, step, "test", vol, pred)
-    if par.score:  # also the set's mia-evals fit block, whose predictions only feed the artifacts
-        vol = sets["fit"][0]
-        img, _, m, size = read_block(vol, tile, p, device)
-        write_artifact(par, step, "fit", vol, predict(img, m, size))
-    stats = {"tbl": "probe", "step": step, "run": run_name(par), "probe_on": par.probe_on, "test_blocks": [v.name for v in sets["test"]],
+    if par.score:  # the tune block's predictions only feed the artifacts
+        img, _, m, size = read_block(blocks.tune, tile, p, device)
+        write_artifact(par, step, "tune", blocks.tune, predict(img, m, size))
+    stats = {"tbl": "probe", "step": step, "run": run_name(par), "probe_on": par.probe_on, "test_blocks": [v.name for v in blocks.test],
              **mean_scores(per_block)}
     (Path(par.savedir) / "probe.json").write_text(json.dumps(stats) + "\n")
     print(f"{par.savedir}: probe at step {step}: boundary AP (short-range mean) {stats['boundary_ap_short']:.3f}{'; wrote probe/' * par.score}", flush=True)
 
 def fit_decoder(par: Finetune, model, score=None):
     """finetune's fit: a UNETR on model's encoder (trained too unless par.freeze_encoder), fitted to the affinities of par's probe set's
-    train block or of its par.fit_side cube, on crops of the encoder's view size: (the UNETR, fit_unetr's curve, the fit's
+    fit block or of its par.fit_side cube, on crops of the encoder's view size: (the UNETR, fit_unetr's curve, the fit's
     finetune_data row without the weights' step). score(unetr) -> dict is fit_unetr's scoring, at its doubling steps."""
     import torch
     from lib.decoders import Unetr, UnetrConfig, fit_unetr
@@ -248,16 +251,15 @@ def fit_decoder(par: Finetune, model, score=None):
     tile = par.train.global_size
     encoder, device = model.encoder, next(model.parameters()).device
     p = encoder.patch_embed.patch_size
-    sets = probe_set(par.probe_on)
+    blocks = probe_set(par.probe_on)
     side = par.fit_side or PROBE_SIDE
-    assert len(sets["train"]) == 1, f"{par.probe_on}: the fit is on one block"
     assert side % p[0] == 0, f"{par.savedir}: fit_side {side} must be whole patches of {p[0]}"
     unetr = Unetr(encoder, UnetrConfig(out_dim=len(AFFINITY_OFFSETS_XYZ))).to(device)
     encoder.requires_grad_(not par.freeze_encoder)
-    img, labels, m, size = read_block(sets["train"][0], tile, p, device, side)
+    img, labels, m, size = read_block(blocks.fit, tile, p, device, side)
     assert all(s >= t for s, t in zip(size, tile)), f"{par.savedir}: the fit cube {size} is smaller than a crop {tile}"
-    aff, valid = affinities(labels, [o[::-1] for o in AFFINITY_OFFSETS_XYZ], sets["train"][0].sparse)  # x y z offsets; the model sees z y x
-    data = {"tbl": "finetune_data", "fit_size": size, "fit_labelled": int((labels != 0).sum()), "test_blocks": [v.name for v in sets["test"]]}
+    aff, valid = affinities(labels, [o[::-1] for o in AFFINITY_OFFSETS_XYZ], blocks.fit.sparse)  # x y z offsets; the model sees z y x
+    data = {"tbl": "finetune_data", "fit_size": size, "fit_labelled": int((labels != 0).sum()), "test_blocks": [v.name for v in blocks.test]}
     curve = fit_unetr(unetr, inner(img, m, size)[None], aff, valid, tile, (lambda: score(unetr)) if score else None, steps=par.steps)
     return unetr, curve, data
 
@@ -268,9 +270,10 @@ def predict_block(unetr, tile, img, m, size):
 
 def finetune(par: Finetune, model, step: int):
     """A UNETR (lib.decoders.unetr: skip connections into the encoder's own blocks) on the spec job's weights (or those of the
-    finetune.json it names), fitted to mia-evals' 6 affinity channels of its probe set's (par.probe_on) train block, or of the
+    finetune.json it names), fitted to mia-evals' 6 affinity channels of its probe set's (par.probe_on) fit block, or of the
     par.fit_side cube about its centre: on crops of the encoder's view size, with the encoder trained too unless
-    par.freeze_encoder, and scored as it fits on the set's test blocks, tiled at that size. Blocks read as probe reads them.
+    par.freeze_encoder, and scored as it fits on the set's test blocks, tiled at that size (with par.score, the tune block's
+    predictions are written too, for `score`). Blocks read as probe reads them.
       savedir/finetune_curve.json   a first row (tbl "finetune_data"): the weights' step, the fit cube's size and labelled voxels
                               (the GT the fit had), the test blocks. Then the fit curve (tbl "finetune", fit_unetr's): the batch
                               loss every 100 steps, and at 100, 200, 400, ... steps and the last, the test blocks' scores
@@ -280,24 +283,24 @@ def finetune(par: Finetune, model, step: int):
       savedir/probe/{fit,test}/   with par.score: the fitted decoder's mia-evals affinity artifacts, as probe writes them
     """
     tile, p, device = par.train.global_size, model.encoder.patch_embed.patch_size, next(model.parameters()).device
-    sets = probe_set(par.probe_on)
-    tests = [read_block(v, tile, p, device, context=True) for v in sets["test"]]  # (img, labels, m, size) each
+    blocks = probe_set(par.probe_on)
+    tests = [read_block(v, tile, p, device, context=True) for v in blocks.test]  # (img, labels, m, size) each
 
     def test_scores(unetr) -> dict:
-        return mean_scores([score_block(predict_block(unetr, tile, t_img, t_m, t_size), t_labels, v.sparse) for v, (t_img, t_labels, t_m, t_size) in zip(sets["test"], tests)])
+        return mean_scores([score_block(predict_block(unetr, tile, t_img, t_m, t_size), t_labels, v.sparse) for v, (t_img, t_labels, t_m, t_size) in zip(blocks.test, tests)])
 
     unetr, curve, data = fit_decoder(par, model, test_scores)
     rows = [{**data, "step": step}] + [{"tbl": "finetune", **c} for c in curve]
     (Path(par.savedir) / "finetune_curve.json").write_text("".join(json.dumps(r) + "\n" for r in rows))
-    assert not par.score or "fit" in sets, f"{par.savedir}: no mia-evals fit block for {par.probe_on} (a probe set with a \"fit\" split), to score"
-    for k, (vol, (img, labels, m, size)) in enumerate(zip(sets["test"], tests)):
+    assert not par.score or blocks.tune, f"{par.savedir}: no mia-evals tune block for {par.probe_on} (a probe set with a tune block), to score"
+    for k, (vol, (img, labels, m, size)) in enumerate(zip(blocks.test, tests)):
         pred = predict_block(unetr, tile, img, m, size)
         if par.score:
             write_artifact(par, step, "test", vol, pred)
         boundary_png(Path(par.savedir) / ("finetune.png" if k == 0 else f"finetune_{vol.name}.png"), inner(img, m, size), labels, pred)
-    if par.score:  # also the set's mia-evals fit block, whose predictions only feed the artifacts
-        img, _, m, size = read_block(sets["fit"][0], tile, p, device, context=True)
-        write_artifact(par, step, "fit", sets["fit"][0], predict_block(unetr, tile, img, m, size))
+    if par.score:  # the tune block's predictions only feed the artifacts
+        img, _, m, size = read_block(blocks.tune, tile, p, device, context=True)
+        write_artifact(par, step, "tune", blocks.tune, predict_block(unetr, tile, img, m, size))
     print(f"{par.savedir}: finetune of step {step} on {data['fit_size']} voxels of {par.probe_on}: boundary AP (short-range mean) "
           f"{curve[-1]['boundary_ap_short']:.3f} after {par.steps} steps", flush=True)
 
@@ -307,7 +310,7 @@ def tiles(par: Finetune, model, step: int):
     predictions, redone with the current tiling; nothing else is written."""
     unetr, _, _ = fit_decoder(par, model)
     tile, p, device = par.train.global_size, model.encoder.patch_embed.patch_size, next(model.parameters()).device
-    img, labels, m, size = read_block(probe_set(par.probe_on)["test"][0], tile, p, device, context=True)
+    img, labels, m, size = read_block(probe_set(par.probe_on).test[0], tile, p, device, context=True)
     boundary_png(Path(par.savedir) / "tiles.png", inner(img, m, size), labels, predict_block(unetr, tile, img, m, size))
     print(f"{par.savedir}: wrote tiles.png, finetune of step {step} for {par.steps} steps", flush=True)
 

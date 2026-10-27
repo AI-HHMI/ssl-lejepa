@@ -156,33 +156,41 @@ def _lmd_ssl_v1(name: str, catalog: str, label_key: str, box: list[list[int]], c
     return ProbeVolume(name, f"{LMD_DATA}/{catalog}.zarr", label_key, box, clip, sparse=True)
 
 
-# Probe sets (Eval.probe_on): a "train" block the probe fits on, and the "test" blocks it is scored on. hemibrain_eb is the
-# probe of every run so far. The others are mia-evals' lmd_ssl_v1_neuron_instance (configs/lmd_ssl_v1_neuron_instance/data,
-# copied 2026-10-18): its fit half the probe's train, its test half the test, boxes and clip ranges as there.
-PROBE_SETS: dict[str, dict[str, list[ProbeVolume]]] = {
-    "hemibrain_eb": {split: [ProbeVolume(f"hemibrain_eb_{split}", f"{LMD_DATA}/{HEMIBRAIN_EB}.zarr", HEMIBRAIN_EB_LABELS.removeprefix("labels/"),
-                                         HEMIBRAIN_EB_PROBE_BOXES[split], annotated=HEMIBRAIN_EB_PROBE_ANNOTATED.get(split))]
-                     for split in ("train", "fit", "test")},
-    "kasthuri15": {
-        "train": [_lmd_ssl_v1("kasthuri15_ac3", "em-mouse-Kasthuri15-ac3ac4-cortex/crop-001_ac3_100slices", "public_gt-cell-kasthuri15", [[0, 1024], [0, 1024], [0, 100]])],
-        "test": [_lmd_ssl_v1("kasthuri15_ac4", "em-mouse-Kasthuri15-ac3ac4-cortex/crop-002_ac4_100slices", "public_gt-cell-kasthuri15", [[0, 1024], [0, 1024], [0, 100]])],
-    },
-    "fish2": {
-        "train": [_lmd_ssl_v1("zebrafish_fish2_quadcube1", "em-zebrafish-fish2/crop-003_quadcube1_x23908_y18314_z0", "proofread-cell-seg230927", [[0, 2000], [0, 2000], [0, 1364]])],
-        "test": [_lmd_ssl_v1("zebrafish_fish2_doublecube1", "em-zebrafish-fish2/crop-001_doublecube1_x52000_y42500_z0", "proofread-cell-seg230927", [[0, 2000], [0, 2000], [0, 2112]])],
-    },
-    "liconn_mouse": {
-        "train": [_lmd_ssl_v1("liconn_mouse_dg", "exm-mouse-liconn-DG-20250809_ExPID19-02_2ndGel_C5_Atto488_40XW_002/crop-001", "manual_gt-cell-final",
-                              [[1416, 1892], [516, 996], [83, 276]], (301, 1130))],
-        "test": [_lmd_ssl_v1("liconn_mouse_hippocampus", "exm-mouse-liconn-hippocampus-202507013_ExPID10-02_2percentAA_S2_Atto488_40XW_004/crop-001", "manual_gt-cell-final",
-                             [[496, 976], [496, 976], [44, 236]], (219, 919)),
-                 _lmd_ssl_v1("liconn_expid82", "exm-mouse-liconn-ExPID82-1/crop-002_sub", "proofread-cell-agglom-dense-v20240123", [[1229, 2253], [1642, 2666], [0, 534]])],
-    },
+class ProbeSet(NamedTuple):
+    """A labelled dataset's blocks, by the role each plays: what lib.evals.probe and finetune fit and score, and what `score` tunes on."""
+    fit: ProbeVolume  # the readout (the linear probe, the decoder) is fit on it
+    test: list[ProbeVolume]  # the fitted readout is scored on these, averaged
+    tune: ProbeVolume | None = None  # `score` only: where mia-evals chooses its post-processing's parameters (its "fit" block), never test
+
+
+def _hemibrain_eb(split: str) -> ProbeVolume:
+    return ProbeVolume(f"hemibrain_eb_{split}", f"{LMD_DATA}/{HEMIBRAIN_EB}.zarr", HEMIBRAIN_EB_LABELS.removeprefix("labels/"),
+                       HEMIBRAIN_EB_PROBE_BOXES[split], annotated=HEMIBRAIN_EB_PROBE_ANNOTATED.get(split))
+
+
+# Probe sets (Eval.probe_on). hemibrain_eb is the probe of every run so far; its volumes are named for the splits of its boxes
+# (HEMIBRAIN_EB_PROBE_BOXES): hemibrain_eb_train is the fit block, hemibrain_eb_fit the tune block (mia-evals' name for it). The others
+# are mia-evals' lmd_ssl_v1_neuron_instance (configs/lmd_ssl_v1_neuron_instance/data, copied 2026-10-18): its fit half is the set's
+# fit block, its test half the test blocks, boxes and clip ranges as there; they have no tune block, so they can't be scored.
+PROBE_SETS: dict[str, ProbeSet] = {
+    "hemibrain_eb": ProbeSet(fit=_hemibrain_eb("train"), test=[_hemibrain_eb("test")], tune=_hemibrain_eb("fit")),
+    "kasthuri15": ProbeSet(
+        fit=_lmd_ssl_v1("kasthuri15_ac3", "em-mouse-Kasthuri15-ac3ac4-cortex/crop-001_ac3_100slices", "public_gt-cell-kasthuri15", [[0, 1024], [0, 1024], [0, 100]]),
+        test=[_lmd_ssl_v1("kasthuri15_ac4", "em-mouse-Kasthuri15-ac3ac4-cortex/crop-002_ac4_100slices", "public_gt-cell-kasthuri15", [[0, 1024], [0, 1024], [0, 100]])]),
+    "fish2": ProbeSet(
+        fit=_lmd_ssl_v1("zebrafish_fish2_quadcube1", "em-zebrafish-fish2/crop-003_quadcube1_x23908_y18314_z0", "proofread-cell-seg230927", [[0, 2000], [0, 2000], [0, 1364]]),
+        test=[_lmd_ssl_v1("zebrafish_fish2_doublecube1", "em-zebrafish-fish2/crop-001_doublecube1_x52000_y42500_z0", "proofread-cell-seg230927", [[0, 2000], [0, 2000], [0, 2112]])]),
+    "liconn_mouse": ProbeSet(
+        fit=_lmd_ssl_v1("liconn_mouse_dg", "exm-mouse-liconn-DG-20250809_ExPID19-02_2ndGel_C5_Atto488_40XW_002/crop-001", "manual_gt-cell-final",
+                        [[1416, 1892], [516, 996], [83, 276]], (301, 1130)),
+        test=[_lmd_ssl_v1("liconn_mouse_hippocampus", "exm-mouse-liconn-hippocampus-202507013_ExPID10-02_2percentAA_S2_Atto488_40XW_004/crop-001", "manual_gt-cell-final",
+                          [[496, 976], [496, 976], [44, 236]], (219, 919)),
+              _lmd_ssl_v1("liconn_expid82", "exm-mouse-liconn-ExPID82-1/crop-002_sub", "proofread-cell-agglom-dense-v20240123", [[1229, 2253], [1642, 2666], [0, 534]])]),
 }
 
 
-def probe_set(name: str) -> dict[str, list[ProbeVolume]]:
-    """The labelled blocks of probe set name: "train", "test" and, if mia-evals scores it, "fit"."""
+def probe_set(name: str) -> ProbeSet:
+    """The labelled blocks of probe set name, by role."""
     assert name in PROBE_SETS, f"no probe set {name!r}: {list(PROBE_SETS)}"
     return PROBE_SETS[name]
 
@@ -207,7 +215,7 @@ VAL_SETS = {"hemibrain_eb": "hemibrain_eb", "hemibrain_wide": "hemibrain_eb", "f
 def val_blocks(family: TrainData) -> list[ProbeVolume]:
     """The held-out blocks of a training family (not a joint set) whose validation loss is measured (VAL_SETS)."""
     blocks = probe_set(VAL_SETS[family])
-    return blocks["train"] + blocks["test"]
+    return [blocks.fit, *blocks.test]
 
 
 def held_out(name: str) -> HeldOut:

@@ -6,6 +6,16 @@ Finetune, the model and weights they name), training.py, evals.py (pca, probe, v
 Each job is an entrypoint taking its spec or the path of the spec's json, e.g. `run outdir/.../train.json`: called in-process
 with the spec, or as an LSF job with the file that submit() writes, so any job can submit another.
 `python experiment.py` or `-h` lists the entrypoints (ENTRYPOINTS, at the bottom).
+
+The pipeline, per trunk (a Train in roots()); the data of each task is named by its role in lib.data (TASKS below has them all):
+    run(trunk):                                  # pretrain on the TrainData volumes (images, no labels)
+        train(trunk)                             #   a checkpoint at each milestone, evaluated as it is saved (eval_milestone)
+        for checkpoint in milestones + the end:
+            pca(checkpoint)                      # a held-out crop's token embeddings, as colours
+            val(checkpoint)                      # pretraining loss: val = held-out blocks, train = the training volumes
+            probe(checkpoint)                    # fit block -> a Linear to the affinities; scored on the test blocks
+    finetune(checkpoint)                         # fit block -> a UNETR on the encoder; scored on the test blocks
+    score(probe | finetune)                      # the post-processing's parameters chosen on the tune block, applied to the test blocks
 Analysis of the results lives in analysis_utils.py (readers), analysis_plots.py (report cards) and reports/ (one page per experiment)."""
 
 from __future__ import annotations
@@ -18,6 +28,7 @@ import json
 import re
 import shutil
 from pathlib import Path
+from typing import NamedTuple
 
 
 # local
@@ -45,6 +56,27 @@ SCORE_CONFIG = "mia_evals/gary_comparison_neuron_instance/mws.toml"  # ours: tru
 # score() runs mia-evals from this sister checkout, with its own .venv (`uv sync` there) and its own commit, which
 # mia-evals records in each score's provenance (mia_evals_commit). Not a dependency of this repo.
 MIA_EVALS = Path.home() / "proj/mia-evals"
+
+class Task(NamedTuple):
+    """One task of the pipeline: the specs it runs on, where, and the data it uses (a role of lib.data's ProbeSet, or TrainData)."""
+    spec: type | tuple[type, ...]  # the spec(s) its entrypoint takes
+    where: str  # "train": the spec's own GPUs (torchrun); "gpu": one, on the trained run's queue; "cpu": SCORE_QUEUE
+    minutes: int  # LSF wall limit (a run with max_hours: that + 60)
+    data: str  # what it reads
+    writes: str  # into its savedir
+
+# Every LSF task, in pipeline order: submit() reads where and minutes, `python experiment.py -h` the rest.
+TASKS = {
+    "run": Task(Train, "train", 15, "train: the spec's TrainData volumes, sampled (images only); then its end's evals", "checkpoints/, metrics.json, and its evals'"),
+    "benchmark": Task(Train, "train", 15, "train: as run, no evals", "performance.json, profile.out"),
+    "pca": Task(Eval, "gpu", 30, "held-out crop of the probe_on set's dataset (lib.data.HELD_OUT), images only", "pca.json, pca2.png"),
+    "pca_sizes": Task(Eval, "gpu", 60, "as pca, at several input sizes", "pca_sizes.json, pca_tile_<side>.png"),
+    "val": Task(Eval, "gpu", 30, "val: the held-out blocks of each training family; train: its training volumes (images only)", "val.json"),
+    "probe": Task(Eval, "gpu", 60, "fit: the probe set's fit block; test: its test blocks; with score, the tune block's predictions too", "probe.json, probe_fit.json, probe.png; with score probe/{fit,test}/"),
+    "finetune": Task(Finetune, "gpu", 120, "fit: the probe set's fit block (or its fit_side cube); test: its test blocks, scored as it fits", "finetune_curve.json, finetune.png; with score probe/{fit,test}/"),
+    "tiles": Task(Finetune, "gpu", 120, "as finetune, test: its first test block, the fit unscored", "tiles.png"),
+    "score": Task((Eval, Finetune), "cpu", SCORE_MINUTES, "tune: where the post-processing's parameters are chosen; test: where they are applied once", "mia_evals/<task>/records/*.json"),
+}
 
 # This experiment's id (README: experiment ids): its roots are outdir/<EXPERIMENT>/d<i>/, a trunk's branches in its own dir.
 EXPERIMENT = "e00/e12-cellmap-qknorm-lrdecay-12h"
@@ -292,39 +324,40 @@ def bsub(savedir: str, job: str, minutes: int, n_gpus: int, queue: str, cmd: str
 
 def submit(fn: str, job: Spec, after: str = ""):
     """Run the entrypoint fn on the spec job as an LSF job: job written to its savedir (dump: train.json, eval.json or
-    finetune.json), and `experiment.py <fn> <that file>` submitted (bsub), which loads it. Resources by fn: run and benchmark,
-    a training job on job's queue and GPUs (torchrun); pca, pca_sizes, probe, finetune and tiles, one GPU on the trained run's queue;
-    score, a CPU job on SCORE_QUEUE. A finetune of one of this experiment's own trunks waits in LSF for the trunk's run job,
-    unless the trunk is done (its own probe.json is written). No commit check: callers from the shared checkout (submitall,
-    lsf) assert_committed() first; a job submitting one is committed code. after: the name of an LSF job a score waits for (start)."""
-    b1 = fn in ("run", "benchmark") and isinstance(job, Train)
-    b2 = fn in ("pca", "pca_sizes", "probe", "val", "score") and isinstance(job, Eval)
-    b3 = fn in ("finetune", "tiles", "score") and isinstance(job, Finetune)
-    assert b1 or b2 or b3, (f"{job.savedir}: no LSF job {fn!r} for a {type(job).__name__} (run and benchmark take a Train; pca, pca_sizes, "
-                            f"probe, val and score an Eval; finetune, tiles and score a Finetune)")
+    finetune.json), and `experiment.py <fn> <that file>` submitted (bsub), which loads it. Resources by TASKS[fn].where: a training
+    job on job's queue and GPUs (torchrun), one GPU on the trained run's queue, or a CPU job on SCORE_QUEUE. A finetune of one of this
+    experiment's own trunks waits in LSF for the trunk's run job, unless the trunk is done (its own probe.json is written). No
+    commit check: callers from the shared checkout (submitall, lsf) assert_committed() first; a job submitting one is committed
+    code. after: the name of an LSF job a score waits for (start)."""
+    task = TASKS[fn]
+    assert isinstance(job, task.spec), f"{job.savedir}: no LSF job {fn!r} for a {type(job).__name__} (it takes {task.spec}): {list(TASKS)}"
     assert not isinstance(job, Train) or job.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={job.n_workers} leaves no core for the training process"
     spec = dump(job)
-    if isinstance(job, Train):
-        # Slack: startup, final checkpoint, pca + probe. A run without max_hours (a fixed step count) or a benchmark: 15 min.
-        minutes = int(job.max_hours * 60) + 60 if job.max_hours and fn == "run" else 15
+    cmd = f"python {{code}}/experiment.py {fn} {spec}"
+    if task.where == "train":
+        # Slack: startup, final checkpoint, pca + probe. A run without max_hours (a fixed step count) or a benchmark: task.minutes.
+        minutes = int(job.max_hours * 60) + 60 if job.max_hours and fn == "run" else task.minutes
         bsub(job.savedir, fn, minutes, job.n_gpus, job.queue, f"torchrun --standalone --nproc_per_node={job.n_gpus} {{code}}/experiment.py {fn} {spec}")
-    elif fn == "score":
-        bsub(job.savedir, fn, SCORE_MINUTES, 0, SCORE_QUEUE, f"python {{code}}/experiment.py score {spec}", slots=SCORE_SLOTS, after=after)
+    elif task.where == "cpu":
+        bsub(job.savedir, fn, task.minutes, 0, SCORE_QUEUE, cmd, slots=SCORE_SLOTS, after=after)
     else:
-        b4 = job.init_from.startswith(f"outdir/{EXPERIMENT}/")
-        b5 = not (Path(job.init_from) / "probe.json").is_file()
-        after = job_name(job.init_from, "run") if isinstance(job, Finetune) and b4 and b5 else ""
-        bsub(job.savedir, fn, {"pca": 30, "pca_sizes": 60, "probe": 60, "val": 30, "finetune": 120, "tiles": 120}[fn], 1, job.train.queue, f"python {{code}}/experiment.py {fn} {spec}",
-             after=after)
+        b1 = isinstance(job, Finetune) and job.init_from.startswith(f"outdir/{EXPERIMENT}/")
+        b2 = not (Path(job.init_from) / "probe.json").is_file()
+        bsub(job.savedir, fn, task.minutes, 1, job.train.queue, cmd, after=job_name(job.init_from, "run") if b1 and b2 else "")
+
+def jobs(p: Spec) -> list[str]:
+    """The tasks start() submits for p, in pipeline order: a training run (which evals itself after), an eval's (Eval.jobs: pca and
+    probe, unless it says otherwise), or a finetune and, if its artifacts are to be scored, the score."""
+    if isinstance(p, Train):
+        return ["run"]
+    return [*p.jobs] if isinstance(p, Eval) else ["finetune", "score"] if p.score else ["finetune"]
 
 def start(p: Spec):
-    """Submit p fresh: its savedir emptied (old contents -> outdir/.trash/), then its jobs: a training run (which evals itself
-    after), an eval's jobs (Eval.jobs: pca and probe, unless it says otherwise), or a finetune (with Finetune.score, its score job after it)."""
+    """Submit p fresh: its savedir emptied (old contents -> outdir/.trash/), then its jobs. A score waits for the job that wrote its
+    artifacts, the probe or the finetune."""
     trash(p.savedir)
-    for fn in ["run"] if isinstance(p, Train) else ["finetune"] if isinstance(p, Finetune) else p.jobs:
-        submit(fn, p)
-    if isinstance(p, Finetune) and p.score:  # its artifacts are scored once the finetune has written them
-        submit("score", p, after=job_name(p.savedir, "finetune"))
+    for fn in jobs(p):
+        submit(fn, p, after=job_name(p.savedir, "probe" if isinstance(p, Eval) else "finetune") if fn == "score" else "")
 
 def lsf(fn: str, target: int | str):
     """Redo one job on LSF, of roots()[target] or of the spec file target names (any run's, e.g. a milestone eval's
@@ -415,6 +448,8 @@ if __name__ == "__main__":
     if len(sys.argv) == 1 or sys.argv[1] in ("-h", "--help"):
         for name, f in names.items():
             print(f"  {name}{inspect.signature(f)}  {(f.__doc__ or '').strip().splitlines()[0]}")
+            if name in TASKS:
+                print(f"      data: {TASKS[name].data}\n      writes: {TASKS[name].writes}")
         sys.exit()
     assert sys.argv[1] in names, f"unknown entrypoint {sys.argv[1]!r}: {', '.join(names)}"
     log_command(sys.argv)  # commands issued outside jobs -> outdir/_log/commands.jsonl; jobs use runs.json

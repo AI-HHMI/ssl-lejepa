@@ -25,7 +25,8 @@ BOXES = {"train": [[24, 56], [24, 56], [24, 56]], "fit": [[20, 52], [24, 56], [2
 def synthetic_store(tmp_path, monkeypatch, sets=None):
     """A 64^3 store in x y z at 8 nm, like the hemibrain crop: raw a gradient in x, two objects split at x = 40. The probe
     reads it through a stand-in for read_window (the real one reads OME-zarr through miao; checked on the cluster): the
-    same z y x windows about a centre, edge-replicated (labels 0) outside. Probe sets: hemibrain_eb on BOXES, plus sets."""
+    same z y x windows about a centre, edge-replicated (labels 0) outside. Probe sets: hemibrain_eb on BOXES (BOXES' train is its
+    fit block, its fit the tune block), plus sets: {name: {"fit": volume args, "test": [volume args], "tune"?: volume args}}."""
     x, y, z = np.meshgrid(*[np.arange(64)] * 3, indexing="ij")
     raw, lab = torch.from_numpy((x * 4).astype(np.uint8)).permute(2, 1, 0).float() / 255, torch.from_numpy(1 + (x >= 40)).permute(2, 1, 0).long()
 
@@ -37,8 +38,10 @@ def synthetic_store(tmp_path, monkeypatch, sets=None):
         return img, torch.nn.functional.pad(lab[a[0]:b[0], a[1]:b[1], a[2]:b[2]], pad, value=0)
 
     vol = lambda name, box, annotated=None: lib.data.ProbeVolume(name, str(tmp_path / "crop.zarr"), "cells", box, annotated=annotated)
-    monkeypatch.setattr(lib.data, "PROBE_SETS", {"hemibrain_eb": {s: [vol(f"hemibrain_eb_{s}", BOXES[s], BOXES[s] if s != "train" else None)] for s in BOXES},
-                                                 **{name: {s: [vol(*v) for v in vs] for s, vs in splits.items()} for name, splits in (sets or {}).items()}})
+    hemibrain = {s: vol(f"hemibrain_eb_{s}", BOXES[s], BOXES[s] if s != "train" else None) for s in BOXES}
+    monkeypatch.setattr(lib.data, "PROBE_SETS", {"hemibrain_eb": lib.data.ProbeSet(fit=hemibrain["train"], test=[hemibrain["test"]], tune=hemibrain["fit"]),
+                                                 **{name: lib.data.ProbeSet(fit=vol(*roles["fit"]), test=[vol(*v) for v in roles["test"]], tune=vol(*roles["tune"]) if "tune" in roles else None)
+                                                    for name, roles in (sets or {}).items()}})
     monkeypatch.setattr(lib.readers, "volume_grid", lambda vol: (np.array([8.0, 8.0, 8.0]), np.array([64, 64, 64])))
     monkeypatch.setattr(lib.readers, "read_window", read_window)
     monkeypatch.setattr(lib.probe, "FIT_STEPS", 300)  # the linear probe's fit: plenty for the store's one split
@@ -61,8 +64,9 @@ def test_sparse_labels_score_a_labelled_cell_against_unlabelled_as_a_boundary():
     assert aff[0, 0, 0].tolist() == [True, False, False, False, False, False]  # same object only within cell 1
     assert dense[0, 0, 0].tolist() == [True, False, False, False, False, False]  # both labelled: cell 1's inside only
     assert sparse[0, 0, 0].tolist() == [True, True, True, True, False, False]  # one labelled: its edges too, not 0 vs 0
-    assert all(v.sparse for s in lib.data.PROBE_SETS.values() for vs in s.values() for v in vs if not v.name.startswith("hemibrain"))
-    assert not any(v.sparse for vs in lib.data.PROBE_SETS["hemibrain_eb"].values() for v in vs)  # dense proofread: unchanged
+    blocks = lambda s: [s.fit, *s.test, *([s.tune] if s.tune else [])]
+    assert all(v.sparse for n, s in lib.data.PROBE_SETS.items() if n != "hemibrain_eb" for v in blocks(s))
+    assert not any(v.sparse for v in blocks(lib.data.PROBE_SETS["hemibrain_eb"]))  # dense proofread: unchanged
 
 
 def test_tokens_voxels_round_trip():
@@ -181,7 +185,7 @@ def test_finetune_writes_the_score_artifacts_only_when_asked(tmp_path, monkeypat
 
 def test_probe_on_another_set_averages_its_test_blocks(tmp_path, monkeypatch):
     """A probe set with two test blocks: scored on each, averaged; one png each. Its boxes are cut to whole patches."""
-    synthetic_store(tmp_path, monkeypatch, {"two": {"train": [("two_train", [[24, 56], [24, 56], [24, 56]])],
+    synthetic_store(tmp_path, monkeypatch, {"two": {"fit": ("two_train", [[24, 56], [24, 56], [24, 56]]),
                                                     "test": [("two_a", [[22, 57], [24, 56], [24, 56]]), ("two_b", [[24, 56], [24, 56], [8, 40]])]}})
     par = specs.Eval(savedir=str(tmp_path / "run"), train=specs.Train(global_size=(24, 24, 24)), probe_on="two")
     (tmp_path / "run").mkdir()
@@ -193,13 +197,13 @@ def test_probe_on_another_set_averages_its_test_blocks(tmp_path, monkeypatch):
     frac = stats["boundary_frac_(1, 0, 0)"]
     assert abs(frac - 1 / 31) < 0.003 and stats["boundary_frac_(0, 1, 0)"] == 0
     assert (tmp_path / "run/probe.png").is_file() and (tmp_path / "run/probe_two_b.png").is_file()
-    with pytest.raises(AssertionError, match="no mia-evals fit block for two"):
+    with pytest.raises(AssertionError, match="no mia-evals tune block for two"):
         evals.probe(specs.Eval(savedir=str(tmp_path / "run"), train=par.train, probe_on="two", score=True), model, 7)
 
 
-def test_score_artifacts_of_any_set_with_a_fit_block_are_named_for_it(tmp_path, monkeypatch):
+def test_score_artifacts_of_any_set_with_a_tune_block_are_named_for_it(tmp_path, monkeypatch):
     box = [[24, 56], [24, 56], [24, 56]]
-    synthetic_store(tmp_path, monkeypatch, {"three": {"train": [("three_train", box)], "fit": [("three_fit", box, [[20, 60]] * 3)], "test": [("three_test", box, [[22, 58]] * 3)]}})
+    synthetic_store(tmp_path, monkeypatch, {"three": {"fit": ("three_train", box), "tune": ("three_fit", box, [[20, 60]] * 3), "test": [("three_test", box, [[22, 58]] * 3)]}})
     (tmp_path / "run").mkdir()
     evals.probe(specs.Eval(savedir=str(tmp_path / "run"), train=specs.Train(global_size=(24, 24, 24)), probe_on="three", score=True), Lejepa(TINY).eval(), 7)
     art = zarr.open_array(str(tmp_path / "run/probe/test/three_test.zarr"), mode="r")
