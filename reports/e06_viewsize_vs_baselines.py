@@ -5,7 +5,7 @@ best view sizes so far (input 128, 2 globals and 4 locals of 96). How does the m
 token sees, and how does it compare with the two? Training FLOPs per sample span ~100x across the six runs, so equal hours
 are not equal steps: read the probe against compute as well as against step."""
 
-from reports import anticollapse, page
+from reports import e03_anticollapse, page
 
 SWEEP = "e00/e06-viewsize-vs-baselines"
 
@@ -44,7 +44,7 @@ def label(p: dict) -> str:
 
 
 def main():
-    tiles, sections = anticollapse.build(SWEEP, label=label)
+    tiles, sections = e03_anticollapse.build(SWEEP, label=label)
     page.write(SWEEP, __doc__, tiles, [("Findings", [("What e06 shows", FINDINGS)]), *sections])
 
 

@@ -4,7 +4,7 @@ effective rank fell. Two suspects, swept: the learning rate (1e-4, 3e-5, 1e-5, h
 1.9e-5 at batch 32) and the decoder (mia-train's default 192 x 2, the MAE paper's 512 x 8, which it found gives a better
 linear probe). 4 h on one B300 each, batch 32."""
 
-from reports import anticollapse, page
+from reports import e03_anticollapse, page
 
 SWEEP = "e00/e08-mae-fix"
 
@@ -39,7 +39,7 @@ def label(p: dict) -> str:
 
 
 def main():
-    tiles, sections = anticollapse.build(SWEEP, label=label)
+    tiles, sections = e03_anticollapse.build(SWEEP, label=label)
     page.write(SWEEP, __doc__, tiles, [("Findings", [("What e08 shows", FINDINGS)]), *sections])
 
 

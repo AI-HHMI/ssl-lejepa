@@ -28,7 +28,7 @@ def cell(p: dict) -> str:
 
 
 def build(sweep: str = SWEEP, label=cell) -> tuple:
-    """Return (tiles, sections) for page.write: of this sweep, or another of the same shape (reports/sigreg_both.py), its
+    """Return (tiles, sections) for page.write: of this sweep, or another of the same shape (reports/e04_sigreg_both.py), its
     trunks named by label(params) (cell's names for e03-e05's masked-token grids)."""
     # Since e04 a trunk's milestone evals nest in it (<trunk>/step_*/); before, they were sibling dN/ dirs.
     params = {e: run_params(e) for d in run_dirs(sweep) for e in [d, *sorted(d.glob("step_*/"))]}

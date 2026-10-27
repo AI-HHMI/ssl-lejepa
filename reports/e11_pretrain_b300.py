@@ -8,7 +8,7 @@ from pathlib import Path
 
 import plots_interactive as pi
 from analysis_utils import boundary_ap, probe_stats, read_jsonl, run_dirs, run_params
-from reports import anticollapse, page
+from reports import e03_anticollapse, page
 
 SWEEP = "e00/e11-pretrain-b300-48h"
 E10 = "e00/e10-finetune-gap"
@@ -128,7 +128,7 @@ def throughput() -> tuple:
 
 
 def main():
-    tiles, sections = anticollapse.build(SWEEP, label=label)
+    tiles, sections = e03_anticollapse.build(SWEEP, label=label)
     sections = [("Findings", [("What e11 shows so far", FINDINGS)]), ("Against e10", against_e10() + [throughput()]), ("Probe fit trajectories", probe_fits()), *sections]
     page.write(SWEEP, __doc__, tiles, sections)
 

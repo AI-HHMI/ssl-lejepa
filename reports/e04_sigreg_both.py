@@ -4,7 +4,7 @@ together neither passes. Eight 2 h trunks: mask block (0.3, 0.6) x pull (lamb x 
 every 5k-step milestone evaluated as saved. Does a linear probe now find content, above the boundary base rate and a random
 encoder? In the PCA maps a position code is a lattice identical on every crop, and a sample code one flat colour per crop."""
 
-from reports import anticollapse, page
+from reports import e03_anticollapse, page
 
 SWEEP = "e00/e04-sigreg-both"
 
@@ -40,7 +40,7 @@ that only content lines up between them.</p>"""
 
 
 def main():
-    tiles, sections = anticollapse.build(SWEEP)
+    tiles, sections = e03_anticollapse.build(SWEEP)
     page.write(SWEEP, __doc__, tiles, [("Findings", [("What e04 shows", FINDINGS)]), *sections])
 
 

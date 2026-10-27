@@ -3,7 +3,7 @@ from a second view shifted 32 voxels, pull 10, SIGReg "both") with the cube's si
 tokens (0.06% to 77% of the view's tokens), 2 h on one B300 each. The cube must fit both views, so sides 9, 10 and 11 get
 shifts of 24, 16 and 8 voxels instead of 32 and differ in the shift as well. Side 7 is e05's d7 on another GPU."""
 
-from reports import anticollapse, page
+from reports import e03_anticollapse, page
 
 SWEEP = "e00/e07-mask-side"
 
@@ -32,7 +32,7 @@ def label(p: dict) -> str:
 
 
 def main():
-    tiles, sections = anticollapse.build(SWEEP, label=label)
+    tiles, sections = e03_anticollapse.build(SWEEP, label=label)
     page.write(SWEEP, __doc__, tiles, [("Findings", [("What e07 shows", FINDINGS)]), *sections])
 
 
