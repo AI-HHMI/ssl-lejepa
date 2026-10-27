@@ -1,0 +1,223 @@
+<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>e00/metric-examples report</title><style>
+body{font:15px system-ui,sans-serif;max-width:1200px;margin:0 auto;padding:16px;color:#222;background:#fff}
+h1{margin-bottom:4px} h2{margin-top:36px;border-bottom:1px solid #ddd;padding-bottom:4px}
+.tiles{display:flex;flex-wrap:wrap;gap:12px} .tile{border:1px solid #ddd;border-radius:6px;padding:10px 16px}
+.tile b{display:block;font-size:24px} .grid{display:flex;flex-wrap:wrap;gap:20px}
+.card{flex:1 1 460px;min-width:0} .card.wide{flex-basis:100%} .card svg{max-width:100%;height:auto} h3{margin:8px 0 4px;font-size:15px}
+table{border-collapse:collapse;font-size:13px} th,td{padding:3px 10px;border-bottom:1px solid #eee;text-align:left}
+td.n,th{text-align:right} th:first-child{text-align:left}
+h1,h2{scroll-margin-top:16px} nav.toc{display:none}
+a.home{font-size:13px;color:#0072B2;text-decoration:none} a.home:hover{text-decoration:underline}
+@media (min-width:1100px){
+  body{max-width:none}
+  .layout{display:grid;grid-template-columns:230px minmax(0,1200px);gap:32px;max-width:1500px;margin:0 auto}
+  nav.toc{display:block;position:sticky;top:16px;align-self:start;max-height:calc(100vh - 32px);overflow:auto;font-size:14px}
+  nav.toc b{display:block;margin:0 0 8px 12px;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:#888}
+  nav.toc a{display:block;padding:5px 10px 5px 12px;color:#555;text-decoration:none;border-left:2px solid #eee}
+  nav.toc a:hover{color:#222;border-left-color:#bbb} nav.toc a.on{color:#0072B2;border-left-color:#0072B2;font-weight:600}
+}
+
+ul.entries{list-style:none;margin:6px 0 0;padding:0}
+ul.entries li{display:grid;grid-template-columns:96px 1fr;column-gap:16px;padding:10px 14px;margin:0 0 8px;
+  border-left:3px solid #0072B2;border-radius:0 6px 6px 0;background:#fafafa;transition:background .15s}
+ul.entries li:hover{background:#eef5fb}
+ul.entries time{grid-row:span 2;color:#888;font:12px ui-monospace,monospace;padding-top:3px;line-height:1.5}
+ul.entries time code{color:#aaa;font-size:11px}
+ul.entries a{font-weight:600;color:#0072B2;text-decoration:none} ul.entries a:hover{text-decoration:underline}
+ul.entries p{margin:3px 0 0;color:#555;font-size:13.5px;line-height:1.45;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+</style></head><body><div class='layout'><nav class='toc'><b>Contents</b><a href='#overview'>Overview</a><a href='#findings'>Findings</a><a href='#metrics-by-mistake'>Metrics by mistake</a><a href='#examples'>Examples</a></nav><main><a class=home href='../../../index.html'>&larr; All reports</a><h1 id='overview'>e00/metric-examples report</h1><p>Instance-segmentation metrics on a real crop with one kind of mistake added at a time. `make` (on the cluster, where the
+data is) reads a hemibrain EB test crop, corrupts its ground-truth labels in eight ways, scores each corrupted labelling
+with mia-evals' voxel_instance metrics (PQ, SQ, RQ, VOI split and merge, adapted Rand error) and with boundary AP as a
+hard prediction (the probe's metric: short is the mean of the +1 channels, long of the +10), and draws each against the
+EM; `main` builds the page. Which mistake costs which metric?</p><div class='tiles'><div class='tile'><b>15</b>objects in the crop</div></div><h2 id='findings'>Findings</h2><div class='grid'><div class='card wide'><h3>What each metric penalizes, in this crop</h3><ul>
+<li><b>PQ and RQ count objects; VOI and Rand error count voxels.</b> 300 specks cost PQ 0.999 to 0.091 (RQ 0.091: each speck is a false
+object) and VOI 0.02, Rand error 0.001. Deleting the smaller half of the objects costs PQ 0.636 (RQ) and Rand error 0.001. This is
+why the size filter decides PQ in mws.toml while VOI barely moves. SQ is 0.999 and 1.0 in both: the matched objects are exact.</li>
+<li><b>One big merge or split is a small mistake to PQ and a large one to VOI.</b> Cutting the largest object in two: PQ 0.955 (one object of
+15 is wrong), VOI split 0.27, Rand error 0.095. Merging it with its neighbour: PQ 0.935, VOI merge 0.66, Rand error 0.299. VOI names the
+direction (split or merge, never both here); PQ and Rand error do not. Rand error and VOI weight a mistake by the voxels it touches.</li>
+<li><b>Shattering is the worst for everything:</b> PQ 0.082 (RQ 0.096: no piece overlaps its object by IoU above 0.5; SQ 0.849 for the few that
+do), VOI split 4.37, Rand error 0.917.</li>
+<li><b>Boundary placement shows in SQ and in short-range AP, little elsewhere.</b> Every object shifted 2 voxels: Rand error 0.056 and
+VOI 0.34 / 0.25, but PQ 0.692 (SQ 0.798, and RQ 0.867 as small objects drop under IoU 0.5) and short-range AP 0.046 (the +1 pairs
+are all at the boundaries) against long-range AP 0.655. A 1-voxel gap between objects: PQ 0.709, short AP 0.213, long AP 0.734.
+Long AP is the more tolerant: its +10 pairs straddle boundaries by a margin.</li>
+<li><b>AP here is of hard labellings</b> (the probe's soft predictions would score differently). Specks barely move it (short 0.933, long
+0.986); deleting objects costs short AP 0.466 against long 0.934 (an erased voxel has no same-object pairs at +1, and few at +10).</li>
+</ul>
+<p><b>Caveats.</b> One crop, a few large objects: a 1 µm³ crop has 15 objects, so one mistake is a large share of its PQ; the
+eight mistakes are synthetic, a real segmentation makes several at once; the crop is of the hemibrain EB test block, which the
+probe is scored on.</p></div></div><h2 id='metrics-by-mistake'>Metrics by mistake</h2><div class='grid'><div class='card wide'><h3>Higher is better for pq, sq, rq and AP; lower for VOI and adapted Rand error</h3><table class='sortable' data-interactive><thead><tr><th>mistake</th><th>pq</th><th>sq</th><th>rq</th><th>voi_split</th><th>voi_merge</th><th>adapted_rand_error</th><th>ap_short</th><th>ap_long</th></tr></thead><tbody><tr><td>exact</td><td>1.000</td><td>1.000</td><td>1.000</td><td>0.000</td><td>0.000</td><td>0.000</td><td>1.000</td><td>1.000</td></tr><tr><td>shifted</td><td>0.692</td><td>0.798</td><td>0.867</td><td>0.338</td><td>0.251</td><td>0.056</td><td>0.046</td><td>0.655</td></tr><tr><td>eroded</td><td>0.709</td><td>0.857</td><td>0.828</td><td>0.299</td><td>0.162</td><td>0.047</td><td>0.213</td><td>0.734</td></tr><tr><td>split</td><td>0.955</td><td>0.987</td><td>0.968</td><td>0.269</td><td>0.000</td><td>0.095</td><td>0.929</td><td>0.933</td></tr><tr><td>merge</td><td>0.935</td><td>0.969</td><td>0.966</td><td>0.000</td><td>0.660</td><td>0.299</td><td>0.802</td><td>0.841</td></tr><tr><td>shattered</td><td>0.082</td><td>0.849</td><td>0.096</td><td>4.374</td><td>0.000</td><td>0.917</td><td>0.405</td><td>0.367</td></tr><tr><td>dust</td><td>0.091</td><td>0.999</td><td>0.091</td><td>0.020</td><td>0.000</td><td>0.001</td><td>0.933</td><td>0.986</td></tr><tr><td>missed small</td><td>0.636</td><td>1.000</td><td>0.636</td><td>0.000</td><td>0.038</td><td>0.001</td><td>0.466</td><td>0.934</td></tr></tbody></table></div></div><h2 id='examples'>Examples</h2><div class='grid'><div class='card'><h3>exact: The ground truth itself: every metric at its best. Columns: EM | truth | labelling | boundaries (green both, red missed, blue extra); z 64</h3><img style='max-width:100%' src='../../../outdir/e00/metric-examples/exact.png'></div><div class='card'><h3>shifted: Every object moved 2 voxels in x: all boundaries in the right place up to 2 voxels, no object wrong. Columns: EM | truth | labelling | boundaries (green both, red missed, blue extra); z 64</h3><img style='max-width:100%' src='../../../outdir/e00/metric-examples/shifted.png'></div><div class='card'><h3>eroded: A 1-voxel gap (label 0) between touching objects, as thresholding or watershed leave: objects slightly small. Columns: EM | truth | labelling | boundaries (green both, red missed, blue extra); z 64</h3><img style='max-width:100%' src='../../../outdir/e00/metric-examples/eroded.png'></div><div class='card'><h3>split: The largest object cut in two by an x plane: one split. Columns: EM | truth | labelling | boundaries (green both, red missed, blue extra); z 63</h3><img style='max-width:100%' src='../../../outdir/e00/metric-examples/split.png'></div><div class='card'><h3>merge: The largest object merged with the neighbour it touches most: one merge. Columns: EM | truth | labelling | boundaries (green both, red missed, blue extra); z 63</h3><img style='max-width:100%' src='../../../outdir/e00/metric-examples/merge.png'></div><div class='card'><h3>shattered: Every object cut into pieces by a 32-voxel grid: many splits, each piece a plausible object. Columns: EM | truth | labelling | boundaries (green both, red missed, blue extra); z 64</h3><img style='max-width:100%' src='../../../outdir/e00/metric-examples/shattered.png'></div><div class='card'><h3>dust: 300 small (2^3) fragments of new ids inside objects: a speck is a false object. Columns: EM | truth | labelling | boundaries (green both, red missed, blue extra); z 73</h3><img style='max-width:100%' src='../../../outdir/e00/metric-examples/dust.png'></div><div class='card'><h3>missed small: The smaller half of the objects (by count) deleted: tiny share of voxels, half of the objects. Columns: EM | truth | labelling | boundaries (green both, red missed, blue extra); z 64</h3><img style='max-width:100%' src='../../../outdir/e00/metric-examples/missed_small.png'></div></div></main></div><script>
+const links = [...document.querySelectorAll('nav.toc a')];
+const targets = links.map(a => document.querySelector(a.getAttribute('href')));
+function mark() {
+  let cur = 0;
+  targets.forEach((t, i) => { if (t.getBoundingClientRect().top <= 120) cur = i; });
+  links.forEach((a, i) => a.classList.toggle('on', i === cur));
+}
+addEventListener('scroll', mark, {passive: true});
+mark();
+</script><style>
+div.axes{font-size:10px;color:#999;text-align:right;line-height:1} div.axes label{margin-left:10px;cursor:pointer}
+div.axes input,#interactive input{appearance:none;margin:0 3px 0 0;width:8px;height:8px;border:1px solid #999;border-radius:50%;vertical-align:-1px;cursor:pointer}
+div.axes input:checked,#interactive input:checked{background:#0072B2;border-color:#0072B2}
+#interactive{position:fixed;top:8px;right:12px;z-index:999;font-size:11px;color:#999;cursor:pointer;background:#fff;padding:2px 6px}
+body.static div.axes{visibility:hidden} body.static table.sortable th,body.static table.imggrid img.zoom{cursor:auto}
+table.sortable th{cursor:pointer;user-select:none} table.sortable th.asc::after{content:" \25B4"} table.sortable th.desc::after{content:" \25BE"}
+table.imggrid{table-layout:fixed;width:100%} table.imggrid th:first-child{width:64px} table.imggrid td{vertical-align:top}
+table.imggrid img.zoom{cursor:zoom-in;border:1px solid #ddd;width:100%;max-width:220px;height:auto;box-sizing:border-box}
+#viewer{position:fixed;inset:0;background:rgba(0,0,0,.93);display:none;z-index:1000;cursor:grab;overflow:hidden}
+#viewer.open{display:block} #viewer img{position:absolute;left:0;top:0;image-rendering:pixelated}
+#viewer-panel{position:fixed;top:0;left:0;bottom:0;width:240px;box-sizing:border-box;padding:10px 12px;overflow:auto;color:#ddd;font-size:13px;background:rgba(0,0,0,.6);z-index:1001;cursor:default}
+#viewer-panel .lyr{margin:10px 0} #viewer-panel input[type=range]{display:block;width:100%;margin:3px 0 0} #viewer-panel .hint{margin-top:16px;color:#999;font-size:11px}
+</style><label id='interactive'><input type='checkbox'>interactive</label><div id='viewer'><div id='viewer-panel'></div></div><script src='https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js'></script><script>
+// The corner "interactive" toggle: off, every chart is redrawn static (no zoom, pan or tooltips; it keeps its current
+// view) and sorting and the image viewer stop. It starts as the page was written (runtime(interactive)).
+var ON = true;
+function config() { return {responsive: true, scrollZoom: ON, displaylogo: false, staticPlot: !ON}; }
+document.querySelectorAll("div.iplot").forEach(function(div) {  // one bad figure must not blank the others
+  try {
+    var d = JSON.parse(document.getElementById(div.id + "-data").textContent);
+    Plotly.newPlot(div, d.data, d.layout, config());
+  } catch (e) { div.textContent = "chart failed to draw: " + e; }
+});
+(function() {
+  var box = document.querySelector("#interactive input");
+  function set(on) {
+    ON = on; box.checked = on; document.body.classList.toggle("static", !on);
+    document.querySelectorAll("div.iplot").forEach(function(div) { Plotly.react(div, div.data, div.layout, config()); });
+  }
+  box.addEventListener("change", function() { set(box.checked); });
+  set(ON);
+})();
+document.addEventListener("change", function(e) {  // a log-scale checkbox, or a subset radio, above a plot
+  var label = e.target.closest && e.target.closest("div.axes label");
+  if (!label) return;
+  if (label.dataset.subset !== undefined) {  // show that subset's traces (and any trace in none)
+    var div = document.getElementById(label.parentNode.dataset.plot);
+    Plotly.restyle(div, {visible: div.data.map(function(t) { return !t.meta || t.meta === label.dataset.subset; })});
+    return;
+  }
+  var u = {}; u[label.dataset.axis + "axis.type"] = e.target.checked ? "log" : "linear";
+  Plotly.relayout(label.parentNode.dataset.plot, u);
+});
+
+// Click a header to sort its column (descending first, then toggling); numbers compare as numbers and stay above
+// text (e.g. "—" for missing) either way.
+document.addEventListener("click", function(e) {
+  var th = e.target.closest && e.target.closest("table.sortable th");
+  if (!th || !ON) return;
+  var t = th.closest("table"), i = th.cellIndex, dir = th.classList.contains("desc") ? 1 : -1;
+  var body = t.tBodies[0], rows = Array.prototype.slice.call(body.rows);
+  function key(r) { var s = r.cells[i] ? r.cells[i].textContent : "", n = parseFloat(s.replace(/,/g, "")); return isNaN(n) ? s : n; }
+  rows.sort(function(a, b) {
+    var x = key(a), y = key(b), nx = typeof x === "number", ny = typeof y === "number";
+    if (nx !== ny) return nx ? -1 : 1;
+    return dir * (nx ? x - y : String(x).localeCompare(String(y), undefined, {numeric: true}));
+  });
+  rows.forEach(function(r) { body.appendChild(r); });
+  t.querySelectorAll("th").forEach(function(h) { h.classList.remove("asc", "desc"); });
+  th.classList.add(dir === 1 ? "asc" : "desc");
+});
+
+// Image viewer: click a grid thumbnail to open it full-screen. A panel fixed on the left lists the layers, each with a
+// checkbox and an opacity slider (state kept across cells); every layer is drawn at the first one's size, stacked in
+// order. Layers are the cell's own images or, in a stack grid (data-stack), the column's rows (their first images), where
+// up and down show one row alone. Sized via width/height, not a CSS transform, which the GPU bilinear-filters at high zoom.
+(function() {
+  var V = document.getElementById("viewer"), PANEL = document.getElementById("viewer-panel"), LEFT = 240;  // LEFT: the panel's width
+  var scale = 1, tx = 0, ty = 0, drag = false, lx = 0, ly = 0, curW = 0, curH = 0;
+  var grid = [], names = [], heads = [], stack = false, row = 0, col = 0, layers = [], on = {}, alpha = {};  // on, alpha: layer index -> shown, opacity
+  function esc(s) { return s.replace(/[&<>"]/g, function(c) { return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]; }); }
+  function apply() {
+    var w = layers[0].el.naturalWidth * scale, h = layers[0].el.naturalHeight * scale;
+    layers.forEach(function(l) { var s = l.el.style; s.left = tx + "px"; s.top = ty + "px"; s.width = w + "px"; s.height = h + "px"; });
+  }
+  function fit() {
+    var nw = layers[0].el.naturalWidth || 1, nh = layers[0].el.naturalHeight || 1, aw = V.clientWidth - LEFT;
+    scale = Math.min(aw / nw, V.clientHeight / nh) * 0.95; tx = LEFT + (aw - nw * scale) / 2; ty = (V.clientHeight - nh * scale) / 2;
+    apply();
+  }
+  function loaded() {  // same-size cell: keep zoom and pan, so stepping across the grid compares one spot
+    var b = layers[0].el;
+    if (b.naturalWidth === curW && b.naturalHeight === curH) apply(); else fit();
+    curW = b.naturalWidth; curH = b.naturalHeight;
+  }
+  function paint() {
+    layers.forEach(function(l) {
+      l.el.style.display = on[l.i] !== false ? "" : "none";
+      l.el.style.opacity = alpha[l.i] === undefined ? 1 : alpha[l.i];
+    });
+    var h = "<b>" + esc(stack ? heads[col] : grid[row][col][0].title) + "</b>";
+    layers.slice().reverse().forEach(function(l) {  // top layer first
+      h += "<div class='lyr'><label><input type='checkbox' data-i='" + l.i + "'" + (on[l.i] !== false ? " checked" : "") + "> " + (l.i + 1) + " " + esc(l.name) + "</label>" +
+           "<input type='range' min='0' max='1' step='0.05' data-i='" + l.i + "' value='" + (alpha[l.i] === undefined ? 1 : alpha[l.i]) + "'></div>";
+    });
+    PANEL.innerHTML = h + "<div class='hint'>arrows: grid · 1-9: layers · scroll: zoom · drag: pan · Esc: close</div>";
+  }
+  function only() {  // stack grid: show the current row's layer alone
+    on = {}; grid.forEach(function(_, r) { on[r] = r === row; });
+  }
+  function show() {
+    layers.forEach(function(l) { l.el.remove(); });
+    var srcs = stack ? grid.map(function(cells, r) { return cells[col].length ? {s: cells[col][0], i: r, name: names[r]} : null; })
+                     : grid[row][col].map(function(s, i) { return {s: s, i: i, name: s.alt}; });
+    layers = srcs.filter(Boolean).map(function(x) {
+      var img = document.createElement("img");
+      img.className = "layer"; img.src = x.s.src; img.alt = x.s.alt; img.onload = apply;
+      V.appendChild(img); return {el: img, i: x.i, name: x.name};
+    });
+    paint();
+    if (layers[0].el.complete) loaded(); else layers[0].el.onload = loaded;
+  }
+  function open(el) {
+    var table = el.closest("table"), trs = Array.prototype.slice.call(table.tBodies[0].rows);
+    grid = trs.map(function(tr) {
+      return Array.prototype.slice.call(tr.cells).map(function(td) { return Array.prototype.slice.call(td.querySelectorAll("img")); });
+    });
+    names = trs.map(function(tr) { return tr.cells[0].textContent; });
+    heads = Array.prototype.slice.call(table.tHead.rows[0].cells).map(function(th) { return th.textContent; });
+    stack = !!table.dataset.stack;
+    grid.forEach(function(cells, i) { cells.forEach(function(imgs, j) { if (imgs[0] === el) { row = i; col = j; } }); });
+    if (stack) only();
+    curW = 0; curH = 0; V.classList.add("open"); show();
+  }
+  function move(dr, dc) {  // the next nonempty cell in that direction; stop at the edge
+    for (var r = row + dr, c = col + dc; r >= 0 && r < grid.length && c >= 0 && c < grid[r].length; r += dr, c += dc) {
+      if (grid[r][c].length) { row = r; col = c; if (stack && dr) only(); show(); return; }
+    }
+  }
+  function close() { V.classList.remove("open"); }
+  document.addEventListener("click", function(e) { if (ON && e.target.matches && e.target.matches("table.imggrid img.zoom")) open(e.target); });
+  V.addEventListener("click", function(e) { if (e.target === V) close(); });
+  PANEL.addEventListener("wheel", function(e) { e.stopPropagation(); });  // scroll the panel, don't zoom
+  PANEL.addEventListener("input", function(e) {
+    var i = +e.target.dataset.i;
+    if (e.target.type === "checkbox") { on[i] = e.target.checked; paint(); }
+    else { alpha[i] = +e.target.value; layers.forEach(function(l) { if (l.i === i) l.el.style.opacity = alpha[i]; }); }  // not paint: it would replace the slider mid-drag
+  });
+  document.addEventListener("keydown", function(e) {
+    if (!V.classList.contains("open")) return;
+    if (e.key === "Escape") { close(); return; }
+    var i = "123456789".indexOf(e.key);
+    if (i >= 0 && layers.some(function(l) { return l.i === i; })) { on[i] = on[i] === false; paint(); return; }
+    var d = {ArrowRight: [0, 1], ArrowLeft: [0, -1], ArrowDown: [1, 0], ArrowUp: [-1, 0]}[e.key];
+    if (d) { e.preventDefault(); move(d[0], d[1]); }
+  });
+  V.addEventListener("wheel", function(e) {  // zoom toward the cursor, ~8% per notch
+    e.preventDefault();
+    var f = Math.exp(-e.deltaY * 0.0008);
+    tx = e.clientX - (e.clientX - tx) * f; ty = e.clientY - (e.clientY - ty) * f; scale *= f; apply();
+  }, {passive: false});
+  V.addEventListener("mousedown", function(e) {
+    if (!e.target.classList.contains("layer")) return;
+    drag = true; lx = e.clientX; ly = e.clientY; V.style.cursor = "grabbing"; e.preventDefault();
+  });
+  window.addEventListener("mousemove", function(e) {
+    if (!drag) return;
+    tx += e.clientX - lx; ty += e.clientY - ly; lx = e.clientX; ly = e.clientY; apply();
+  });
+  window.addEventListener("mouseup", function() { drag = false; V.style.cursor = "grab"; });
+})();
+</script></body></html>
