@@ -47,7 +47,7 @@ SCORE_CONFIG = "mia_evals/gary_comparison_neuron_instance/mws.toml"  # ours: tru
 MIA_EVALS = Path.home() / "proj/mia-evals"
 
 # This experiment's id (README: experiment ids): its roots are outdir/<EXPERIMENT>/d<i>/, a trunk's branches in its own dir.
-EXPERIMENT = "e00/e12-cellmap-qknorm-lrdecay-48h"
+EXPERIMENT = "e00/e12-cellmap-qknorm-lrdecay-12h"
 
 def roots() -> list[Spec]:
     """This experiment: the runs it starts from nothing (trunks, other training runs, evals of another experiment's weights).
@@ -58,11 +58,11 @@ def roots() -> list[Spec]:
     # in a region of 128 (shift 32, so 12^3 tokens a view), not 64 in 88. Data: d0-d2 (MAE, masked, views) on lmd5_pow04, e11's
     # lmd4 families and CellMap's organelle EM (lib.data "cellmap", ~10 Tvox: 48% of the samples) weighted by voxel count ^ 0.4;
     # d3 masked on lmd4_pow04, without CellMap, and d4 masked on CellMap alone, to tell what it adds. total_steps is the pace we
-    # expect over 48 h less ~5%, so the lr reaches 0 as the budget ends (a slower run stops before it): e11's for MAE and views
+    # expect over 12 h less ~5%, so the lr reaches 0 as the budget ends (a slower run stops before it): e11's for MAE and views
     # (s/step 0.127 and 0.41); the masked runs' are guessed from e11's (masked 64 on lmd4, 7 H200s: 0.083; on B300: 0.23) x ~4 for
     # 3.4x the tokens a view and a bigger share of attention: `lsf benchmark` d1 and d3 first. Milestones are kept, their evals add
     # a val loss (val.json). d1 and d4 take B300 nodes (8 GPUs, global batch 256), the others 7 GPUs of H200 nodes (global batch 224).
-    BATCH, HOURS = 32, 48
+    BATCH, HOURS = 32, 12
 
     def trunk(objective: Literal["views", "mask", "mae"], data: TrainData, input_size: int, view: int) -> Train:
         p = Train()
@@ -103,7 +103,7 @@ def roots() -> list[Spec]:
     for i in (1, 4):  # the two B300 nodes
         runs[i].n_gpus = 8
         runs[i].queue = "gpu_b300"
-    for i, (p, steps) in enumerate(zip(runs, [1_300_000, 250_000, 400_000, 500_000, 250_000])):
+    for i, (p, steps) in enumerate(zip(runs, [325_000, 62_500, 100_000, 125_000, 62_500])):
         p.total_steps = steps
         p.savedir = f"outdir/{EXPERIMENT}/d{i}/"
     return runs
