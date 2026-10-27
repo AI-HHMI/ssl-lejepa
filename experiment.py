@@ -55,7 +55,7 @@ def roots() -> list[Spec]:
     # e11's recipes again, with a bigger encoder context for the masked tokens, more data, qk_norm (the encoder's queries and keys
     # normalized) and the lr falling linearly from 1e-4 to 0 over total_steps (lr_decay): e11's probes peaked by 160k steps and fell,
     # d3 diverged at 1.2M and d0 went unstable at 1.06M, all with a constant lr. Masked tokens now see the MAE's context: a view of 96
-    # in a region of 128 (shift 32, so 12^3 tokens a view), not 64 in 88. Data: d0-d2 (MAE, masked, views) on lmd5_pow04, e11's
+    # in a region of 128 (shift 32, so 12^3 tokens a view), not 64 in 88, with e11's masked cube of 5^3 tokens (mask_block 5/12). Data: d0-d2 (MAE, masked, views) on lmd5_pow04, e11's
     # lmd4 families and CellMap's organelle EM (lib.data "cellmap", ~10 Tvox: 48% of the samples) weighted by voxel count ^ 0.4;
     # d3 masked on lmd4_pow04, without CellMap, and d4 masked on CellMap alone, to tell what it adds. total_steps is the pace we
     # expect over 12 h less ~5%, so the lr reaches 0 as the budget ends (a slower run stops before it): e11's for MAE and views
@@ -87,7 +87,7 @@ def roots() -> list[Spec]:
 
     def masked(data: TrainData) -> Train:
         p = trunk("mask", data, 128, 96)
-        p.mask_block = 0.6
+        p.mask_block = 5 / 12  # a 5^3-token cube in the 12^3 grid: e11's mask (0.6 of 8^3) at the MAE's bigger context
         p.mask_shift = 32
         p.sigreg_over = "both"
         p.lamb = 10 / BATCH
