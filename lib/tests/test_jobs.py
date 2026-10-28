@@ -119,13 +119,9 @@ def test_scores_keeps_a_branch_only_if_it_is_the_trunks_best(tmp_path, monkeypat
     assert not list(trunk.glob("step_*/checkpoint.pt"))  # the losers' weights are deleted
 
 
-def test_every_phase_declares_known_hardware_and_data():
-    import lib.data
+def test_every_phase_declares_known_hardware():
     assert {"benchmark", "trunk", "branch", "scores"} <= set(jobs.TASKS)
     assert {t.needs for t in jobs.TASKS.values()} <= {"gpus", "cpu"}
-    for fn, task in jobs.TASKS.items():
-        assert all(use.role in lib.data.Dataset._fields for use in task.data), fn
-        assert len({u.role for u in task.data}) == len(task.data), (fn, "a role twice")
     assert set(jobs.BOARDS) == set(typing.get_args(typing.get_type_hints(specs.Train)["board"]))  # Train.board names a leaderboard
 
 

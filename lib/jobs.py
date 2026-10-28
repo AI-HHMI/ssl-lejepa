@@ -1,7 +1,6 @@
 """What an experiment.py is made of, and the LSF code that runs it. An experiment is a table of runs (Experiment) and the phases
-that process each run: functions in experiment.py, each declared with @task (its spec, hardware, the data it uses and what it
-writes) and each calling the next with go(), which submits it as an LSF job. A phase takes its spec, or the path of the spec's
-json (`branch outdir/.../eval.json`), so one can be redone by hand: `lsf <phase> <run or spec file>`. Depends on lib/, so a
+that process each run: functions in experiment.py, each declared with @task (its spec and hardware) and each
+calling the next with go(), which submits it as an LSF job. A phase takes its spec, or the path of the spec's json (`branch outdir/.../eval.json`), so one can be redone by hand: `lsf <phase> <run or spec file>`. Depends on lib/, so a
 phase runs only from its experiment's commit. `python experiment.py` or `-h` lists the commands and phases (main)."""
 
 from __future__ import annotations
@@ -55,29 +54,19 @@ def experiment_dir(savedir: str) -> str:
     return "/".join(Path(savedir).parts[1:3])
 
 
-class Use(NamedTuple):
-    """A dataset volume a phase reads, by its role (a field of lib.data.Dataset)."""
-    role: str  # train, val, fit, test or tune
-    labels: bool  # its labels are read (else its images only)
-
 class Task(NamedTuple):
-    """A phase: the function, the specs it takes, the hardware it needs, the data it uses and what it writes."""
+    """A phase: the function, the specs it takes, and the hardware it needs."""
     fn: Callable
     spec: type | tuple[type, ...]  # the spec(s) it takes
     needs: str  # "gpus": the Train's own, torchrun; "cpu": SCORE_QUEUE's slots
     minutes: int | Callable[[Spec], int]  # the LSF wall limit (of the spec)
-    data: tuple[Use, ...]
-    writes: tuple[str, ...]  # into its savedir
-
-TRAIN, VAL, FIT, TEST, TUNE = Use("train", False), Use("val", False), Use("fit", True), Use("test", True), Use("tune", True)
-TUNE_IMAGES = TUNE._replace(labels=False)  # a branch writes the tune volume's predictions; scores reads its labels
 
 TASKS: dict[str, Task] = {}  # every phase, in the order declared: submit() reads it, `-h` prints it
 
-def task(spec, needs: str, minutes, data: tuple[Use, ...], writes: tuple[str, ...]):
+def task(spec, needs: str, minutes):
     """Declare a function a phase of the pipeline (TASKS) and an entrypoint of experiment.py."""
     def declare(fn):
-        TASKS[fn.__name__] = Task(fn, spec, needs, minutes, data, writes)
+        TASKS[fn.__name__] = Task(fn, spec, needs, minutes)
         return fn
     return declare
 
@@ -89,7 +78,7 @@ def check_snapshot():
     assert not (b1 and b2), f"LSF job running {__file__} from the shared checkout; submit via go() (code snapshot)"
 
 
-@task(Train, "gpus", 15, (TRAIN,), ("performance.json", "profile.out"))
+@task(Train, "gpus", 15)
 def benchmark(job: Train | str):
     """Throughput and a profiler trace of the spec job's training step (or the train.json's it names), with no training run:
     lib.training.benchmark. Every DDP rank."""
@@ -280,8 +269,7 @@ def main(exp: Experiment):
             print(f"  {name}{str(inspect.signature(f)).replace('exp: Experiment, ', '')}  {doc}")
             if name in TASKS:
                 t = TASKS[name]
-                uses = [f"{u.role}, {'labels' if u.labels else 'images'}" for u in t.data]
-                print(f"      needs: {t.needs}\n      data: {'; '.join(uses)}\n      writes: {', '.join(t.writes)}")
+                print(f"      needs: {t.needs}")
         sys.exit()
     assert sys.argv[1] in names, f"unknown command {sys.argv[1]!r}: {', '.join(names)}"
     log_command(sys.argv)  # commands issued outside jobs -> outdir/_log/commands.jsonl; jobs use runs.json

@@ -13,14 +13,14 @@ Each run is a trunk, which branches at its start and after every segment; a bran
         mia-evals on the test volume, its post-processing fitted on the tune volume; best.pt = the best score of the trunk's branches
 
 Every run shares BASE and differs by the fields its line names. Run it: `sh jrun.sh exp experiment.py submitall`, then
-`lsf <phase> <run or spec file>`; `python experiment.py -h` lists the commands and phases with their data."""
+`lsf <phase> <run or spec file>`; `python experiment.py -h` lists the commands and phases with their hardware."""
 
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
 
 from lib import evals
-from lib.jobs import B300, CPUS_PER_GPU, H200, SCORE_MINUTES, TEST, TRAIN, TUNE, TUNE_IMAGES, VAL, FIT
+from lib.jobs import B300, CPUS_PER_GPU, H200, SCORE_MINUTES
 from lib.jobs import Experiment, check_snapshot, go, keep_if_best, main, mia_eval, task
 from lib.specs import Eval, Finetune, Mae, Masked, Train, Views, load_checkpoint, record
 from lib.training import Trainer
@@ -38,9 +38,9 @@ BASE = Train(
 )
 
 
-@task(Train, "gpus", lambda p: int(p.hours * 60), (TRAIN,), ("step_<N>/ per branch", "metrics.json", "best.pt", "best.json"))
+@task(Train, "gpus", lambda p: int(p.hours * 60))
 def trunk(job: Train | str):
-    """Pretrain at a constant lr, with a branch at the start and after every segment."""
+    """Pretrain at a constant lr, with a branch at the start and after every segment (step_<N>/ each; metrics.json, best.pt)."""
     check_snapshot()
     par = load(job, Train)
     with Trainer(par, par.segments * par.segment_steps, par.init_from) as t:
@@ -59,9 +59,9 @@ def trunk(job: Train | str):
             fork()
 
 
-@task(Eval, "gpus", 120, (TRAIN, VAL, FIT, TEST, TUNE_IMAGES), ("checkpoint.pt", "metrics.json", "pca2.png", "probe.json | finetune_curve.json", "probe/{fit,test}/"))
+@task(Eval, "gpus", 120)
 def branch(job: Eval | str):
-    """Anneal a branch point's weights, then pca and tiled inference on them, and go scores."""
+    """Anneal a branch point's weights, then pca and tiled inference on them, and go scores (checkpoint.pt, pca2.png, probe.json or finetune_curve.json)."""
     check_snapshot()
     e = load(job, Eval)
     par = e.train
@@ -86,9 +86,9 @@ def branch(job: Eval | str):
             go(scores, f)
 
 
-@task((Eval, Finetune), "cpu", SCORE_MINUTES, (TUNE, TEST), ("mia_evals/<board>/records/*.json", "../best.pt", "../best.json"))
+@task((Eval, Finetune), "cpu", SCORE_MINUTES)
 def scores(job: Eval | Finetune | str):
-    """mia-evals on a branch's predictions; its weights are kept if they score best in the trunk."""
+    """mia-evals on a branch's predictions; its weights are kept if they score best in the trunk (mia_evals/<board>/records/*.json, ../best.pt)."""
     par = load(job, Finetune if str(job).endswith("finetune.json") or isinstance(job, Finetune) else Eval)
     record(par, "scores")
     keep_if_best(par, mia_eval(par))
