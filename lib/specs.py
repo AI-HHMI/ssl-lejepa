@@ -1,5 +1,5 @@
-"""The specs: Train (how a model is trained, in groups) and the three tasks' (Trunk, Branch, Score: what an experiment's runs are
-and lib.jobs submits), what follows from one (its model), and the weights it loads."""
+"""Train (how a model is trained, in groups: the spec every task of an experiment shares), what follows from one (its model), and the
+weights it loads. The tasks' own specs (Trunk, Branch, Score) are experiment.py's, each beside its task."""
 
 from __future__ import annotations
 
@@ -111,39 +111,6 @@ class Train:
         return replace(self, **changes)
 
 
-# The three tasks' specs, each holding its parent's (Score -> Branch -> Trunk -> Train), each in its own savedir.
-@dataclass(slots=True)
-class Trunk:
-    """Task trunk: pretrain train for segments x segment_steps steps, with a branch at the start and after each segment. You write
-    these: an Experiment's runs. It also says what its branches do."""
-    savedir: str = "outdir/e00/scratch/"
-    train: Train = field(default_factory=Train)
-    init_from: str = ""  # the starting weights: "" random, or a checkpoint .pt (its weights and optimizer)
-    segments: int = 10
-    segment_steps: int = 10_000
-    hours: float = 12.0  # the LSF wall limit: a trunk killed at it keeps the branches of its finished segments
-    anneal_steps: int = 10_000  # a branch's steps, its lr falling linearly to train.optim.lr x anneal_to
-    anneal_to: float = 0.01
-    eval_data: str = ""  # the lib.data.DATASETS a branch is evaluated on: its val images, and its fit, test and tune blocks
-    eval_head: Literal["linear", "unetr"] = "linear"  # the branch's tiled inference: a Linear on the frozen encoder, or a UNETR
-    standardize: bool = False  # linear head: fit on features standardized per channel (fit block's mean and std; folded back into the Linear)
-    board: Literal["neuron-instance"] = "neuron-instance"  # the mia-evals leaderboard (lib.jobs.BOARDS) a branch is scored on
-
-@dataclass(slots=True)
-class Branch:
-    """Task branch: anneal a fork point of trunk, then pca and tiled inference on the result. Made by the trunk's fork."""
-    savedir: str
-    trunk: Trunk
-    init_from: str  # the fork point: a checkpoint .pt of weights and optimizer
-
-@dataclass(slots=True)
-class Score:
-    """Task score: mia-evals on the weights and affinities branch wrote (savedir/checkpoint.pt, savedir/probe/). Made by the branch."""
-    savedir: str  # the branch's
-    branch: Branch
-
-Spec = Trunk | Branch | Score  # a task's spec: what an Experiment's runs are (Trunk) and go() submits
-
 @dataclass(slots=True)
 class Rank:
     """This process's place in a training job's DDP run (setup: torchrun's environment); a plain process is rank 0 of 1."""
@@ -203,8 +170,8 @@ def load_checkpoint(train: Train, init_from: str):
     model.load_state_dict(ckpt["model"])  # strict: architecture drift fails loudly
     return model.to(device).eval(), ckpt["step"]
 
-def record(par: Spec, fn: str):
-    """Append one row to par.savedir/runs.json: which experiment function ran (fn), its spec (params), code_provenance(),
+def record(par, fn: str):
+    """Append one row to par.savedir/runs.json: which task ran (fn), its spec par (a dataclass: params), code_provenance(),
     argv and LSF job. Written first thing, so even a run that crashes before any results describes itself.
     Repro for the dir's artifacts: that commit + argv. The command that submitted the job is in
     outdir/_log/commands.jsonl (log_command)."""

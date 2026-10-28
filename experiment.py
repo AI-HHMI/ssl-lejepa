@@ -2,7 +2,7 @@
 e12's, or e11's 5^3) and the training objective change what 12 h of pretraining gives a linear probe on hemibrain?
 
 Each run is a Trunk, which branches at its start and after every segment; a branch is scored, and its trunk keeps the best. Three
-tasks, each with a spec of its name (lib.specs): Trunk(train: Train), Branch(trunk), Score(branch).
+tasks, each defined with a spec of its name beside it, each spec holding its parent's: Trunk(train: Train), Branch(trunk), Score(branch).
 
     trunk(Trunk):                                # one job, the run's GPUs, up to run.hours
         fork(); repeat run.segments times: train(run.segment_steps, lr, lr); fork()
@@ -16,13 +16,15 @@ tasks, each with a spec of its name (lib.specs): Trunk(train: Train), Branch(tru
 Every run shares BASE (its Train) and differs by the groups its line names. Run it: `sh jrun.sh exp experiment.py submitall`, then
 `lsf <task> <run or spec file>`; `python experiment.py -h` lists the commands and tasks."""
 
-from dataclasses import replace
+import os
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
+from typing import Literal
 
-from lib import evals
+from lib import evals, training
 from lib.jobs import B300, H200, SCORE_MINUTES, Experiment, check_snapshot, go, keep_if_best, main, mia_eval, task
-from lib.specs import Branch, Data, Encoder, Mae, Masked, Optim, Score, Speed, Train, Trunk, Views, load_checkpoint, record
+from lib.specs import Data, Encoder, Mae, Masked, Optim, Speed, Train, Views, load_checkpoint, record
 from lib.training import Trainer
 from lib.util import load
 
@@ -36,10 +38,27 @@ BASE = Train(
     optim=Optim(batch_size=BATCH, weight_decay=0.05, adam_beta2=0.95),
     speed=Speed(cudagraphs=True),
 )
-run = partial(Trunk, eval_data="hemibrain", segments=10, anneal_steps=10_000, anneal_to=0.01, hours=12)
 
 
-@task(Trunk, "gpus", lambda t: int(t.hours * 60))
+@dataclass(slots=True)
+class Trunk:
+    """Spec of task trunk: pretrain train for segments x segment_steps steps, with a branch at the start and after each segment. You
+    write these: an Experiment's runs. It also says what its branches do."""
+    savedir: str = "outdir/e00/scratch/"
+    train: Train = field(default_factory=Train)
+    init_from: str = ""  # the starting weights: "" random, or a checkpoint .pt (its weights and optimizer)
+    segments: int = 10
+    segment_steps: int = 10_000
+    hours: float = 12.0  # the LSF wall limit: a trunk killed at it keeps the branches of its finished segments
+    anneal_steps: int = 10_000  # a branch's steps, its lr falling linearly to train.optim.lr x anneal_to
+    anneal_to: float = 0.01
+    eval_data: str = ""  # the lib.data.DATASETS a branch is evaluated on: its val images, and its fit, test and tune blocks
+    eval_head: Literal["linear", "unetr"] = "linear"  # the branch's tiled inference: a Linear on the frozen encoder, or a UNETR
+    standardize: bool = False  # linear head: fit on features standardized per channel (fit block's mean and std; folded back into the Linear)
+    board: Literal["neuron-instance"] = "neuron-instance"  # the mia-evals leaderboard (lib.jobs.BOARDS) a branch is scored on
+
+
+@task(Trunk, "gpus", lambda t: int(t.hours * 60), lambda t: t.train.hardware)
 def trunk(job: Trunk | str):
     """Pretrain at a constant lr, with a branch at the start and after every segment (step_<N>/ each; metrics.json, best.pt)."""
     check_snapshot()
@@ -61,7 +80,15 @@ def trunk(job: Trunk | str):
             fork()
 
 
-@task(Branch, "gpus", 120)
+@dataclass(slots=True)
+class Branch:
+    """Spec of task branch: anneal a fork point of trunk, then pca and tiled inference on the result. Made by the trunk's fork."""
+    savedir: str
+    trunk: Trunk
+    init_from: str  # the fork point: a checkpoint .pt of weights and optimizer
+
+
+@task(Branch, "gpus", 120, lambda b: b.trunk.train.hardware)
 def branch(job: Branch | str):
     """Anneal a fork point's weights, then pca and tiled inference on them, and go score (checkpoint.pt, pca2.png, probe.json or finetune_curve.json)."""
     check_snapshot()
@@ -83,6 +110,13 @@ def branch(job: Branch | str):
         go(score, Score(savedir=b.savedir, branch=b))
 
 
+@dataclass(slots=True)
+class Score:
+    """Spec of task score: mia-evals on the weights and affinities its branch wrote (savedir/checkpoint.pt, savedir/probe/). Made by the branch."""
+    savedir: str  # the branch's
+    branch: Branch
+
+
 @task(Score, "cpu", SCORE_MINUTES)
 def score(job: Score | str):
     """mia-evals on a branch's predictions; its weights are kept if they score best in the trunk (mia_evals/<board>/records/*.json, ../best.pt)."""
@@ -91,6 +125,18 @@ def score(job: Score | str):
     keep_if_best(s, mia_eval(s))
 
 
+@task(Trunk, "gpus", 15, lambda t: t.train.hardware)
+def benchmark(job: Trunk | str):
+    """Throughput and a profiler trace of the trunk's training step (or of the trunk.json it names), with no training run:
+    lib.training.benchmark. Every DDP rank."""
+    check_snapshot()
+    t = load(job, Trunk)
+    if int(os.environ.get("RANK", 0)) == 0:
+        record(t, "benchmark")
+    training.benchmark(t.train, t.savedir)
+
+
+run = partial(Trunk, eval_data="hemibrain", segments=10, anneal_steps=10_000, anneal_to=0.01, hours=12)  # a line of the table below
 EXPERIMENT = Experiment("e00/e13-cellmap-12h", trunk, {
     "mae":          run(train=BASE.but(model=Mae(decoder=(512, 8)),                       hardware=H200), segment_steps=30_000),
     "views":        run(train=BASE.but(model=Views(local=96, batch_views=True, lamb=0.1), hardware=H200), segment_steps=10_000),

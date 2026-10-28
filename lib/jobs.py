@@ -1,9 +1,9 @@
-"""What an experiment.py is made of, and the LSF code that runs it. An experiment is a table of runs (Experiment), each a Trunk
-spec, and the tasks that process each run: functions in experiment.py (trunk, branch, score), each declared with @task (its spec
-class and hardware) and each calling the next with go(), which submits it as an LSF job: a job is a task submitted. A task takes
-its spec, or the path of the spec's json (`branch outdir/.../branch.json`), so one can be redone by hand: `lsf <task> <run or
-spec file>`. Depends on lib/, so a task runs only from its experiment's commit. `python experiment.py` or `-h` lists the
-commands and tasks (main)."""
+"""What an experiment.py is made of, and the LSF code that runs it. An experiment is a table of runs (Experiment), each a Trunk spec,
+and the tasks that process each run: functions in experiment.py (trunk, branch, score), each declared with @task (its spec class,
+defined beside it, and its hardware) and each calling the next with go(), which submits it as an LSF job: a job is a task
+submitted. A spec has a savedir; a gpus task says which Hardware (queue, GPUs) its spec asks LSF for. A task takes its spec, or the path of the
+spec's json (`branch outdir/.../branch.json`), so one can be redone by hand: `lsf <task> <run or spec file>`. Depends on lib/, so a
+task runs only from its experiment's commit. `python experiment.py` or `-h` lists the commands and tasks (main)."""
 
 from __future__ import annotations
 
@@ -17,10 +17,10 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import Any, Callable, NamedTuple
 
 from lib import training
-from lib.specs import Branch, Hardware, Score, Spec, Train, Trunk, record
+from lib.specs import Hardware
 from lib.util import *
 
 CODE = Path(__file__).resolve().parent.parent  # the code root: the shared checkout, or the .tmpcode/ snapshot a job runs
@@ -44,10 +44,10 @@ class Experiment:
     """An experiment (README: experiment ids): the task that starts each run, and its runs, each a Trunk whose savedir is
     outdir/<id>/<name>/."""
     id: str  # <series>/e<NN>[-<NN>...]-<slug>, e.g. e00/e15-02-pca
-    task: Callable  # the first task of every run (one taking a Trunk)
-    runs: dict[str, Trunk]  # by name: [a-z][a-z0-9_-]*
+    task: Callable  # the first task of every run (one taking its Trunk)
+    runs: dict[str, Any]  # its Trunks (experiment.py's), by name: [a-z][a-z0-9_-]*
 
-    def roots(self) -> dict[str, Trunk]:
+    def roots(self) -> dict[str, Any]:
         assert all(re.fullmatch(r"[a-z][a-z0-9_-]*", name) for name in self.runs), f"run names are lowercase words: {list(self.runs)}"
         return {name: replace(spec, savedir=f"outdir/{self.id}/{name}/") for name, spec in self.runs.items()}
 
@@ -58,18 +58,20 @@ def experiment_dir(savedir: str) -> str:
 
 
 class Task(NamedTuple):
-    """A task: the function, the spec class(es) it takes, and the hardware it needs."""
+    """A task: the function, the spec class it takes, and the hardware it needs."""
     fn: Callable
-    spec: type | tuple[type, ...]  # the spec(s) it takes
+    spec: type  # the spec it takes (a dataclass with a savedir)
     needs: str  # "gpus": the Train's own, torchrun; "cpu": SCORE_QUEUE's slots
-    minutes: int | Callable[[Spec], int]  # the LSF wall limit (of the spec)
+    minutes: int | Callable[[Any], int]  # the LSF wall limit (of the spec)
+    hardware: Callable[[Any], Hardware] | None  # the Hardware (queue, GPUs) a "gpus" task's spec says; a "cpu" task has none
 
 TASKS: dict[str, Task] = {}  # every task, in the order declared: submit() reads it, `-h` prints it
 
-def task(spec, needs: str, minutes):
-    """Declare a function a task of the pipeline (TASKS) and an entrypoint of experiment.py."""
+def task(spec: type, needs: str, minutes, hardware=None):
+    """Declare a function a task of the pipeline (TASKS) and an entrypoint of experiment.py, taking a `spec`."""
+    assert (needs == "gpus") == (hardware is not None), f"{needs!r} task {spec.__name__}: hardware is for (and only for) gpus tasks"
     def declare(fn):
-        TASKS[fn.__name__] = Task(fn, spec, needs, minutes)
+        TASKS[fn.__name__] = Task(fn, spec, needs, minutes, hardware)
         return fn
     return declare
 
@@ -81,16 +83,6 @@ def check_snapshot():
     assert not (b1 and b2), f"LSF job running {__file__} from the shared checkout; submit via go() (code snapshot)"
 
 
-@task(Trunk, "gpus", 15)
-def benchmark(job: Trunk | str):
-    """Throughput and a profiler trace of the trunk's training step (or of the trunk.json it names), with no training run:
-    lib.training.benchmark. Every DDP rank."""
-    check_snapshot()
-    trunk = load(job, Trunk)
-    if int(os.environ.get("RANK", 0)) == 0:
-        record(trunk, "benchmark")
-    training.benchmark(trunk.train, trunk.savedir)
-
 def replay_bad_batch(exp: Experiment, path: str):
     """Replay a skipped (non-finite gradient) training step from its bad_batch_*.pt dump: lib.training.replay_bad_batch. Like
     training, replay depends on lib/: only for dumps of this commit's own experiment (replaylsf submits it)."""
@@ -98,10 +90,9 @@ def replay_bad_batch(exp: Experiment, path: str):
     ours = Path("outdir", exp.id).resolve()
     assert Path(path).resolve().is_relative_to(ours), f"{path} isn't from this commit's experiment: replay it from its experiment's commit"
     dump = torch.load(path, map_location="cpu", weights_only=False)
-    record(Trunk(savedir=f"{Path(path).parent}/", train=parse(Train, dump["params"])), "replay_bad_batch")
     return training.replay_bad_batch(dump)
 
-def mia_eval(par: Score) -> float:
+def mia_eval(par) -> float:
     """Score par's branch's affinities (probe/{fit,test}, written by its probe or finetune) as mia-evals' neuron-instance task on its trunk's board
     (mutex watershed + size filter, fitted on the fit block, reported on the test block); panoptic quality, which ranks, comes
     back (VOI and ARE are in the record).
@@ -129,7 +120,7 @@ def mia_eval(par: Score) -> float:
     record_file = sorted(savedir.glob("mia_evals/*/records/*.json"))[-1]
     return json.loads(record_file.read_text())["scores"]["voxel_instance"]["pq"]
 
-def keep_if_best(par: Score, score: float):
+def keep_if_best(par, score: float):
     """Keep par's branch's weights (savedir/checkpoint.pt, its end) as its trunk's best.pt if score beats the best so far (best.json, in the
     trunk's dir); else delete them. The scores of one trunk's branches finish in any order, so the compare-and-move is under a lock
     held only for it (a rename, not a copy)."""
@@ -175,11 +166,7 @@ def bsub(savedir: str, job: str, minutes: int, n_gpus: int, queue: str, cmd: str
     subprocess.run(full, shell=True, stdin=subprocess.DEVNULL, check=True)
     print(f"Submitted {name} (code {code}) to LSF.")
 
-def train_of(job: Spec) -> Train:
-    """The Train a task's spec trains or reads: a Trunk's, a Branch's trunk's, a Score's branch's trunk's."""
-    return job.train if isinstance(job, Trunk) else job.trunk.train if isinstance(job, Branch) else job.branch.trunk.train
-
-def go(fn: Callable, job: Spec):
+def go(fn: Callable, job):
     """Run the task fn on the spec job as its own LSF job: job written to its savedir (dump: trunk.json, branch.json or
     score.json), and `experiment.py <fn> <that file>` submitted (bsub), which loads it. Hardware by the task's needs: its
     Train's own GPUs (torchrun), or a CPU job on SCORE_QUEUE. No commit check: callers from the shared checkout (start, lsf)
@@ -187,16 +174,16 @@ def go(fn: Callable, job: Spec):
     name = fn.__name__
     t = TASKS[name]
     assert isinstance(job, t.spec), f"{job.savedir}: task {name!r} takes a {t.spec}, not a {type(job).__name__}: {list(TASKS)}"
-    h = train_of(job).hardware
-    assert t.needs != "gpus" or h.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={h.n_workers} leaves no core for the training process"
+    h = t.hardware(job) if t.hardware else None
+    assert h is None or h.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={h.n_workers} leaves no core for the training process"
     spec = dump(job)
     minutes = t.minutes(job) if callable(t.minutes) else t.minutes
-    if t.needs == "gpus":
+    if h:
         bsub(job.savedir, name, minutes, h.n_gpus, h.queue, f"torchrun --standalone --nproc_per_node={h.n_gpus} {{code}}/experiment.py {name} {spec}")
     else:
         bsub(job.savedir, name, minutes, 0, SCORE_QUEUE, f"python {{code}}/experiment.py {name} {spec}", slots=SCORE_SLOTS)
 
-def start(exp: Experiment, run: Trunk):
+def start(exp: Experiment, run):
     """Submit run fresh: its savedir emptied (old contents -> outdir/.trash/), then the experiment's first task."""
     trash(run.savedir)
     go(exp.task, run)
@@ -209,7 +196,7 @@ def lsf(exp: Experiment, fn: str, target: str):
     assert_committed()
     roots = exp.roots()
     assert fn in TASKS, f"no task {fn!r}: {list(TASKS)}"
-    p = roots[target] if target in roots else load(target, SPECS[Path(target).stem])
+    p = roots[target] if target in roots else load(target, {t.spec.__name__.lower(): t.spec for t in TASKS.values()}[Path(target).stem])  # a spec file's name (spec_path) -> its class
     if TASKS[fn].fn is exp.task:
         start(exp, p)
     else:
@@ -262,7 +249,6 @@ def submitall(exp: Experiment):
             start(exp, r)
 
 
-SPECS = {"trunk": Trunk, "branch": Branch, "score": Score}  # a spec file's name -> its class (spec_path)
 COMMANDS = [replay_bad_batch, lsf, replaylsf, submitall]  # take the experiment first, bound by main
 
 

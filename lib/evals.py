@@ -1,4 +1,5 @@
-"""Evals of a branch's weights, each given its model (load_checkpoint's) and writing its artifacts to the branch's savedir: PCA maps
+"""Evals of a branch's weights (b: experiment.py's Branch, read as savedir and trunk.{train, eval_data, standardize}), each given its
+model (load_checkpoint's) and writing its artifacts to the branch's savedir: PCA maps
 of an encoder's tokens (pca_maps), a linear affinity probe (probe), and a UNETR fitted on labels (finetune). The tasks and their
 run records are experiment.py's."""
 
@@ -13,7 +14,7 @@ import numpy as np
 from lib.data import Volume, dataset
 from lib.inference import boundary_png, mean_scores, pca_rgb, score_block, tile_features, tile_logits, write_affinities
 from lib.readers import PROBE_SIDE, crop, inner, read_block
-from lib.specs import Branch, Train
+from lib.specs import Train
 from lib.util import *
 
 FINETUNE_STEPS = 10_000  # finetune: fit steps (lib.decoders.unetr.fit_unetr, batch 4), scored at 100, 200, 400, ... and the last
@@ -89,13 +90,13 @@ def pca_maps(encoder, par: Train, savedir: Path, step: int, data: str):
     print(f"{savedir}: step {step}, effective rank {erank:.1f}, top-3 variance {sum(var[:3]):.2f}, "
           f"between-tile variance {between_tile:.2f}, norm outliers (>2x median) {stats['norm_outliers']}/{norms.numel()}; wrote pca2.png")
 
-def run_name(b: Branch) -> str:
+def run_name(b) -> str:
     """mia-evals' row name for b's run: its savedir's parts, letters, digits, _ and - only."""
     return "-".join(Path(b.savedir).parts[1:])
 
 MIA_EVALS_SPLIT = {"tune": "fit", "test": "test"}  # mia-evals' names for the blocks it tunes on and scores on ([data.fit], [data.test])
 
-def write_artifact(b: Branch, step: int, role: str, vol: Volume, pred):
+def write_artifact(b, step: int, role: str, vol: Volume, pred):
     """vol's predictions pred (C Z Y X probabilities) as the mia-evals affinity artifact `score` reads, savedir/probe/<split>/<its
     name>.zarr, vol being the dataset's tune or test block (role) and split mia-evals' name for the role."""
     assert vol.name, f"{vol.crop} has no name in a mia-evals data config: mia-evals can't score it"
@@ -106,7 +107,7 @@ def write_artifact(b: Branch, step: int, role: str, vol: Volume, pred):
                      native_box=vol.box, scale=[1, 1, 1], annotated_box=vol.annotated, covers_full_box=False)
 
 
-def probe(b: Branch, model, step: int):
+def probe(b, model, step: int):
     """Linear affinity probe (lib.probe) of model, frozen: one Linear per token to mia-evals' 6 affinity channels at every voxel
     of its patch, fitted on the fit block of dataset b.trunk.eval_data (lib.data.DATASETS) against its instance labels, scored on
     its test blocks (averaged) as mia-evals' neuron-instance task. Data: the dataset's fit block fits the Linear; its test blocks
@@ -176,7 +177,7 @@ def predict_block(unetr, tile, img, m, size):
     import torch
     return torch.sigmoid(inner(tile_logits(unetr, img, tile), m, size)).half()
 
-def finetune(b: Branch, model, step: int):
+def finetune(b, model, step: int):
     """A UNETR (lib.decoders.unetr: skip connections into the encoder's own blocks) on model's frozen encoder, fitted for
     FINETUNE_STEPS to mia-evals' 6 affinity channels of the fit block of dataset b.trunk.eval_data (a PROBE_SIDE cube, as probe
     reads it), on crops of the encoder's view size, and scored as it fits on the dataset's test blocks, tiled at that size; the

@@ -7,6 +7,7 @@ import pytest
 import torch
 import zarr
 
+import experiment
 from lib import jobs
 import lib.data
 import lib.probe
@@ -22,9 +23,9 @@ TINY = LejepaConfig(encoder=EncoderConfig(depth=1, embed_dim=16, num_heads=2, pa
 BOXES = {"train": [[24, 56], [24, 56], [24, 56]], "fit": [[20, 52], [24, 56], [24, 56]], "test": [[24, 56], [20, 52], [24, 56]]}
 
 
-def branch(tmp_path, data="hemibrain", view=24, **trunk) -> specs.Branch:
+def branch(tmp_path, data="hemibrain", view=24, **trunk) -> experiment.Branch:
     """A Branch of a trunk that evaluates on data, at view^3 crops, in tmp_path/run."""
-    return specs.Branch(savedir=str(tmp_path / "run"), trunk=specs.Trunk(train=specs.Train(data=specs.Data(view=(view,) * 3)), eval_data=data, **trunk), init_from="")
+    return experiment.Branch(savedir=str(tmp_path / "run"), trunk=experiment.Trunk(train=specs.Train(data=specs.Data(view=(view,) * 3)), eval_data=data, **trunk), init_from="")
 
 
 def synthetic_store(tmp_path, monkeypatch, sets=None):
@@ -154,7 +155,7 @@ def test_finetune_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch):
     (tmp_path / "run").mkdir(exist_ok=True)
     evals.finetune(par, model.eval(), 7)
 
-    assert load(str(spec), specs.Branch) == par  # its results didn't overwrite its spec
+    assert load(str(spec), experiment.Branch) == par  # its results didn't overwrite its spec
     data, *curve = [json.loads(l) for l in (tmp_path / "run/finetune_curve.json").read_text().splitlines()]
     assert data == {"tbl": "finetune_data", "step": 7, "fit_size": [32] * 3, "fit_labelled": 32 ** 3, "test_blocks": ["hemibrain_eb_test"]}
     assert [c["step"] for c in curve] == [100, 150] and all(c["tbl"] == "finetune" for c in curve)
@@ -223,7 +224,7 @@ def test_scoring_config_reads_instances_truth_from_its_own_data_configs():
 
 
 def test_score_calls_mia_evals_on_the_probe_artifacts(tmp_path, monkeypatch):
-    par = specs.Score(savedir=str(tmp_path / "run"), branch=branch(tmp_path))
+    par = experiment.Score(savedir=str(tmp_path / "run"), branch=branch(tmp_path))
     with pytest.raises(AssertionError, match="no probe artifacts"):
         jobs.mia_eval(par)
     for split in ["fit", "test"]:

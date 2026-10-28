@@ -36,8 +36,8 @@ bjobs -w
 
 Design an experiment: `experiment.py` is its tasks and its table of runs. Words: an *experiment* is one `experiment.py` (an id and its
 runs); a *run* is one named line of its table, a `Trunk` spec you write; a *task* is a function of the pipeline (`trunk`, `branch`,
-`score`), declared with `@task` and taking the spec of its own name; a *job* is a task submitted to LSF by `go()`. The specs nest, each
-holding its parent's: `Score(branch)`, `Branch(trunk)`, `Trunk(train)`, and `Train` (model, encoder, data, optim, hardware, speed,
+`score`), declared with `@task` beside the spec dataclass of its own name that it takes; a *job* is a task submitted to LSF by `go()`. The specs nest, each
+holding its parent's (all in `experiment.py`, except `Train`): `Score(branch)`, `Branch(trunk)`, `Trunk(train)`, and `Train` (model, encoder, data, optim, hardware, speed,
 profile) is how a model is trained, shared by all. A trunk pretrains in one job and forks a branch at its start and after every
 segment; a branch anneals, runs pca and tiled inference, and goes to `score`, a CPU job after which the trunk keeps `best.pt`. The
 module docstring says which volumes each task uses (train, val, fit, test, tune: the parts every dataset of `lib/data.py` has). The
