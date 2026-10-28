@@ -76,7 +76,7 @@ class Optim:
 class Hardware:
     queue: str = "gpu_h200"  # LSF queue
     n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); Optim.batch_size and n_workers are per GPU
-    n_workers: int = 16  # data loader workers per GPU (lib.jobs.CPUS_PER_GPU - 1 at most)
+    n_workers: int = 16  # data loader workers per GPU (lib.task_utils.CPUS_PER_GPU - 1 at most)
     prefetch_factor: int = 2
 
 @dataclass(slots=True)

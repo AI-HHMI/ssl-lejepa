@@ -40,7 +40,7 @@ tasks, `trunk`, `branch` and `score`, each beside the spec dataclass of its name
 `Score(branch)`, `Branch(trunk)`, `Trunk(train)`). A task is a job's entrypoint: it loads its spec, reads and writes files and
 checkpoints, submits the next tasks with `go()` and calls the library (`lib/`: straight-line code on loaded models and specs, no
 callbacks) in its own process. A trunk pretrains in one job and forks a branch at its start and after every segment; a branch anneals,
-runs pca and tiled inference, and goes to `score`, a CPU job after which the trunk keeps `best.pt`. `lib/jobs.py` is the LSF and
+runs pca and tiled inference, and goes to `score`, a CPU job after which the trunk keeps `best.pt`. `lib/task_utils.py` is the LSF and
 registry helpers. Words: *experiment* is one `experiment.py`; a *run* a line of its table; a *task* a function of `tasks.py`; a *job* a
 task submitted to LSF. `python experiment.py -h` lists the tasks with their hardware.
 ```sh

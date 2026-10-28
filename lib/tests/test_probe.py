@@ -1,4 +1,4 @@
-"""Tests for lib.probe and lib.evals (probe, finetune), and jobs.score: affinity targets, token layout, fit, AP, and the probe end to end."""
+"""Tests for lib.probe and lib.evals (probe, finetune), and task_utils.score: affinity targets, token layout, fit, AP, and the probe end to end."""
 
 import json
 
@@ -9,7 +9,7 @@ import zarr
 
 import experiment
 import tasks
-from lib import jobs
+from lib import task_utils
 import lib.data
 import lib.probe
 import lib.readers
@@ -223,7 +223,7 @@ def test_load_checkpoint_init_from(tmp_path, monkeypatch):
 def test_scoring_config_reads_instances_truth_from_its_own_data_configs():
     import tomllib
     from pathlib import Path
-    path = jobs.CODE / jobs.BOARDS["neuron-instance"]
+    path = task_utils.CODE / task_utils.BOARDS["neuron-instance"]
     c = tomllib.loads(path.read_text())
     assert c["task"]["truth_kind"] == "instances"  # GT read from the store, no .gt.zarr copies
     for split, box in [("test", "[[4000, 5000], [4000, 5000], [4000, 5000]]"), ("fit", "[[4000, 5000], [4000, 5000], [3000, 4000]]")]:
@@ -234,10 +234,10 @@ def test_scoring_config_reads_instances_truth_from_its_own_data_configs():
 def test_score_calls_mia_evals_on_the_probe_artifacts(tmp_path, monkeypatch):
     par = tasks.Score(savedir=str(tmp_path / "run"), branch=branch(tmp_path))
     with pytest.raises(AssertionError, match="no probe artifacts"):
-        jobs.mia_eval(par)
+        task_utils.mia_eval(par)
     for split in ["fit", "test"]:
         (tmp_path / "run/probe" / split).mkdir(parents=True)
-    monkeypatch.setattr(jobs, "code_provenance", lambda: {"commit_id": "abc123"})
+    monkeypatch.setattr(task_utils, "code_provenance", lambda: {"commit_id": "abc123"})
     monkeypatch.setattr(specs, "code_provenance", lambda: {"commit_id": "abc123"})  # record's
     calls = []
     def fake_score(args):  # mia-evals writes its record into the leaderboard dir
@@ -247,9 +247,9 @@ def test_score_calls_mia_evals_on_the_probe_artifacts(tmp_path, monkeypatch):
         record.write_text(json.dumps({"scores": {"voxel_instance": {"pq": 0.25}}}))
     from mia_evals import evaluate
     monkeypatch.setattr(evaluate, "cmd_score", fake_score)
-    assert jobs.mia_eval(par) == 0.25  # the panoptic quality, which ranks
+    assert task_utils.mia_eval(par) == 0.25  # the panoptic quality, which ranks
     (args,) = calls
-    assert str(args.config).endswith(jobs.BOARDS["neuron-instance"])
+    assert str(args.config).endswith(task_utils.BOARDS["neuron-instance"])
     assert args.test == tmp_path / "run/probe/test" and args.val == tmp_path / "run/probe/fit"
     assert args.leaderboard == tmp_path / "run/mia_evals" and args.no_scored
     assert args.run_dir == tmp_path / "run"

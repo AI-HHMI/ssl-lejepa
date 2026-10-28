@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Literal
 
 from lib import evals, training
-from lib.jobs import SCORE_MINUTES, check_snapshot, go, keep_if_best, mia_eval, task
+from lib.task_utils import SCORE_MINUTES, check_snapshot, go, keep_if_best, mia_eval, task
 from lib.specs import Train, load_checkpoint, record
 from lib.training import Trainer
 from lib.util import load
@@ -47,7 +47,7 @@ class Trunk:
     eval_data: str = ""  # the lib.data.DATASETS a branch is evaluated on: its val images, and its fit, test and tune blocks
     eval_head: Literal["linear", "unetr"] = "linear"  # the branch's tiled inference: a Linear on the frozen encoder, or a UNETR
     standardize: bool = False  # linear head: fit on features standardized per channel (fit block's mean and std; folded back into the Linear)
-    board: Literal["neuron-instance"] = "neuron-instance"  # the mia-evals leaderboard (lib.jobs.BOARDS) a branch is scored on
+    board: Literal["neuron-instance"] = "neuron-instance"  # the mia-evals leaderboard (lib.task_utils.BOARDS) a branch is scored on
 
 
 @task(Trunk, "gpus", lambda t: int(t.hours * 60), lambda t: t.train.hardware)

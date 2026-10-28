@@ -1,4 +1,4 @@
-"""Tests for lib.jobs and experiment.py: the tasks' wiring (trunk, branch, score), the LSF submission, the commands on an
+"""Tests for lib.task_utils and experiment.py: the tasks' wiring (trunk, branch, score), the LSF submission, the commands on an
 Experiment, and the experiment file."""
 
 import json
@@ -12,8 +12,8 @@ import pytest
 
 import experiment
 import tasks
-from lib import evals, jobs, specs
-from lib.jobs import Experiment
+from lib import evals, task_utils, specs
+from lib.task_utils import Experiment
 
 
 @pytest.fixture(autouse=True)
@@ -121,83 +121,83 @@ def test_score_keeps_a_branch_only_if_it_is_the_trunks_best(tmp_path, monkeypatc
 
 
 def test_every_task_declares_known_hardware():
-    assert {"benchmark", "trunk", "branch", "score"} <= set(jobs.TASKS)
-    assert {t.needs for t in jobs.TASKS.values()} <= {"gpus", "cpu"}
-    assert set(jobs.BOARDS) == set(typing.get_args(typing.get_type_hints(tasks.Trunk)["board"]))  # Trunk.board names a leaderboard
+    assert {"benchmark", "trunk", "branch", "score"} <= set(task_utils.TASKS)
+    assert {t.needs for t in task_utils.TASKS.values()} <= {"gpus", "cpu"}
+    assert set(task_utils.BOARDS) == set(typing.get_args(typing.get_type_hints(tasks.Trunk)["board"]))  # Trunk.board names a leaderboard
 
 
 def test_go_refuses_a_task_for_a_spec_it_does_not_take(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(jobs, "bsub", lambda *a, **kw: pytest.fail("submitted"))
+    monkeypatch.setattr(task_utils, "bsub", lambda *a, **kw: pytest.fail("submitted"))
     with pytest.raises(AssertionError, match="task 'branch' takes"):
-        jobs.go(tasks.branch, replace(TRUNK, savedir="outdir/e00/x/a/"))
+        task_utils.go(tasks.branch, replace(TRUNK, savedir="outdir/e00/x/a/"))
     with pytest.raises(AssertionError, match="task 'trunk' takes"):
-        jobs.go(tasks.trunk, tasks.Branch(savedir="outdir/e00/x/a/", trunk=TRUNK, init_from=""))
+        task_utils.go(tasks.trunk, tasks.Branch(savedir="outdir/e00/x/a/", trunk=TRUNK, init_from=""))
     assert not (tmp_path / "outdir").exists()  # refused before writing its spec
 
 
 def test_go_writes_the_spec_its_job_loads_and_asks_for_the_hardware_the_task_needs(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     submitted = []
-    monkeypatch.setattr(jobs, "bsub", lambda savedir, job, minutes, n_gpus, queue, cmd, **kw: submitted.append((job, minutes, n_gpus, queue, cmd)))
+    monkeypatch.setattr(task_utils, "bsub", lambda savedir, job, minutes, n_gpus, queue, cmd, **kw: submitted.append((job, minutes, n_gpus, queue, cmd)))
     trunk = replace(TRUNK, savedir="outdir/e00/x/a/", hours=3, train=specs.Train(hardware=specs.Hardware(queue="gpu_b300", n_gpus=2, n_workers=11)))
     b = tasks.Branch(savedir="outdir/e00/x/a/step_0000100/", trunk=trunk, init_from="outdir/e00/x/a/step_0000100/start.pt")
     s = tasks.Score(savedir=b.savedir, branch=b)
-    jobs.go(tasks.trunk, trunk)
-    jobs.go(tasks.branch, b)  # the trunk's queue and GPUs
-    jobs.go(tasks.score, s)
+    task_utils.go(tasks.trunk, trunk)
+    task_utils.go(tasks.branch, b)  # the trunk's queue and GPUs
+    task_utils.go(tasks.score, s)
     assert submitted == [("trunk", 180, 2, "gpu_b300", "torchrun --standalone --nproc_per_node=2 {code}/experiment.py trunk outdir/e00/x/a/trunk.json"),
                          ("branch", 120, 2, "gpu_b300", "torchrun --standalone --nproc_per_node=2 {code}/experiment.py branch outdir/e00/x/a/step_0000100/branch.json"),
-                         ("score", jobs.SCORE_MINUTES, 0, jobs.SCORE_QUEUE, "python {code}/experiment.py score outdir/e00/x/a/step_0000100/score.json")]
-    assert jobs.load("outdir/e00/x/a/trunk.json", tasks.Trunk) == trunk  # what the job runs: the same spec
-    assert jobs.load("outdir/e00/x/a/step_0000100/branch.json", tasks.Branch) == b
-    assert jobs.load("outdir/e00/x/a/step_0000100/score.json", tasks.Score) == s
+                         ("score", task_utils.SCORE_MINUTES, 0, task_utils.SCORE_QUEUE, "python {code}/experiment.py score outdir/e00/x/a/step_0000100/score.json")]
+    assert task_utils.load("outdir/e00/x/a/trunk.json", tasks.Trunk) == trunk  # what the job runs: the same spec
+    assert task_utils.load("outdir/e00/x/a/step_0000100/branch.json", tasks.Branch) == b
+    assert task_utils.load("outdir/e00/x/a/step_0000100/score.json", tasks.Score) == s
     spec = json.loads(Path("outdir/e00/x/a/step_0000100/branch.json").read_text())
     Path("bad.json").write_text(json.dumps({**spec, "init_from": 3}))
     with pytest.raises(Exception, match="init_from"):  # validated: a typo fails at load, before any GPU work
-        jobs.load("bad.json", tasks.Branch)
+        task_utils.load("bad.json", tasks.Branch)
     Path("extra.json").write_text(json.dumps({**spec, "steps": 3}))
     with pytest.raises(AssertionError, match="doesn't round-trip"):  # so does a field the spec doesn't have
-        jobs.load("extra.json", tasks.Branch)
+        task_utils.load("extra.json", tasks.Branch)
 
 
 def test_the_experiment_file_names_runs_that_load_as_a_job_loads_them(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     for name, r in experiment.EXPERIMENT.roots().items():  # a job validates its json (pydantic's Literals), which building the dataclass doesn't
         assert r.savedir == f"outdir/{experiment.EXPERIMENT.id}/{name}/"
-        assert jobs.parse(type(r), asdict(r)) == r, name
+        assert task_utils.parse(type(r), asdict(r)) == r, name
         specs.model_config(r.train)  # its model builds on its encoder's patch
         assert r.hours * 60 > 0 and r.segments * r.segment_steps > 0
-        assert r.train.hardware.n_workers + 1 <= jobs.CPUS_PER_GPU
+        assert r.train.hardware.n_workers + 1 <= task_utils.CPUS_PER_GPU
     assert experiment.EXPERIMENT.task is tasks.trunk
-    jobs.check_experiment(experiment.EXPERIMENT)
+    task_utils.check_experiment(experiment.EXPERIMENT)
 
 
 def sweep(monkeypatch, id, init_from=""):
     """The Experiment id of 3 trunks a, b and c (from init_from/<run>/checkpoint.pt if set), start() recording their names, and no LSF."""
     started = []
     run = lambda n: tasks.Trunk(init_from=f"{init_from}/{n}/checkpoint.pt" if init_from else "")
-    monkeypatch.setattr(jobs, "assert_committed", lambda: None)
-    monkeypatch.setattr(jobs, "start", lambda exp, p: started.append(Path(p.savedir).name))
-    monkeypatch.setattr(jobs, "bsub", lambda *a, **kw: None)
+    monkeypatch.setattr(task_utils, "assert_committed", lambda: None)
+    monkeypatch.setattr(task_utils, "start", lambda exp, p: started.append(Path(p.savedir).name))
+    monkeypatch.setattr(task_utils, "bsub", lambda *a, **kw: None)
     return Experiment(id, tasks.trunk, {n: run(n) for n in "abc"}), started
 
 
 def test_start_empties_the_savedir_and_submits_the_first_task(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     gone = []
-    monkeypatch.setattr(jobs, "trash", lambda savedir: gone.append(("trash", savedir)))
-    monkeypatch.setattr(jobs, "go", lambda fn, p: gone.append((fn.__name__, p.savedir)))
+    monkeypatch.setattr(task_utils, "trash", lambda savedir: gone.append(("trash", savedir)))
+    monkeypatch.setattr(task_utils, "go", lambda fn, p: gone.append((fn.__name__, p.savedir)))
     exp = Experiment("e00/e01-test", tasks.trunk, {"a": tasks.Trunk()})
-    jobs.start(exp, exp.roots()["a"])
+    task_utils.start(exp, exp.roots()["a"])
     assert gone == [("trash", "outdir/e00/e01-test/a/"), ("trunk", "outdir/e00/e01-test/a/")]
 
 
 def test_submitall_starts_each_run_not_submitted_before(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     exp, started = sweep(monkeypatch, "e00/e01-test")
-    jobs.dump(exp.roots()["b"])  # submitted before
-    jobs.submitall(exp)
+    task_utils.dump(exp.roots()["b"])  # submitted before
+    task_utils.submitall(exp)
     assert started == ["a", "c"]
 
 
@@ -214,7 +214,7 @@ def test_submitall_refuses_an_experiment_misnamed(tmp_path, monkeypatch, id, ini
         (tmp_path / "outdir/e00" / s).mkdir(parents=True)
     exp, started = sweep(monkeypatch, id, init_from)
     with pytest.raises(AssertionError, match=re.escape(error)):
-        jobs.submitall(exp)
+        task_utils.submitall(exp)
     assert started == []  # refused before any job
 
 
@@ -223,20 +223,20 @@ def test_submitall_takes_a_child_of_its_parent(tmp_path, monkeypatch):
     for s in ("e01-train", "e01-01-pca", "e01-02-probe"):  # e01-02-probe: this experiment's own dir, from a first submit
         (tmp_path / "outdir/e00" / s).mkdir(parents=True)
     exp, started = sweep(monkeypatch, "e00/e01-02-probe", init_from="outdir/e00/e01-train")
-    jobs.submitall(exp)
-    assert started == ["a", "b", "c"] and jobs.experiment_id("e01-02-probe") == "e01-02"
+    task_utils.submitall(exp)
+    assert started == ["a", "b", "c"] and task_utils.experiment_id("e01-02-probe") == "e01-02"
 
 
 def test_lsf_restarts_a_run_at_its_first_task_and_redoes_any_other_in_place(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     exp, started = sweep(monkeypatch, "e00/e01-test")
     gone = []
-    monkeypatch.setattr(jobs, "go", lambda fn, job: gone.append((fn.__name__, job.savedir)))
-    jobs.lsf(exp, "trunk", "b")
+    monkeypatch.setattr(task_utils, "go", lambda fn, job: gone.append((fn.__name__, job.savedir)))
+    task_utils.lsf(exp, "trunk", "b")
     assert started == ["b"] and gone == []  # start() went
-    jobs.lsf(exp, "benchmark", "b")
+    task_utils.lsf(exp, "benchmark", "b")
     b = tasks.Branch(savedir="outdir/e00/e01-test/b/step_0000100/", trunk=exp.roots()["b"], init_from="random")
     s = tasks.Score(savedir=b.savedir, branch=b)
-    jobs.dump(s)
-    jobs.lsf(exp, "score", f"{s.savedir}score.json")
+    task_utils.dump(s)
+    task_utils.lsf(exp, "score", f"{s.savedir}score.json")
     assert gone == [("benchmark", "outdir/e00/e01-test/b/"), ("score", s.savedir)]

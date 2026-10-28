@@ -1,6 +1,6 @@
 """Training a Train spec: the data loader, DDP setup, model and optimizer, the step, the Trainer that takes a few at a time,
 checkpoints, the stop rules, throughput benchmark and replay of a skipped step. Phases and their bookkeeping (code snapshot
-check, run records, evals, branches) are experiment.py's and lib.jobs'."""
+check, run records, evals, branches) are tasks.py's and lib.task_utils'."""
 
 from __future__ import annotations
 

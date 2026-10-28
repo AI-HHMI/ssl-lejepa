@@ -9,7 +9,7 @@ commands and tasks."""
 from dataclasses import replace
 from functools import partial
 
-from lib.jobs import B300, H200, Experiment, main
+from lib.task_utils import B300, H200, Experiment, main
 from lib.specs import Data, Encoder, Mae, Masked, Optim, Speed, Train, Views
 from tasks import Trunk, trunk
 
