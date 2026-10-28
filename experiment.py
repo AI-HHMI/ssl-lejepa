@@ -57,25 +57,44 @@ SCORE_CONFIG = "mia_evals/gary_comparison_neuron_instance/mws.toml"  # ours: tru
 # mia-evals records in each score's provenance (mia_evals_commit). Not a dependency of this repo.
 MIA_EVALS = Path.home() / "proj/mia-evals"
 
+ROLES = {  # what a dataset is for in a task
+    "train": "pretraining samples",
+    "val": "held-out images whose pretraining loss is measured",
+    "crop": "a held-out crop the PCA maps are drawn on",
+    "fit": "a readout (the probe, the decoder) is fit on it",
+    "tune": "mia-evals chooses its post-processing's parameters on it",
+    "test": "the fitted readout is scored on it",
+}
+
+class Use(NamedTuple):
+    """A dataset a task reads, by its role."""
+    role: str  # a key of ROLES
+    source: str  # where lib.data defines it: TrainData, VAL_SETS, HELD_OUT, or ProbeSet.<fit|test|tune>
+    labels: bool  # its labels are read (else its images only)
+    when: str = ""  # the spec flag it needs, e.g. "score" (the tune block's predictions are written only for a score): "" always
+
 class Task(NamedTuple):
-    """One task of the pipeline: the specs it runs on, where, and the data it uses (a role of lib.data's ProbeSet, or TrainData)."""
+    """One task of the pipeline: the specs it runs on, where, the data it uses and what it writes."""
     spec: type | tuple[type, ...]  # the spec(s) its entrypoint takes
     where: str  # "train": the spec's own GPUs (torchrun); "gpu": one, on the trained run's queue; "cpu": SCORE_QUEUE
     minutes: int  # LSF wall limit (a run with max_hours: that + 60)
-    data: str  # what it reads
-    writes: str  # into its savedir
+    data: tuple[Use, ...]
+    writes: tuple[str, ...]  # into its savedir
+
+TRAIN, VAL, CROP = Use("train", "TrainData", False), Use("val", "VAL_SETS", False), Use("crop", "HELD_OUT", False)
+FIT, TEST, TUNE = Use("fit", "ProbeSet.fit", True), Use("test", "ProbeSet.test", True), Use("tune", "ProbeSet.tune", True)
 
 # Every LSF task, in pipeline order: submit() reads where and minutes, `python experiment.py -h` the rest.
 TASKS = {
-    "run": Task(Train, "train", 15, "train: the spec's TrainData volumes, sampled (images only); then its end's evals", "checkpoints/, metrics.json, and its evals'"),
-    "benchmark": Task(Train, "train", 15, "train: as run, no evals", "performance.json, profile.out"),
-    "pca": Task(Eval, "gpu", 30, "held-out crop of the probe_on set's dataset (lib.data.HELD_OUT), images only", "pca.json, pca2.png"),
-    "pca_sizes": Task(Eval, "gpu", 60, "as pca, at several input sizes", "pca_sizes.json, pca_tile_<side>.png"),
-    "val": Task(Eval, "gpu", 30, "val: the held-out blocks of each training family; train: its training volumes (images only)", "val.json"),
-    "probe": Task(Eval, "gpu", 60, "fit: the probe set's fit block; test: its test blocks; with score, the tune block's predictions too", "probe.json, probe_fit.json, probe.png; with score probe/{fit,test}/"),
-    "finetune": Task(Finetune, "gpu", 120, "fit: the probe set's fit block (or its fit_side cube); test: its test blocks, scored as it fits", "finetune_curve.json, finetune.png; with score probe/{fit,test}/"),
-    "tiles": Task(Finetune, "gpu", 120, "as finetune, test: its first test block, the fit unscored", "tiles.png"),
-    "score": Task((Eval, Finetune), "cpu", SCORE_MINUTES, "tune: where the post-processing's parameters are chosen; test: where they are applied once", "mia_evals/<task>/records/*.json"),
+    "run": Task(Train, "train", 15, (TRAIN,), ("checkpoints/", "metrics.json", "the evals of each milestone and of its end")),
+    "benchmark": Task(Train, "train", 15, (TRAIN,), ("performance.json", "profile.out")),
+    "pca": Task(Eval, "gpu", 30, (CROP,), ("pca.json", "pca2.png")),
+    "pca_sizes": Task(Eval, "gpu", 60, (CROP,), ("pca_sizes.json", "pca_tile_<side>.png")),
+    "val": Task(Eval, "gpu", 30, (VAL, TRAIN), ("val.json",)),
+    "probe": Task(Eval, "gpu", 60, (FIT, TEST, TUNE._replace(labels=False, when="score")), ("probe.json", "probe_fit.json", "probe.png", "probe/{fit,test}/ (score)")),
+    "finetune": Task(Finetune, "gpu", 120, (FIT, TEST, TUNE._replace(labels=False, when="score")), ("finetune_curve.json", "finetune.png", "probe/{fit,test}/ (score)")),
+    "tiles": Task(Finetune, "gpu", 120, (FIT, TEST), ("tiles.png",)),
+    "score": Task((Eval, Finetune), "cpu", SCORE_MINUTES, (TUNE, TEST), ("mia_evals/<task>/records/*.json",)),
 }
 
 # This experiment's id (README: experiment ids): its roots are outdir/<EXPERIMENT>/d<i>/, a trunk's branches in its own dir.
@@ -449,7 +468,9 @@ if __name__ == "__main__":
         for name, f in names.items():
             print(f"  {name}{inspect.signature(f)}  {(f.__doc__ or '').strip().splitlines()[0]}")
             if name in TASKS:
-                print(f"      data: {TASKS[name].data}\n      writes: {TASKS[name].writes}")
+                uses = [f"{u.role} = {u.source}, {'labels' if u.labels else 'images'}{f', if {u.when}' if u.when else ''}" for u in TASKS[name].data]
+                print(f"      data: {'; '.join(uses)}\n      writes: {', '.join(TASKS[name].writes)}")
+        print("data roles:\n" + "\n".join(f"  {role}: {what}" for role, what in ROLES.items()))
         sys.exit()
     assert sys.argv[1] in names, f"unknown entrypoint {sys.argv[1]!r}: {', '.join(names)}"
     log_command(sys.argv)  # commands issued outside jobs -> outdir/_log/commands.jsonl; jobs use runs.json

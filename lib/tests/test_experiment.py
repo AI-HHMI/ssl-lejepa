@@ -51,6 +51,18 @@ def test_every_task_is_an_entrypoint_and_its_where_is_known():
     assert {t.where for t in experiment.TASKS.values()} <= {"train", "gpu", "cpu"}
 
 
+def test_every_data_use_names_a_role_and_a_source_in_lib_data():
+    import lib.data
+    for fn, task in experiment.TASKS.items():
+        for use in task.data:
+            kind, _, field = use.source.partition(".")
+            assert use.role in experiment.ROLES, (fn, use)
+            assert kind == "TrainData" or hasattr(lib.data, kind), (fn, use)
+            assert not field or field in getattr(lib.data, kind)._fields, (fn, use)
+            assert not use.when or all(use.when in spec.__dataclass_fields__ for spec in (experiment.Eval, experiment.Finetune)), (fn, use)
+        assert len({u.role for u in task.data}) == len(task.data), (fn, "a role twice")
+
+
 def test_submit_refuses_a_task_for_a_spec_it_does_not_take(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     with pytest.raises(AssertionError, match="no LSF job 'probe' for a Train"):
