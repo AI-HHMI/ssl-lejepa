@@ -1,7 +1,9 @@
-"""What an experiment.py is made of, and the LSF code that runs it. An experiment is a table of runs (Experiment) and the phases
-that process each run: functions in experiment.py, each declared with @task (its spec and hardware) and each
-calling the next with go(), which submits it as an LSF job. A phase takes its spec, or the path of the spec's json (`branch outdir/.../eval.json`), so one can be redone by hand: `lsf <phase> <run or spec file>`. Depends on lib/, so a
-phase runs only from its experiment's commit. `python experiment.py` or `-h` lists the commands and phases (main)."""
+"""What an experiment.py is made of, and the LSF code that runs it. An experiment is a table of runs (Experiment), each a Trunk
+spec, and the tasks that process each run: functions in experiment.py (trunk, branch, score), each declared with @task (its spec
+class and hardware) and each calling the next with go(), which submits it as an LSF job: a job is a task submitted. A task takes
+its spec, or the path of the spec's json (`branch outdir/.../branch.json`), so one can be redone by hand: `lsf <task> <run or
+spec file>`. Depends on lib/, so a task runs only from its experiment's commit. `python experiment.py` or `-h` lists the
+commands and tasks (main)."""
 
 from __future__ import annotations
 
@@ -18,7 +20,7 @@ from pathlib import Path
 from typing import Callable, NamedTuple
 
 from lib import training
-from lib.specs import Eval, Finetune, Spec, Train, record
+from lib.specs import Branch, Hardware, Score, Spec, Train, Trunk, record
 from lib.util import *
 
 CODE = Path(__file__).resolve().parent.parent  # the code root: the shared checkout, or the .tmpcode/ snapshot a job runs
@@ -26,25 +28,26 @@ CODE = Path(__file__).resolve().parent.parent  # the code root: the shared check
 # starts depending on others. Dependencies (pyproject.toml / uv.lock) are not frozen.
 SNAPSHOT_PATHS = ["experiment.py", "lib", "mia_evals"]
 CPUS_PER_GPU = 12  # LSF slots per GPU: 8 GPUs -> all 96 cores; training processes need cores beyond the data workers
-H200 = dict(queue="gpu_h200", n_gpus=7)  # whole nodes (Train.batch_size and n_workers are per GPU); an H200 node has one GPU taken by someone else's job
-B300 = dict(queue="gpu_b300", n_gpus=8)
+# Whole nodes (Optim.batch_size and Hardware.n_workers are per GPU); an H200 node has one GPU taken by someone else's job.
+H200 = Hardware(queue="gpu_h200", n_gpus=7, n_workers=CPUS_PER_GPU - 1)
+B300 = Hardware(queue="gpu_b300", n_gpus=8, n_workers=CPUS_PER_GPU - 1)
 # mia-evals scoring (mia_eval): CPU only. mia-evals: ~1 h and ~200 GB peak for the mutex watershed at 896^3, "give it a
 # whole node". The shortest CPU queue; check its run limit and memory per slot with `bqueues -l short`.
 SCORE_QUEUE, SCORE_SLOTS, SCORE_MINUTES = "local", 16, 4*60
-BOARDS = {"neuron-instance": "mia_evals/gary_comparison_neuron_instance/mws.toml"}  # Train.board: ours, truth_kind = "instances"
+BOARDS = {"neuron-instance": "mia_evals/gary_comparison_neuron_instance/mws.toml"}  # Trunk.board: ours, truth_kind = "instances"
 # mia_eval() calls mia-evals as a library (a path dependency on the sister checkout, see pyproject.toml); its commit is recorded
 # in each score's provenance (mia_evals_commit).
 
 
 @dataclass
 class Experiment:
-    """An experiment (README: experiment ids): the phase that starts each run, and its runs, each a Train whose savedir is
+    """An experiment (README: experiment ids): the task that starts each run, and its runs, each a Trunk whose savedir is
     outdir/<id>/<name>/."""
     id: str  # <series>/e<NN>[-<NN>...]-<slug>, e.g. e00/e15-02-pca
-    root: Callable  # the first phase of every run (a task taking a Train)
-    runs: dict[str, Train]  # by name: [a-z][a-z0-9_-]*
+    task: Callable  # the first task of every run (one taking a Trunk)
+    runs: dict[str, Trunk]  # by name: [a-z][a-z0-9_-]*
 
-    def roots(self) -> dict[str, Train]:
+    def roots(self) -> dict[str, Trunk]:
         assert all(re.fullmatch(r"[a-z][a-z0-9_-]*", name) for name in self.runs), f"run names are lowercase words: {list(self.runs)}"
         return {name: replace(spec, savedir=f"outdir/{self.id}/{name}/") for name, spec in self.runs.items()}
 
@@ -55,16 +58,16 @@ def experiment_dir(savedir: str) -> str:
 
 
 class Task(NamedTuple):
-    """A phase: the function, the specs it takes, and the hardware it needs."""
+    """A task: the function, the spec class(es) it takes, and the hardware it needs."""
     fn: Callable
     spec: type | tuple[type, ...]  # the spec(s) it takes
     needs: str  # "gpus": the Train's own, torchrun; "cpu": SCORE_QUEUE's slots
     minutes: int | Callable[[Spec], int]  # the LSF wall limit (of the spec)
 
-TASKS: dict[str, Task] = {}  # every phase, in the order declared: submit() reads it, `-h` prints it
+TASKS: dict[str, Task] = {}  # every task, in the order declared: submit() reads it, `-h` prints it
 
 def task(spec, needs: str, minutes):
-    """Declare a function a phase of the pipeline (TASKS) and an entrypoint of experiment.py."""
+    """Declare a function a task of the pipeline (TASKS) and an entrypoint of experiment.py."""
     def declare(fn):
         TASKS[fn.__name__] = Task(fn, spec, needs, minutes)
         return fn
@@ -78,15 +81,15 @@ def check_snapshot():
     assert not (b1 and b2), f"LSF job running {__file__} from the shared checkout; submit via go() (code snapshot)"
 
 
-@task(Train, "gpus", 15)
-def benchmark(job: Train | str):
-    """Throughput and a profiler trace of the spec job's training step (or the train.json's it names), with no training run:
+@task(Trunk, "gpus", 15)
+def benchmark(job: Trunk | str):
+    """Throughput and a profiler trace of the trunk's training step (or of the trunk.json it names), with no training run:
     lib.training.benchmark. Every DDP rank."""
     check_snapshot()
-    par = load(job, Train)
+    trunk = load(job, Trunk)
     if int(os.environ.get("RANK", 0)) == 0:
-        record(par, "benchmark")
-    training.benchmark(par)
+        record(trunk, "benchmark")
+    training.benchmark(trunk.train, trunk.savedir)
 
 def replay_bad_batch(exp: Experiment, path: str):
     """Replay a skipped (non-finite gradient) training step from its bad_batch_*.pt dump: lib.training.replay_bad_batch. Like
@@ -95,11 +98,11 @@ def replay_bad_batch(exp: Experiment, path: str):
     ours = Path("outdir", exp.id).resolve()
     assert Path(path).resolve().is_relative_to(ours), f"{path} isn't from this commit's experiment: replay it from its experiment's commit"
     dump = torch.load(path, map_location="cpu", weights_only=False)
-    record(parse(Train, dump["params"]), "replay_bad_batch")
+    record(Trunk(savedir=f"{Path(path).parent}/", train=parse(Train, dump["params"])), "replay_bad_batch")
     return training.replay_bad_batch(dump)
 
-def mia_eval(par: Eval | Finetune) -> float:
-    """Score par's affinities (probe/{fit,test}, written by its probe or finetune) as mia-evals' neuron-instance task on par's board
+def mia_eval(par: Score) -> float:
+    """Score par's branch's affinities (probe/{fit,test}, written by its probe or finetune) as mia-evals' neuron-instance task on its trunk's board
     (mutex watershed + size filter, fitted on the fit block, reported on the test block); panoptic quality, which ranks, comes
     back (VOI and ARE are in the record).
 
@@ -113,10 +116,10 @@ def mia_eval(par: Eval | Finetune) -> float:
 
     from mia_evals import evaluate
     savedir = Path(par.savedir)
-    assert (savedir / "probe/test").is_dir() and (savedir / "probe/fit").is_dir(), f"no probe artifacts in {savedir}: probe or finetune first with score=True"
+    assert (savedir / "probe/test").is_dir() and (savedir / "probe/fit").is_dir(), f"no probe artifacts in {savedir}: probe or finetune first"
     (savedir / "resolved_config.json").write_text(json.dumps(asdict(par)) + "\n")
     (savedir / "git_commit.txt").write_text(code_provenance()["commit_id"] + "\n")
-    config = CODE / BOARDS[par.train.board]  # the snapshot's copy when run as a job
+    config = CODE / BOARDS[par.branch.trunk.board]  # the snapshot's copy when run as a job
     root = savedir.resolve()
     evaluate.cmd_score(Namespace(
         config=config, test=root / "probe/test", val=root / "probe/fit", leaderboard=root / "mia_evals", run_dir=root,
@@ -126,18 +129,18 @@ def mia_eval(par: Eval | Finetune) -> float:
     record_file = sorted(savedir.glob("mia_evals/*/records/*.json"))[-1]
     return json.loads(record_file.read_text())["scores"]["voxel_instance"]["pq"]
 
-def keep_if_best(par: Eval | Finetune, score: float):
-    """Keep par's weights (par.init_from, a branch's end) as its trunk's best.pt if score beats the best so far (best.json, in the
+def keep_if_best(par: Score, score: float):
+    """Keep par's branch's weights (savedir/checkpoint.pt, its end) as its trunk's best.pt if score beats the best so far (best.json, in the
     trunk's dir); else delete them. The scores of one trunk's branches finish in any order, so the compare-and-move is under a lock
     held only for it (a rename, not a copy)."""
-    trunk, weights = Path(par.savedir).parent, Path(par.init_from)
+    trunk, weights = Path(par.savedir).parent, Path(par.savedir) / "checkpoint.pt"
     step = int(Path(par.savedir).name.split("_")[1])
     with open(trunk / "best.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)  # released when the file closes
         best = json.loads((trunk / "best.json").read_text())["score"] if (trunk / "best.json").is_file() else float("-inf")
         if score > best:
             weights.replace(trunk / "best.pt")
-            (trunk / "best.json").write_text(json.dumps({"score": score, "step": step, "board": par.train.board, "from": par.savedir}) + "\n")
+            (trunk / "best.json").write_text(json.dumps({"score": score, "step": step, "board": par.branch.trunk.board, "from": par.savedir}) + "\n")
         else:
             weights.unlink()
     print(f"{par.savedir}: score {score:.4f} {'beats' if score > best else 'does not beat'} the best so far, {best:.4f}", flush=True)
@@ -172,51 +175,53 @@ def bsub(savedir: str, job: str, minutes: int, n_gpus: int, queue: str, cmd: str
     subprocess.run(full, shell=True, stdin=subprocess.DEVNULL, check=True)
     print(f"Submitted {name} (code {code}) to LSF.")
 
+def train_of(job: Spec) -> Train:
+    """The Train a task's spec trains or reads: a Trunk's, a Branch's trunk's, a Score's branch's trunk's."""
+    return job.train if isinstance(job, Trunk) else job.trunk.train if isinstance(job, Branch) else job.branch.trunk.train
+
 def go(fn: Callable, job: Spec):
-    """Run the phase fn on the spec job as its own LSF job: job written to its savedir (dump: train.json, eval.json or
-    finetune.json), and `experiment.py <fn> <that file>` submitted (bsub), which loads it. Hardware by the phase's needs: the
+    """Run the task fn on the spec job as its own LSF job: job written to its savedir (dump: trunk.json, branch.json or
+    score.json), and `experiment.py <fn> <that file>` submitted (bsub), which loads it. Hardware by the task's needs: its
     Train's own GPUs (torchrun), or a CPU job on SCORE_QUEUE. No commit check: callers from the shared checkout (start, lsf)
     assert_committed() first; a job calling it is committed code."""
     name = fn.__name__
     t = TASKS[name]
-    assert isinstance(job, t.spec), f"{job.savedir}: phase {name!r} takes a {t.spec}, not a {type(job).__name__}: {list(TASKS)}"
-    train = job if isinstance(job, Train) else job.train
-    assert t.needs != "gpus" or train.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={train.n_workers} leaves no core for the training process"
+    assert isinstance(job, t.spec), f"{job.savedir}: task {name!r} takes a {t.spec}, not a {type(job).__name__}: {list(TASKS)}"
+    h = train_of(job).hardware
+    assert t.needs != "gpus" or h.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={h.n_workers} leaves no core for the training process"
     spec = dump(job)
     minutes = t.minutes(job) if callable(t.minutes) else t.minutes
     if t.needs == "gpus":
-        bsub(job.savedir, name, minutes, train.n_gpus, train.queue, f"torchrun --standalone --nproc_per_node={train.n_gpus} {{code}}/experiment.py {name} {spec}")
+        bsub(job.savedir, name, minutes, h.n_gpus, h.queue, f"torchrun --standalone --nproc_per_node={h.n_gpus} {{code}}/experiment.py {name} {spec}")
     else:
         bsub(job.savedir, name, minutes, 0, SCORE_QUEUE, f"python {{code}}/experiment.py {name} {spec}", slots=SCORE_SLOTS)
 
-def start(exp: Experiment, p: Train):
-    """Submit p fresh: its savedir emptied (old contents -> outdir/.trash/), then the experiment's first phase."""
-    trash(p.savedir)
-    go(exp.root, p)
+def start(exp: Experiment, run: Trunk):
+    """Submit run fresh: its savedir emptied (old contents -> outdir/.trash/), then the experiment's first task."""
+    trash(run.savedir)
+    go(exp.task, run)
 
 
 def lsf(exp: Experiment, fn: str, target: str):
-    """Redo one phase on LSF, of the run named target or of the spec file target names (train.json, eval.json or
-    finetune.json of any run or branch, e.g. outdir/.../mae/step_0010000/eval.json): `lsf scores <that>` after changing the
-    board. The experiment's first phase on a run restarts it fresh (start); the others run on the spec in place."""
+    """Redo one task on LSF, of the run named target or of the spec file target names (trunk.json, branch.json or score.json
+    of any run or branch, e.g. outdir/.../mae/step_0010000/score.json): `lsf score <that>` after changing the board. The
+    experiment's first task on a run restarts it fresh (start); the others run on the spec in place."""
     assert_committed()
     roots = exp.roots()
-    phase = TASKS[fn].fn if fn in TASKS else None
-    assert phase, f"no phase {fn!r}: {list(TASKS)}"
-    p = roots[target] if target in roots else load(target, Eval if target.endswith("eval.json") else Finetune if target.endswith("finetune.json") else Train)
-    if phase is exp.root:
+    assert fn in TASKS, f"no task {fn!r}: {list(TASKS)}"
+    p = roots[target] if target in roots else load(target, SPECS[Path(target).stem])
+    if TASKS[fn].fn is exp.task:
         start(exp, p)
     else:
-        go(phase, p)
+        go(TASKS[fn].fn, p)
 
 def replaylsf(exp: Experiment, name: str):
     """replay_bad_batch on LSF for the run name's first bad_batch dump. CUDA_LAUNCH_BLOCKING names a crashing kernel."""
-    par = exp.roots()[name]
-    assert isinstance(par, Train), f"{par.savedir}: an eval trains nothing, so it has no bad batches"
-    dumps = sorted(Path(par.savedir).glob("bad_batch_*.pt"))
-    assert dumps, f"no bad_batch_*.pt in {par.savedir}"
+    run = exp.roots()[name]
+    dumps = sorted(Path(run.savedir).glob("bad_batch_*.pt"))
+    assert dumps, f"no bad_batch_*.pt in {run.savedir}"
     assert_committed()
-    bsub(par.savedir, "replay", 30, 1, par.queue, f"env CUDA_LAUNCH_BLOCKING=1 python {{code}}/experiment.py replay_bad_batch {dumps[0]}")
+    bsub(run.savedir, "replay", 30, 1, run.train.hardware.queue, f"env CUDA_LAUNCH_BLOCKING=1 python {{code}}/experiment.py replay_bad_batch {dumps[0]}")
 
 def experiment_id(name: str) -> str | None:
     """The id of a sweep dir name under outdir/<series>/: 'e15-02-pca' -> 'e15-02'. None for one from before
@@ -249,7 +254,7 @@ def check_experiment(exp: Experiment):
 def submitall(exp: Experiment):
     """Submit the experiment (README: one experiment, one entrypoint): every run whose spec isn't in its savedir yet, i.e. not
     submitted before (whether it finished, is still going, or failed). Idempotent: run it again after adding runs; a run
-    already submitted is left alone (`lsf <first phase> <name>` restarts one fresh)."""
+    already submitted is left alone (`lsf <first task> <name>` restarts one fresh)."""
     check_experiment(exp)
     assert_committed()
     for r in exp.roots().values():
@@ -257,11 +262,12 @@ def submitall(exp: Experiment):
             start(exp, r)
 
 
+SPECS = {"trunk": Trunk, "branch": Branch, "score": Score}  # a spec file's name -> its class (spec_path)
 COMMANDS = [replay_bad_batch, lsf, replaylsf, submitall]  # take the experiment first, bound by main
 
 
 def main(exp: Experiment):
-    """The command line of experiment.py: `<phase> <spec json>` (what an LSF job runs), or a command on the experiment's runs."""
+    """The command line of experiment.py: `<task> <spec json>` (what an LSF job runs), or a command on the experiment's runs."""
     names = {**{name: t.fn for name, t in TASKS.items()}, **{f.__name__: partial(f, exp) for f in COMMANDS}}
     if len(sys.argv) == 1 or sys.argv[1] in ("-h", "--help"):
         for name, f in names.items():

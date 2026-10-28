@@ -6,7 +6,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
-from lib.specs import Train, model_config
+from lib.specs import Data, Encoder, Train, model_config
 from lib.models import Lejepa, train_flops
 
 N_PARAMS_CACHE = Path(".cache/lejepa_n_params.json")  # machine-local (gitignored): see lejepa_n_params
@@ -29,7 +29,7 @@ def lejepa_n_params(n_layers: int, width: int) -> tuple[int, int, int]:
     key = f"{code}/{n_layers}x{width}"
     cache = json.loads(N_PARAMS_CACHE.read_text()) if N_PARAMS_CACHE.is_file() else {}
     if key not in cache:
-        model = Lejepa(model_config(replace(Train(), n_layers=n_layers, width=width, global_size=(96, 96, 96))))
+        model = Lejepa(model_config(replace(Train(), encoder=Encoder(n_layers=n_layers, width=width), data=Data(view=(96, 96, 96)))))
         cache[key] = [model._n_encoder_params, model._n_predictor_params, model._n_projector_params]
         N_PARAMS_CACHE.parent.mkdir(exist_ok=True)
         N_PARAMS_CACHE.write_text(json.dumps(cache))
@@ -39,7 +39,7 @@ def sample_flops(name: str, grid=SCALING_GRID) -> float:
     """Model training FLOPs per sample of SIZES[name] (exact: lib.models.lejepa.train_flops, which Lejepa.forward's own
     out.n_flops uses), for a view with this token grid."""
     n_layers, width = SIZES[name]
-    return train_flops(model_config(replace(Train(), n_layers=n_layers, width=width)), grid, *lejepa_n_params(n_layers, width))
+    return train_flops(model_config(replace(Train(), encoder=Encoder(n_layers=n_layers, width=width))), grid, *lejepa_n_params(n_layers, width))
 
 def step_seconds(name: str, batch: int, grid=SCALING_GRID) -> float:
     """Estimated seconds per training step of SIZES[name] at this per-GPU batch: ANCHOR_STEP_S_M_B84 scaled by FLOPs per

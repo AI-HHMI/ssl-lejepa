@@ -34,14 +34,17 @@ git checkout main
 bjobs -w
 ```
 
-Design an experiment: `experiment.py` is its phases and its table of runs. The phases are functions declared with `@task` (spec,
-hardware), each calling the next with `go()`, which submits it as an LSF job: a `trunk` pretrains in one job and forks a `branch` at its
-start and after every segment; a branch anneals, runs pca and tiled inference, and goes to `scores`, a CPU job after which the trunk
-keeps `best.pt`. The module docstring says which volumes each phase uses (train, val, fit, test, tune: the parts every dataset of
-`lib/data.py` has). The table is `BASE.but(...)`, one line per run, named (`H200` and `B300` are whole nodes); `lib/jobs.py` is the rest.
-`python experiment.py -h` lists the phases with their hardware.
+Design an experiment: `experiment.py` is its tasks and its table of runs. Words: an *experiment* is one `experiment.py` (an id and its
+runs); a *run* is one named line of its table, a `Trunk` spec you write; a *task* is a function of the pipeline (`trunk`, `branch`,
+`score`), declared with `@task` and taking the spec of its own name; a *job* is a task submitted to LSF by `go()`. The specs nest, each
+holding its parent's: `Score(branch)`, `Branch(trunk)`, `Trunk(train)`, and `Train` (model, encoder, data, optim, hardware, speed,
+profile) is how a model is trained, shared by all. A trunk pretrains in one job and forks a branch at its start and after every
+segment; a branch anneals, runs pca and tiled inference, and goes to `score`, a CPU job after which the trunk keeps `best.pt`. The
+module docstring says which volumes each task uses (train, val, fit, test, tune: the parts every dataset of `lib/data.py` has). The
+table is `BASE.but(...)` per run (`H200` and `B300` are whole nodes); `lib/jobs.py` is the rest.
+`python experiment.py -h` lists the tasks with their hardware.
 ```sh
 # [On the Janelia cluster, from the experiment's commit.]
 sh jrun.sh exp experiment.py submitall        # every run not submitted yet
-sh jrun.sh exp experiment.py lsf benchmark mask7   # one phase of one run (or of a spec json, e.g. a branch's eval.json)
+sh jrun.sh exp experiment.py lsf benchmark mask7   # one task of one run (or of a spec json, e.g. a branch's score.json)
 ```

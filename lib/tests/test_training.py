@@ -18,10 +18,17 @@ from lib.specs import Train
 from lib.views import ViewConfig
 
 
-def train(par: Train, steps: int, lr1: float | None = None):
-    """A Trainer's one train() of steps steps, the lr par.lr (to lr1, if given); the Trainer, closed."""
-    with training.Trainer(par, steps) as t:
-        t.train(steps, par.lr, par.lr if lr1 is None else lr1)
+def small(objective=None, profile_steps=0, compile=True, qk_norm=False) -> Train:
+    """A Train on 8^3 windows and a synthetic loader (no workers)."""
+    return Train(model=objective or specs.Masked(), encoder=specs.Encoder(qk_norm=qk_norm), data=specs.Data(window=(8, 8, 8)),
+                 optim=specs.Optim(batch_size=2), hardware=specs.Hardware(n_workers=0), speed=specs.Speed(defer_image_ops=False, compile=compile),
+                 profile=specs.Profile(warmup_steps=1, benchmark_steps=2, profile_steps=profile_steps))
+
+
+def train(par: Train, savedir, steps: int, lr1: float | None = None):
+    """A Trainer's one train() of steps steps, the lr par.optim.lr (to lr1, if given); the Trainer, closed."""
+    with training.Trainer(par, str(savedir), steps) as t:
+        t.train(steps, par.optim.lr, par.optim.lr if lr1 is None else lr1)
     return t
 
 
@@ -85,11 +92,7 @@ def patch_training(monkeypatch):
     [(2, 7, 2), (0, 4, 0), (3, 4, 0), (3, 5, 1)],
 )
 def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorded_steps):
-    params = Train(
-        savedir=str(tmp_path), patch_size=(8, 8, 8), batch_size=2,
-        warmup_steps=1, benchmark_steps=2, profile_steps=profile_steps,
-        n_workers=0, defer_image_ops=False,  # synthetic dataset yields finished float images; loaded in-process (no worker startup)
-    )
+    params = small(profile_steps=profile_steps)  # the synthetic dataset yields finished float images, loaded in-process (no worker startup)
     patch_training(monkeypatch)
     consumed = []
 
@@ -102,9 +105,9 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
         return model
 
     monkeypatch.setattr(specs.models, "Lejepa", small_model)
-    train(params, n_steps)
+    train(params, tmp_path, n_steps)
 
-    assert consumed == list(range(n_steps * params.batch_size))
+    assert consumed == list(range(n_steps * params.optim.batch_size))
     metrics = [json.loads(line) for line in (tmp_path / "metrics.json").read_text().splitlines()]
     assert metrics[-1]["idx_step"] == n_steps - 1  # Training continues beyond capture.
     assert all(torch.isfinite(torch.tensor(row["loss"])) for row in metrics)
@@ -135,28 +138,23 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
 
 @pytest.mark.parametrize("objective", ["views", "mae"])
 def test_each_objective_trains_logs_its_terms_and_reloads_for_eval(tmp_path, monkeypatch, objective):
-    params = Train(savedir=str(tmp_path), model={"views": specs.Views(), "mae": specs.Mae()}[objective], patch_size=(8, 8, 8), batch_size=2,
-                              warmup_steps=1, benchmark_steps=1, profile_steps=0, n_workers=0, defer_image_ops=False)
+    params = small({"views": specs.Views(), "mae": specs.Mae()}[objective])
     patch_training(monkeypatch)
-    train(params, 3).save(tmp_path / "checkpoint.pt")
+    train(params, tmp_path, 3).save(tmp_path / "checkpoint.pt")
     metrics = [json.loads(line) for line in (tmp_path / "metrics.json").read_text().splitlines()]
     assert metrics[-1]["idx_step"] == 2 and all(torch.isfinite(torch.tensor(row["loss"])) for row in metrics)
     if objective == "views":  # LeJEPA's two terms, logged apart
         assert all(row["loss"] == pytest.approx(row["inv"] + LejepaConfig().lamb * row["sigreg"], rel=1e-5) for row in metrics)
     else:  # an MAE's reconstruction error alone
         assert not {"inv", "sigreg"} & set(metrics[-1])
-    model, step = specs.load_checkpoint(specs.Eval(savedir=str(tmp_path), train=params, init_from=str(tmp_path)))  # strict: the saved weights fit the objective's model
+    model, step = specs.load_checkpoint(params, str(tmp_path / "checkpoint.pt"))  # strict: the saved weights fit the objective's model
     assert step == 3 and type(model).__name__ == {"views": "Lejepa", "mae": "Mae"}[objective]
 
 
 def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
     run = tmp_path / "d0"
     run.mkdir()
-    params = Train(
-        savedir=f"{run}/", patch_size=(8, 8, 8), batch_size=2,
-        warmup_steps=1, benchmark_steps=2, profile_steps=0, n_workers=0, defer_image_ops=False,
-        compile=False,  # eager on CPU, so the replay below must reproduce the step's loss exactly
-    )
+    params = small(compile=False)  # eager on CPU, so the replay below must reproduce the step's loss exactly
     patch_training(monkeypatch)
     monkeypatch.setattr(training, "VolumeDataset", Uint8Dataset)
     losses = []
@@ -171,7 +169,7 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
             return out
 
     monkeypatch.setattr(specs.models, "Lejepa", PoisonedStep)
-    train(params, 6).save(run / "checkpoint.pt")
+    train(params, run, 6).save(run / "checkpoint.pt")
 
     metrics = [json.loads(line) for line in (run / "metrics.json").read_text().splitlines()]
     assert metrics[-1]["idx_step"] == 5 and metrics[-1]["skipped"] == 1  # training continued past the bad step
@@ -188,12 +186,9 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
 
 
 def test_benchmark_times_and_profiles_the_training_step_only(tmp_path, monkeypatch):
-    params = Train(
-        savedir=str(tmp_path), patch_size=(8, 8, 8), batch_size=2,
-        warmup_steps=1, benchmark_steps=2, profile_steps=2, n_workers=0, defer_image_ops=False,
-    )
+    params = small(profile_steps=2)
     patch_training(monkeypatch)
-    training.benchmark(params)
+    training.benchmark(params, str(tmp_path))
     performance = json.loads((tmp_path / "performance.json").read_text())
     assert performance["steps"] == 2 and performance["samples_per_second"] > 0
     assert (tmp_path / "profile.json").is_file() and (tmp_path / "trace_summary.json").is_file()
@@ -202,15 +197,14 @@ def test_benchmark_times_and_profiles_the_training_step_only(tmp_path, monkeypat
 
 def test_the_lr_goes_linearly_from_lr0_to_lr1_after_the_warmup(tmp_path, monkeypatch):
     monkeypatch.setattr(training, "LR_WARMUP", 20)
-    par = Train(savedir=f"{tmp_path}/d0/", patch_size=(8, 8, 8), batch_size=2, qk_norm=True,
-                warmup_steps=1, benchmark_steps=2, profile_steps=0, n_workers=0, defer_image_ops=False, compile=False)
+    par = small(compile=False, qk_norm=True)
     patch_training(monkeypatch)
-    Path(par.savedir).mkdir()
-    train(par, 200, lr1=0.0)
-    rows = [json.loads(line) for line in (Path(par.savedir) / "metrics.json").read_text().splitlines()]
-    lerp = lambda i: par.lr * (1 - i / 200) * min(1, (i + 1) / 20)  # lr0 -> lr1 over the call, times the warmup
+    train(par, tmp_path, 200, lr1=0.0)
+    rows = [json.loads(line) for line in (tmp_path / "metrics.json").read_text().splitlines()]
+    lr = par.optim.lr
+    lerp = lambda i: lr * (1 - i / 200) * min(1, (i + 1) / 20)  # lr0 -> lr1 over the call, times the warmup
     assert all(r["lr"] == pytest.approx(lerp(r["idx_step"])) for r in rows)
-    assert max(r["lr"] for r in rows) == pytest.approx(par.lr * 0.9, rel=0.1) and rows[-1]["lr"] < 0.02 * par.lr  # up, then down to ~0
+    assert max(r["lr"] for r in rows) == pytest.approx(lr * 0.9, rel=0.1) and rows[-1]["lr"] < 0.02 * lr  # up, then down to ~0
 
 
 def test_qk_norm_normalizes_each_heads_queries_and_keys():
@@ -224,39 +218,39 @@ def test_qk_norm_normalizes_each_heads_queries_and_keys():
 
 def test_a_trainer_trains_in_calls_and_a_checkpoint_continues_it(tmp_path, monkeypatch):
     monkeypatch.setattr(training, "LR_WARMUP", 100)  # a short warmup, so a short trunk gets past it
-    src = Train(savedir=f"{tmp_path}/d0/", patch_size=(8, 8, 8), batch_size=2,
-                warmup_steps=1, benchmark_steps=2, profile_steps=0, n_workers=0, defer_image_ops=False, compile=False)
+    par = small(compile=False)
+    lr = par.optim.lr
     patch_training(monkeypatch)
-    Path(src.savedir).mkdir()
-    with training.Trainer(src, 130) as t:
-        t.train(65, src.lr, src.lr)
-        t.train(65, src.lr, src.lr)  # the second call goes on where the first stopped: the step, the warmup, the loader
+    trunk_dir, branch_dir = tmp_path / "trunk", tmp_path / "trunk/step_0000130"
+    trunk_dir.mkdir()
+    branch_dir.mkdir()
+    with training.Trainer(par, str(trunk_dir), 130) as t:
+        t.train(65, lr, lr)
+        t.train(65, lr, lr)  # the second call goes on where the first stopped: the step, the warmup, the loader
         assert t.step == 130
-        t.save(Path(src.savedir) / "step_0000130/start.pt")
-    trunk = [json.loads(line) for line in (Path(src.savedir) / "metrics.json").read_text().splitlines()]
+        t.save(branch_dir / "start.pt")
+    trunk = [json.loads(line) for line in (trunk_dir / "metrics.json").read_text().splitlines()]
     assert [r["idx_step"] for r in trunk] == list(range(0, 70, 10)) + [64] + list(range(70, 130, 10)) + [129]  # one run of steps
-    assert all(r["lr"] == pytest.approx(src.lr * min(1, (r["idx_step"] + 1) / 100)) for r in trunk)  # warmup, then constant
-    assert trunk[-1]["lr"] == src.lr
+    assert all(r["lr"] == pytest.approx(lr * min(1, (r["idx_step"] + 1) / 100)) for r in trunk)  # warmup, then constant
+    assert trunk[-1]["lr"] == lr
 
-    start = Path(src.savedir) / "step_0000130/start.pt"
-    par = replace(src, savedir=f"{src.savedir}step_0000130/")
-    with training.Trainer(par, 12, str(start)) as t:
+    with training.Trainer(par, str(branch_dir), 12, str(branch_dir / "start.pt")) as t:
         assert t.step == 130  # the checkpoint's
-        t.train(12, par.lr, 0.01 * par.lr)
-    metrics = [json.loads(line) for line in (Path(par.savedir) / "metrics.json").read_text().splitlines()]
-    assert metrics[0]["idx_step"] == 130 and metrics[0]["lr"] == pytest.approx(par.lr) and metrics[-1]["lr"] == pytest.approx(par.lr * (1 - 0.99 * 11 / 12))  # lr0 -> lr1 over the call
-    t.save(Path(par.savedir) / "checkpoint.pt")
-    done = torch.load(Path(par.savedir) / "checkpoint.pt", weights_only=False)
+        t.train(12, lr, 0.01 * lr)
+    metrics = [json.loads(line) for line in (branch_dir / "metrics.json").read_text().splitlines()]
+    assert metrics[0]["idx_step"] == 130 and metrics[0]["lr"] == pytest.approx(lr) and metrics[-1]["lr"] == pytest.approx(lr * (1 - 0.99 * 11 / 12))  # lr0 -> lr1 over the call
+    t.save(branch_dir / "checkpoint.pt")
+    done = torch.load(branch_dir / "checkpoint.pt", weights_only=False)
     assert done["step"] == 142 and done["opt"]["state"][0]["step"] == 142  # Adam's moments and step count carried over
 
 
 def test_a_trainer_stops_on_a_non_finite_loss_and_trains_no_more(tmp_path, monkeypatch):
-    par = Train(savedir=str(tmp_path), patch_size=(8, 8, 8), batch_size=2, warmup_steps=1, benchmark_steps=2, profile_steps=0,
-                n_workers=0, defer_image_ops=False, compile=False)
+    par = small(compile=False)
+    lr = par.optim.lr
     patch_training(monkeypatch)
     monkeypatch.setattr(training, "stop_reason", lambda *a: "diverged")
-    with training.Trainer(par, 500) as t:
-        t.train(200, par.lr, par.lr)
+    with training.Trainer(par, str(tmp_path), 500) as t:
+        t.train(200, lr, lr)
         assert t.stopped == "diverged" and t.step == 100  # agreed every 100 steps
-        t.train(200, par.lr, par.lr)
+        t.train(200, lr, lr)
         assert t.step == 100

@@ -38,13 +38,13 @@ def collate_images(samples):
     return torch.stack([s["img"] for s in samples])
 
 def compile_model(model: Lejepa | Mae, par: Train):
-    """torch.compile the encoder in place, as par says (no-op unless par.compile)."""
+    """torch.compile the encoder in place, as par says (no-op unless par.speed.compile)."""
     import torch
-    assert par.compile or not (par.cudagraphs or par.compile_blocks), "cudagraphs / compile_blocks require compile"
-    if not par.compile:
+    assert par.speed.compile or not (par.speed.cudagraphs or par.speed.compile_blocks), "cudagraphs / compile_blocks require compile"
+    if not par.speed.compile:
         return
     torch._logging.set_logs(recompiles=True)  # pyright: ignore[reportPrivateImportUsage]  # recompiles show up in job_*.log
-    if par.cudagraphs:
+    if par.speed.cudagraphs:
         # CUDA graphs replay whole kernel sequences, removing per-kernel CPU launch cost.
         # They need static shapes: displace has exactly 2 encoder shapes (the whole view, and its visible tokens), basic has ~9.
         kwargs = dict(mode="reduce-overhead", dynamic=False)
@@ -52,16 +52,16 @@ def compile_model(model: Lejepa | Mae, par: Train):
         kwargs = dict(dynamic=True)  # Views change shape every step.
     # A whole-encoder compile releases every gradient at the end of one fused backward, so DDP can't
     # start all-reducing until backward is done. Per-block compile releases each block's grads as it finishes.
-    for m in (model.encoder.blocks if par.compile_blocks else [model.encoder]):
+    for m in (model.encoder.blocks if par.speed.compile_blocks else [model.encoder]):
         m.compile(**kwargs)
-    if par.eager_patch_embed:
+    if par.speed.eager_patch_embed:
         # Inductor's fused patchify kernel (triton_poi_fused__to_copy__unsafe_view_clone_permute_view_0: the input's
         # reshape/permute + bf16 cast) hits an illegal memory access under static shapes at batch 64 on B300 and
         # H200 (e00/b300-compile, replay of b300-train8h/d0 with CUDA_LAUNCH_BLOCKING). Run it eagerly instead.
         pe = model.encoder.patch_embed
         setattr(pe, "forward", torch.compiler.disable(pe.forward))  # instance override; nn.Module.__call__ uses it
 
-def save_view_pngs(par: Train, dataset, n_samples: int = 3):
+def save_view_pngs(par: Train, savedir: str, dataset, n_samples: int = 3):
     """Save what the model sees: for n_samples fresh samples, the input and each of its views, as
     center-z slices at native voxel size, left to right (input | globals | locals) -> savedir/views_{i}.png."""
     from PIL import Image
@@ -69,10 +69,10 @@ def save_view_pngs(par: Train, dataset, n_samples: int = 3):
     p = cfg.encoder.patch_size
     maker = ViewMaker(cfg.view, patch_size=(p, p, p) if isinstance(p, int) else p)
     samples = [dataset[i] for i in range(n_samples)]
-    x = finish_images(collate_deferred(samples))["img"] if par.defer_image_ops else collate_images(samples)  # Batch C Z Y X
+    x = finish_images(collate_deferred(samples))["img"] if par.speed.defer_image_ops else collate_images(samples)  # Batch C Z Y X
     globals_, locals_ = maker(x)
     to_u8 = lambda v: (v[0, v.shape[1] // 2].clamp(0, 1) * 255).byte().numpy()  # C Z Y X -> Y X center slice
-    savedir = Path(par.savedir)
+    savedir = Path(savedir)
     savedir.mkdir(parents=True, exist_ok=True)
     for b in range(n_samples):
         panels = [to_u8(v[b]) for v in [x, *globals_, *locals_]]
@@ -81,40 +81,40 @@ def save_view_pngs(par: Train, dataset, n_samples: int = 3):
         Image.fromarray(np.concatenate(panels, axis=1)).save(savedir / f"views_{b}.png")
     print(f"Saved {n_samples} input + view slices to {savedir}/views_*.png", flush=True)
 
-def dataloader(par: Train, steps: int):
+def dataloader(par: Train, savedir: str, steps: int):
     import torch
     # The datasets' train volumes (lib/data.py), images only, each sampled by its weight alone (lib.data.sampling); output is z y x.
-    volumes = [volume_config(v, v.zyx, weight=w) for v, w in sampling(par.data, par.data_power)]
+    volumes = [volume_config(v, v.zyx, weight=w) for v, w in sampling(par.data.sets, par.data.power)]
     mcfg = MiaoConfig(
         volumes=volumes,
-        patch_size=list(par.patch_size),
+        patch_size=list(par.data.window),
         resolutions=[[8.0, 8.0, 8.0]],
         # Extra batches keep workers busy (as in real training) through the last, profiled steps.
-        samples_per_epoch=par.batch_size * (steps + par.n_workers * par.prefetch_factor),
+        samples_per_epoch=par.optim.batch_size * (steps + par.hardware.n_workers * par.hardware.prefetch_factor),
         sampling="random",
         output_axes="lzyx",
-        defer_image_ops=par.defer_image_ops,
+        defer_image_ops=par.speed.defer_image_ops,
     )
     dl = VolumeDataset(mcfg)
     loader = torch.utils.data.DataLoader(
       dl,
-      batch_size=par.batch_size,
-      num_workers=par.n_workers,
-      collate_fn=collate_deferred if par.defer_image_ops else collate_images,
-      prefetch_factor=par.prefetch_factor if par.n_workers else None,  # n_workers 0 (tests): loads in this process, no workers
+      batch_size=par.optim.batch_size,
+      num_workers=par.hardware.n_workers,
+      collate_fn=collate_deferred if par.speed.defer_image_ops else collate_images,
+      prefetch_factor=par.hardware.prefetch_factor if par.hardware.n_workers else None,  # n_workers 0 (tests): loads in this process, no workers
       pin_memory=torch.cuda.is_available(),
-      multiprocessing_context="spawn" if par.n_workers else None,
+      multiprocessing_context="spawn" if par.hardware.n_workers else None,
     )
     batches = iter(loader)
     if int(os.environ.get("RANK", 0)) == 0:
-        save_view_pngs(par, dl)
+        save_view_pngs(par, savedir, dl)
     return batches
 
 def setup(par: Train) -> Rank:
     """Torch settings, this rank's CUDA device and the DDP process group for training par; this process's Rank. Every rank."""
     import torch
     import torch.distributed as dist
-    torch.set_float32_matmul_precision(par.f32mode)
+    torch.set_float32_matmul_precision(par.speed.f32mode)
     # cuDNN's fused attention backward returns NaN grads on some trained weights where flash and mem-efficient
     # don't (replay_bad_batch on e00/nanhunt_beta95/d9): the "divergences" of e00/viewsizes* and nanhunt*.
     # Runs before 2026-09-28 used it (torch's default pick on H200/B300).
@@ -122,7 +122,7 @@ def setup(par: Train) -> Rank:
     # Set by torchrun. Unset (plain `python`, tests) means a single process.
     # Don't seed torch identically across ranks: DataLoader workers derive miao's numpy seed from it.
     r = Rank(rank=int(os.environ.get("RANK", 0)), world=int(os.environ.get("WORLD_SIZE", 1)), local=int(os.environ.get("LOCAL_RANK", 0)))
-    assert r.world == par.n_gpus, f"launched {r.world} ranks but par.n_gpus={par.n_gpus}"
+    assert r.world == par.hardware.n_gpus, f"launched {r.world} ranks but par.hardware.n_gpus={par.hardware.n_gpus}"
     if torch.cuda.is_available():
         torch.cuda.set_device(r.local)
     if r.world > 1:
@@ -146,15 +146,15 @@ def build(par: Train, r: Rank, init_from: str):
     if r.world > 1:
         # SIGReg and projector BatchNorm statistics stay per-rank (local batch) for now.
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[r.local] if r.device().type == "cuda" else None)
-        if par.grad_compress:
+        if par.optim.grad_compress:
             from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
             model.register_comm_hook(None, default_hooks.bf16_compress_hook)
     # AdamW with weight_decay=0 is exactly Adam. Decay only weight matrices, not biases or norm gains.
     decay = [p for p in model.parameters() if p.ndim >= 2]
     no_decay = [p for p in model.parameters() if p.ndim < 2]
-    opt = torch.optim.AdamW([{"params": decay, "weight_decay": par.weight_decay},
+    opt = torch.optim.AdamW([{"params": decay, "weight_decay": par.optim.weight_decay},
                              {"params": no_decay, "weight_decay": 0.0}],
-                            lr=par.lr, betas=(0.9, par.adam_beta2))  # the lr is set at every step (Trainer.train)
+                            lr=par.optim.lr, betas=(0.9, par.optim.adam_beta2))  # the lr is set at every step (Trainer.train)
     if ckpt is not None:  # the Adam moments and step count only: the fresh param groups keep their own lr
         ckpt["opt"]["param_groups"] = opt.state_dict()["param_groups"]
         opt.load_state_dict(ckpt["opt"])
@@ -168,16 +168,16 @@ def train_step(model, opt, batches, par: Train, r: Rank, bench: Benchmark):
     views draw on the CPU generator and SIGReg slices on the GPU's, so a skipped step replays exactly from its dump.)"""
     import torch
     device = r.device()
-    if par.cudagraphs:
+    if par.speed.cudagraphs:
         torch.compiler.cudagraph_mark_step_begin()  # previous step's graph outputs may be overwritten
     # No annotation hooks or profiler are active during the throughput baseline.
     with bench.phase("01_DATA_IO"):
         x = next(batches)
     with bench.phase("03_H2D_TRANSFER"):
         # Deferred batches are dicts of per-sample uint8 crops; finish_images copies and normalizes them.
-        x = finish_images(x, device)["img"] if par.defer_image_ops else x.to(device, non_blocking=True)
+        x = finish_images(x, device)["img"] if par.speed.defer_image_ops else x.to(device, non_blocking=True)
     rng = (torch.get_rng_state(), torch.cuda.get_rng_state(device) if device.type == "cuda" else None)
-    with bench.phase("04_FORWARD_AND_LOSS"), torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.amp):
+    with bench.phase("04_FORWARD_AND_LOSS"), torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.speed.amp):
         out = model(x)
     bench.count(out)
     with bench.phase("05_BACKWARD"):
@@ -190,13 +190,13 @@ def train_step(model, opt, batches, par: Train, r: Rank, bench: Benchmark):
         opt.zero_grad(set_to_none=True)
     return x, out, grad_norm, skipped, rng
 
-def save_bad_batch(par: Train, lejepa, x, rng, step: int):
+def save_bad_batch(par: Train, savedir: str, lejepa, x, rng, step: int):
     """A skipped step, replayable (replay_bad_batch): the weights, still the pre-step ones, the input (uint8: lossless) and
     the RNG state before its forward -> savedir/bad_batch_<step>.pt."""
     import torch
     torch.save({"step": step, "params": asdict(par), "model_config": asdict(lejepa.config), "model": lejepa.state_dict(),
                 "x_uint8": (x.clamp(0, 1) * 255).round().byte().cpu(), "rng_cpu": rng[0], "rng_cuda": rng[1]},
-               Path(par.savedir) / f"bad_batch_{step:07d}.pt")
+               Path(savedir) / f"bad_batch_{step:07d}.pt")
 
 def log_metrics(f, par: Train, lejepa, x, out, grad_norm, lr: float, step: int, n_skipped: int, seconds: float):
     """One metrics.json row (and a progress line) for this step."""
@@ -204,8 +204,8 @@ def log_metrics(f, par: Train, lejepa, x, out, grad_norm, lr: float, step: int, 
     loss = out.loss.detach().item()
     # Median pre-LayerNorm token norm on a global-view-sized corner of 4 samples: residual-stream
     # growth tends to precede divergence (see e00/viewsizes). Eager and grad-free, so cheap.
-    g = par.global_size
-    with torch.no_grad(), torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=par.amp):
+    g = par.data.view
+    with torch.no_grad(), torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=par.speed.amp):
         resid = lejepa.encoder.forward_residual(x[:4, :, :g[0], :g[1], :g[2]])
     # LeJEPA's loss = inv + lamb * sigreg, logged apart: sigreg is ~1.05 for exactly Gaussian projections
     # (its floor), and its pull scales with the per-GPU batch, so the total alone mixes invariance
@@ -231,13 +231,13 @@ def stop_reason(r: Rank, out, n_skipped: int, step: int) -> str:
                f"{n_skipped} steps skipped for non-finite gradients by step {step + 1}; stopping"]
     return next((m for m, s in zip(reasons, stop.tolist()) if s), "")
 
-def record_oom(par: Train, r: Rank, step: int, err: Exception):
+def record_oom(par: Train, savedir: str, r: Rank, step: int, err: Exception):
     """An out-of-memory error as a result row in performance.json (the table shows which configs don't fit)."""
     import torch
     row = {"tbl": "oom", "time": time.time(), "params": asdict(par), "idx_step": step, "error": str(err).splitlines()[0][:300]}
     if r.device().type == "cuda":
         row |= {"gpu_name": torch.cuda.get_device_name(r.device()), "max_mem_gb": torch.cuda.max_memory_allocated(r.device()) / 1e9}
-    with open(Path(par.savedir) / "performance.json", "a") as f:
+    with open(Path(savedir) / "performance.json", "a") as f:
         f.write(json.dumps(row) + "\n")
 
 class Trainer:
@@ -245,14 +245,15 @@ class Trainer:
     often as you like, t.save(path) between. Every DDP rank makes one; leaving the block destroys the process group.
     Rank 0 writes metrics.json, and the throughput window and profile of Benchmark (at the first steps)."""
 
-    def __init__(self, par: Train, steps: int, init_from: str = ""):
-        """steps: the most it will train in all (the loader's supply, the benchmark's windows). init_from: "" fresh, or a checkpoint .pt."""
-        self.par = par
+    def __init__(self, par: Train, savedir: str, steps: int, init_from: str = ""):
+        """savedir: where it writes. steps: the most it will train in all (the loader's supply, the benchmark's windows).
+        init_from: "" fresh, or a checkpoint .pt."""
+        self.par, self.savedir = par, savedir
         self.r = setup(par)
-        self.batches = dataloader(par, steps)  # each rank its own, with its own miao seed (see setup)
+        self.batches = dataloader(par, savedir, steps)  # each rank its own, with its own miao seed (see setup)
         self.model, self.lejepa, self.opt, self.step = build(par, self.r, init_from)  # step: steps done, in all
-        self.first, self.n_skipped, self.stopped, self.start_time, self.lr = self.step, 0, "", time.time(), par.lr
-        self.bench = Benchmark(par, steps, self.r.device(), self.r.world, self.r.rank0)
+        self.first, self.n_skipped, self.stopped, self.start_time, self.lr = self.step, 0, "", time.time(), par.optim.lr
+        self.bench = Benchmark(par, savedir, steps, self.r.device(), self.r.world, self.r.rank0)
 
     def __enter__(self) -> Trainer:
         self.bench.__enter__()
@@ -263,7 +264,7 @@ class Trainer:
         import torch.distributed as dist
         self.bench.__exit__(kind, err, tb)
         if isinstance(err, torch.OutOfMemoryError) and self.r.rank0:
-            record_oom(self.par, self.r, self.step, err)  # then the job fails as usual
+            record_oom(self.par, self.savedir, self.r, self.step, err)  # then the job fails as usual
         if self.r.world > 1:
             dist.destroy_process_group()
 
@@ -278,7 +279,7 @@ class Trainer:
         """steps more steps, the lr going linearly from lr0 to lr1. No validation, no checkpoints: those are the caller's. Stops
         early (self.stopped says why) on a non-finite loss or too many skipped steps; later calls then train nothing."""
         r, par = self.r, self.par
-        with open(Path(par.savedir) / "metrics.json" if r.rank0 else os.devnull, "a") as f:
+        with open(Path(self.savedir) / "metrics.json" if r.rank0 else os.devnull, "a") as f:
             for i in range(steps * (not self.stopped)):
                 lr = lr0 + (lr1 - lr0) * i / steps
                 self.bench.begin(self.step - self.first)
@@ -287,7 +288,7 @@ class Trainer:
                     self.n_skipped += 1
                     print(f"Non-finite grad norm at step {self.step}; skipped ({self.n_skipped} so far)", flush=True)
                     if r.rank0 and self.n_skipped <= BAD_BATCHES_KEPT:
-                        save_bad_batch(par, self.lejepa, x, rng, self.step)
+                        save_bad_batch(par, self.savedir, self.lejepa, x, rng, self.step)
                 with self.bench.phase("07_LOGGING"):
                     if r.rank0 and (self.step % 10 == 0 or i + 1 == steps):
                         log_metrics(f, par, self.lejepa, x, out, grad_norm, self.lr, self.step, self.n_skipped, time.time() - self.start_time)
@@ -312,15 +313,15 @@ class Trainer:
         print(f"Saved {path}", flush=True)
 
 
-def benchmark(par: Train):
-    """Throughput and a profiler trace of par's training step, with no training run:
+def benchmark(par: Train, savedir: str):
+    """Throughput and a profiler trace of par's training step, with no training run, in savedir:
     warmup_steps untimed, benchmark_steps timed (performance.json), then profile_steps traced (profile.json, profile.out,
     trace_summary.json); no metrics, checkpoints or evals. Same setup, data and step as Trainer.train. Every DDP rank."""
-    steps = par.warmup_steps + par.benchmark_steps + 1 + par.profile_steps  # Benchmark's windows, no more
-    with Trainer(par, steps) as t:
+    steps = par.profile.warmup_steps + par.profile.benchmark_steps + 1 + par.profile.profile_steps  # Benchmark's windows, no more
+    with Trainer(par, savedir, steps) as t:
         for i in range(steps):
             t.bench.begin(i)
-            t.advance(par.lr)
+            t.advance(par.optim.lr)
             t.bench.end(i)
 
 def replay_bad_batch(dump: dict):
@@ -343,7 +344,7 @@ def replay_bad_batch(dump: dict):
     from torch.nn.attention import SDPBackend, sdpa_kernel
     par = parse(Train, dump["params"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.set_float32_matmul_precision(par.f32mode)
+    torch.set_float32_matmul_precision(par.speed.f32mode)
     x = dump["x_uint8"].to(device).float() / 255  # Batch C Z Y X, exactly the training input
 
     def step(label: str, compiled: bool, backend: SDPBackend | None = None) -> tuple[float, int]:
@@ -352,14 +353,14 @@ def replay_bad_batch(dump: dict):
         model.to(device).train()
         if compiled:
             compile_model(model, par)
-            if par.cudagraphs:
+            if par.speed.cudagraphs:
                 torch.compiler.cudagraph_mark_step_begin()
         # Same view crops (CPU generator) and SIGReg slices (GPU generator) as the original step.
         torch.set_rng_state(dump["rng_cpu"])
         if device.type == "cuda" and dump["rng_cuda"] is not None:
             torch.cuda.set_rng_state(dump["rng_cuda"], device)
         with sdpa_kernel(backend) if backend else nullcontext():
-            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.amp):
+            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.speed.amp):
                 out = model(x)
             assert isinstance(out, LejepaOutput)
             out.loss.backward()
@@ -370,7 +371,7 @@ def replay_bad_batch(dump: dict):
               + (f", e.g. {bad[:3]}; finite: {good}" if bad else ""), flush=True)
         return out.loss.item(), len(bad)
 
-    print(f"Replaying step {dump['step']} of {par.savedir}", flush=True)
+    print(f"Replaying step {dump['step']}", flush=True)
     try:
         with torch.autograd.detect_anomaly(check_nan=True):
             res = {"eager": step("eager, detect_anomaly", compiled=False)}

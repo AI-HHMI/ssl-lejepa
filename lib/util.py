@@ -129,7 +129,7 @@ def parse(cls, data: dict):
     return job
 
 def load(job, cls):
-    """job itself, or, given a path (a spec dump wrote, e.g. <savedir>/train.json), the spec in it validated as cls (parse):
+    """job itself, or, given a path (a spec dump wrote, e.g. <savedir>/trunk.json), the spec in it validated as cls (parse):
     so an entrypoint runs the same in-process, called with its spec, and as a job, called with the spec's file."""
     if isinstance(job, str):
         return parse(cls, json.loads(Path(job).read_text()))
@@ -137,7 +137,7 @@ def load(job, cls):
     return job
 
 def spec_path(job) -> Path:
-    """Where dump writes the spec job (a dataclass with a savedir): <savedir>/<its class, lowercased>.json, e.g. train.json."""
+    """Where dump writes the spec job (a dataclass with a savedir): <savedir>/<its class, lowercased>.json, e.g. trunk.json."""
     return Path(job.savedir) / f"{type(job).__name__.lower()}.json"
 
 def dump(job) -> Path:
