@@ -315,7 +315,7 @@ def ng_link(name: str, boxes: dict[str, list[list[int]]] | None = None) -> str:
 def ng_mia_evals_hemibrain() -> str:
     """Hemibrain EB crop-001 with mia-evals' neuron-instance GT boxes (labels/proofread-cell-hemibrain-v1.2) and our
     own EB train/val/test split, to see what each eval scores and whether it overlaps our training data.
-    Boxes copied from ~/proj/mia-evals configs/*/data/*.yaml (2026-09-29) and lib/data.py HEMIBRAIN_EB_BOXES."""
+    Boxes copied from ~/proj/mia-evals configs/*/data/*.yaml (2026-09-29) and lib/data.py's hemibrain volumes."""
     return ng_link("em-drosophila-flyem-hemibrain/crop-001_EllipsoidBody_x24000_y23000_z17000", {
         "mia-evals gary_comparison test": [[4000, 5000], [4000, 5000], [4000, 5000]],  # = our test box
         "mia-evals gary_comparison fit": [[4000, 5000], [4000, 5000], [3000, 4000]],  # inside our val slab

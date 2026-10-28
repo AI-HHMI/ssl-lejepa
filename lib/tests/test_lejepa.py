@@ -16,7 +16,7 @@ TINY = LejepaConfig(encoder=EncoderConfig(depth=1, embed_dim=32, num_heads=2, pa
 
 def test_each_part_keeps_its_config_whole():
     cfg = LejepaConfig(encoder=EncoderConfig(depth=2, embed_dim=64, num_heads=2), view=ViewConfig(n_local=0),
-                       mask=MaskConfig(block=0.5, predictor_depth=1), sigreg=SIGRegConfig(num_slices=16), projector=None)
+                       mask=MaskConfig(cube=2, predictor_depth=1), sigreg=SIGRegConfig(num_slices=16), projector=None)
     model = Lejepa(cfg)
     assert model.encoder.config == cfg.encoder and model.sigreg.config == cfg.sigreg and model.view_maker is not None
     assert model.view_maker.config == cfg.view and model.projector is None
@@ -144,15 +144,15 @@ def test_view_maker_displace_locals_inside_globals():
 
 
 def test_mask_block_is_one_cube_per_sample():
-    model = Lejepa(TINY)
-    grid = (4, 5, 6)  # round(0.6 * grid) is a 2 3 4 cube: 24 tokens
+    model = Lejepa(TINY, mask=MaskConfig(cube=3))
+    grid = (4, 5, 6)  # a 3 3 3 cube: 27 tokens
     visible, masked, coords = model.mask_block(grid, torch.zeros(16, 3, dtype=torch.long))  # no shift: the cube's own tokens
-    assert visible.shape == (16, 120 - 24) and masked.shape == (16, 24)
+    assert visible.shape == (16, 120 - 27) and masked.shape == (16, 27)
     assert torch.equal(coords, torch.stack([masked // 30, masked // 6 % 5, masked % 6], dim=-1).float())
     for v, m in zip(visible, masked):
         assert sorted(torch.cat([v, m]).tolist()) == list(range(120))  # a partition of the tokens
         z, y, x = m // 30, m // 6 % 5, m % 6
-        assert [(c.max() - c.min() + 1).item() for c in (z, y, x)] == [2, 3, 4]  # the cube fills its bounding box
+        assert [(c.max() - c.min() + 1).item() for c in (z, y, x)] == [3, 3, 3]  # the cube fills its bounding box
 
 
 def test_the_context_never_sees_the_masked_voxels():
@@ -171,7 +171,7 @@ def test_the_context_never_sees_the_masked_voxels():
 
 def test_a_shifted_targets_centres_fall_in_the_context_cube():
     torch.manual_seed(0)
-    model = Lejepa(TINY, view=ViewConfig(views="displace", global_size=(32, 32, 32)), mask=MaskConfig(block=0.5, shift=8))
+    model = Lejepa(TINY, view=ViewConfig(views="displace", global_size=(32, 32, 32)), mask=MaskConfig(cube=3, shift=8))
     grid, p = (6, 6, 6), 4  # views of 24: the region of 32 less the shift of 8
     offset = torch.randint(-8, 9, (64, 3))  # the target view's origin less the context's, in voxels
     visible, masked, coords = model.mask_block(grid, offset)
@@ -187,7 +187,7 @@ def test_a_shifted_targets_centres_fall_in_the_context_cube():
 
 def test_expand_hides_every_voxel_of_the_masked_target_tokens():
     torch.manual_seed(0)
-    mask = MaskConfig(block=0.5, shift=8, expand=True)
+    mask = MaskConfig(cube=3, shift=8, expand=True)
     model = Lejepa(TINY, view=ViewConfig(views="displace", global_size=(32, 32, 32)), mask=mask)
     grid, p = (6, 6, 6), 4
     offset = torch.randint(-8, 9, (64, 3))
@@ -307,7 +307,7 @@ def test_mae_normalizes_each_target_patch():
 
 
 def test_forward_accounts_tokens_and_flops_of_both_encoder_passes():
-    model = Lejepa(TINY, view=ViewConfig(views="displace", global_size=(16, 16, 16)))  # grid 4 4 4: a masked cube of side round(0.6 * 4) = 2
+    model = Lejepa(TINY, view=ViewConfig(views="displace", global_size=(16, 16, 16)))  # grid 4 4 4: a masked cube of side 2
     out = model(torch.randn(3, 1, 16, 16, 16))
     assert out.n_tokens == 3 * (64 + 56)
     assert out.n_flops == 3 * train_flops(model.config, (4, 4, 4), model._n_encoder_params, model._n_predictor_params, model._n_projector_params)

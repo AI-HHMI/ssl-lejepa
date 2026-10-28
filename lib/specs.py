@@ -1,4 +1,4 @@
-"""The specs of a job (Train, Eval, Finetune: what experiment.py's roots() lists and its LSF code submits), what follows from one
+"""The specs of a job (Train, Eval, Finetune: what an experiment's runs are and lib.jobs submits), what follows from one
 (its model and the milestones it keeps), and the weights it loads."""
 
 from __future__ import annotations
@@ -6,22 +6,57 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field, replace
 from pathlib import Path
+from typing import Literal
 
-from lib.data import DEFAULT_DATA
 from lib.encoders import EncoderConfig
-from lib.models import Lejepa, LejepaConfig, Mae, MaeConfig, MaskConfig
+from lib import models
 from lib.views import ViewConfig
 from lib.util import *
 from lib.types import *
 
 
+# The pretraining objectives: each its own knobs, whole. Train.model is one of them.
+@dataclass(slots=True)
+class Mae:
+    """A masked autoencoder, the pixel-space baseline (lib.models.Mae), on the view Train.global_size."""
+    decoder: tuple[int, int] = (192, 2)  # the decoder's (width, depth), heads width // 32
+    kind: Literal["mae"] = "mae"
+
+
+@dataclass(slots=True)
+class Masked:
+    """Masked-token prediction (lib.models.Lejepa): a cube of the view's tokens is hidden from the encoder and a predictor makes
+    their embeddings, loss = prediction error + lamb x SIGReg. The view is Train.global_size, plus shift (both views' region)."""
+    cube: int = 48  # the masked cube's side, voxels (a multiple of the patch)
+    shift: int = 0  # >0: the targets are a second view's tokens, up to this many voxels off the context's (a multiple of the patch)
+    aligned: bool = False  # shift only: whole-token view origins (lib.models.MaskConfig.aligned)
+    expand: bool = False  # shift only: hide a token more of the context around the masked target tokens (MaskConfig.expand)
+    # SIGReg's pull is lamb x its sample count (its statistic is N x an empirical-CF distance); it sees each view's N tokens.
+    lamb: float = 0.002
+    sigreg_over: Literal["view", "batch", "both"] = "view"  # SIGReg's samples: each view's tokens, each position's batch, or both
+    stop_grad: bool = False  # detach the targets (lib.models.LejepaConfig.stop_grad)
+    kind: Literal["mask"] = "mask"
+
+
+@dataclass(slots=True)
+class Views:
+    """LeJEPA's multi-view invariance (lib.models.Lejepa): 2 global views of Train.global_size and 4 local ones, each pulled to the
+    mean of the globals, loss = invariance + lamb x SIGReg."""
+    local: int = 56  # the local views' side, voxels
+    batch_views: bool = False  # one encoder call per group of same-shape views
+    lamb: float = 0.002
+    kind: Literal["views"] = "views"
+
+
 @dataclass(slots=True)
 class Train:
-    savedir: str = "outdir/e00/main/basic/"
-    data: TrainData = DEFAULT_DATA  # training volumes, see lib.data.TRAIN_BOXES
-    probe_sets: tuple[str, ...] = (DEFAULT_DATA,)  # run(): the lib.data.PROBE_SETS its end of training is probed on (probe_evals)
+    savedir: str = "outdir/e00/scratch/"
+    data: tuple[str, ...] = ()  # the lib.data.DATASETS whose train volumes pretraining samples
+    data_power: float = 0.0  # their sampling: a dataset's share, and a volume's within it, go as voxel count ^ this (lib.data.sampling)
+    eval_on: str = ""  # run(): the lib.data.DATASETS its end of training is evaluated on (its val images, and its fit and test blocks)
+    model: Mae | Masked | Views = field(default_factory=Masked)
     patch_size: Tup3Int = (104, 104, 104)  # voxels are 8 nm isotropic (the dataloader reads every volume at 8 nm)
     batch_size: int = 84
     total_steps: int = 71  # warmup + benchmark + 1 profiler warmup + profile steps: stop right after profiling.
@@ -34,23 +69,7 @@ class Train:
     lr: float = 1e-4  # run(): linear warmup, then held at this lr (or lr_decay; see anneal_from)
     lr_decay: bool = False  # run(): after the warmup, lr falls linearly to 0 at total_steps (a run stopped by max_hours first ends mid-way)
     qk_norm: bool = False  # LayerNorm on the encoder's queries and keys (lib.encoders.EncoderConfig.qk_norm)
-    # The pre-training objective: LeJEPA's multi-view invariance ("views", every run before e02), its masked-token prediction
-    # ("mask", e02-e05), or a masked autoencoder ("mae", the pixel-space baseline: lib.models.Mae). See model_config.
-    objective: Literal["views", "mask", "mae"] = "mask"
-    views: Views = "basic"  # the crops: 'basic' (random scales) or 'displace' (global_size; "views": locals of local_size inside them)
-    global_size: Tup3Int = (88, 88, 88)  # displace only
-    local_size: Tup3Int = (56, 56, 56)  # displace, "views" only (analysis_utils reads it)
-    batch_views: bool = False  # "views": one encoder call per group of same-shape views (2 per step with displace)
-    mae_decoder: tuple[int, int] = (192, 2)  # "mae": the decoder's (width, depth), heads width // 32 (lib.models.MaeConfig)
-    mask_block: float = 0.6  # the masked cube's side as a fraction of the view's token grid side (lib.models.MaskConfig.block)
-    mask_aligned: bool = False  # mask_shift only: whole-token view origins (lib.models.MaskConfig.aligned)
-    mask_expand: bool = False  # mask_shift only: hide a token more of the context around the masked target tokens (MaskConfig.expand)
-    mask_shift: int = 0  # >0: targets from a second view up to this many voxels off the context's (lib.models.MaskConfig.shift); both global_size
-    # loss = prediction error + lamb x SIGReg. SIGReg's pull is lamb x its sample count (its statistic is N x an empirical-CF
-    # distance) and it sees each view's N tokens: the old lamb 0.1 over 32 batch samples (a pull of 3.2) is 0.002 at 12^3 tokens.
-    lamb: float = 0.002
-    sigreg_over: Literal["view", "batch", "both"] = "view"  # SIGReg's samples: each view's tokens, each position's batch, or both (lib.models.Lejepa.sigreg_term)
-    stop_grad: bool = False  # detach the masked-token targets (lib.models.LejepaConfig.stop_grad)
+    global_size: Tup3Int = (88, 88, 88)  # the view each sample trains on, voxels (a multiple of the patch)
 
     # optimizations
     f32mode: F32Mode = "high"
@@ -58,7 +77,7 @@ class Train:
     prefetch_factor: int = 2
     amp: bool = True  # bf16 autocast for forward + loss
     compile: bool = True  # torch.compile(dynamic=True) the encoder
-    cudagraphs: bool = False  # instead compile static with CUDA graphs (mode="reduce-overhead"); needs compile + displace views
+    cudagraphs: bool = False  # instead compile static with CUDA graphs (mode="reduce-overhead"); needs compile
     compile_blocks: bool = False  # compile each transformer block separately so DDP can overlap all-reduce with backward
     defer_image_ops: bool = True  # workers ship uint8 crops; cast + normalize on the GPU (miao.finish_images)
     eager_patch_embed: bool = True  # keep PatchEmbed3d out of torch.compile (see compile_model); False only to study the bug
@@ -76,6 +95,10 @@ class Train:
     benchmark_steps: int = 50
     profile_steps: int = 10  # Set to zero to disable trace collection.
 
+    def but(self, **changes) -> Train:
+        """This spec with these fields changed: how an experiment writes each run as a difference from its base."""
+        return replace(self, **changes)
+
 @dataclass(slots=True)
 class Eval:
     """The spec of pca, probe and score: one set of weights, in the architecture of the run that made them, measured as they
@@ -86,7 +109,7 @@ class Eval:
     init_from: str = ""  # the weights: "" train's own latest checkpoint; a run dir, its latest; a checkpoint .pt; "random" untrained
     score: bool = False  # probe() also writes the affinity artifacts `score` reads (probe/{fit,test}, GBs each; score deletes them after)
     jobs: tuple[str, ...] = ("pca", "probe")  # the entrypoints start() submits for it
-    probe_on: str = DEFAULT_DATA  # probe(): the lib.data.PROBE_SETS whose fit block it fits on and whose test blocks score it
+    data: str = ""  # the lib.data.DATASETS it is measured on: pca and pca_sizes on its first val volume, probe on its fit and test blocks
     standardize: bool = False  # probe(): fit on features standardized per channel (fit block's mean and std; folded back into the Linear)
 
 @dataclass(slots=True)
@@ -97,13 +120,13 @@ class Finetune:
     savedir: str
     train: Train  # the weights' run, as Eval.train: its architecture, and its view size (the crops the decoder fits and predicts on)
     init_from: str = ""  # the weights, as Eval.init_from ("random": the from-scratch baseline)
-    probe_on: str = DEFAULT_DATA  # the lib.data.PROBE_SETS whose fit block it fits and whose test blocks score it
+    data: str = ""  # the lib.data.DATASETS whose fit block it fits and whose test blocks score it
     fit_side: int = 0  # >0: fit on a cube of this side (8 nm voxels) about the fit block's centre, not all of it (less GT)
     steps: int = 10_000  # fit steps (lib.decoders.unetr.fit_unetr, batch 4), scored at 100, 200, 400, ... and the last
     freeze_encoder: bool = True  # False: train the encoder with the decoder (end-to-end finetuning)
     score: bool = False  # finetune() also writes the affinity artifacts `score` reads (probe/{fit,test}, GBs each; score deletes them after)
 
-Spec = Train | Eval | Finetune  # a job's spec: what roots() lists and start() submits
+Spec = Train | Eval | Finetune  # a job's spec: what an Experiment's runs are and start() submits
 
 @dataclass(slots=True)
 class Rank:
@@ -120,35 +143,29 @@ class Rank:
         import torch
         return torch.device(f"cuda:{self.local}" if torch.cuda.is_available() else "cpu")
 
-def lejepa_config(par: Train) -> LejepaConfig:
-    """par's Lejepa: "views" (all runs before e02, which kept lamb 0.1 in the model; set it in par) or "mask"."""
-    assert par.objective != "mae", f"{par.savedir} trains an MAE: model_config"
-    (z, y, x), s = par.global_size, par.mask_shift
-    n_global, n_local = (2, 4) if par.objective == "views" else (1, 0)  # "views": ViewConfig's defaults before e02
-    return LejepaConfig(
-        encoder = EncoderConfig(depth=par.n_layers, embed_dim=par.width, num_heads=par.width // 64, qk_norm=par.qk_norm),
-        objective = par.objective,
-        view = ViewConfig(views=par.views, n_global=n_global, n_local=n_local, global_size=(z + s, y + s, x + s), local_size=par.local_size),  # "mask": both views' region
-        batch_views = par.batch_views,
-        mask = MaskConfig(block=par.mask_block, shift=par.mask_shift, aligned=par.mask_aligned, expand=par.mask_expand),
-        lamb = par.lamb,
-        sigreg_over = par.sigreg_over,
-        stop_grad = par.stop_grad,
-    )
+def encoder_config(par: Train) -> EncoderConfig:
+    return EncoderConfig(depth=par.n_layers, embed_dim=par.width, num_heads=par.width // 64, qk_norm=par.qk_norm)
 
-def model_config(par: Train) -> LejepaConfig | MaeConfig:
-    """par's model's config: an MAE on the same encoder and view, or lejepa_config."""
-    if par.objective != "mae":
-        return lejepa_config(par)
-    (dim, depth) = par.mae_decoder
-    return MaeConfig(encoder=EncoderConfig(depth=par.n_layers, embed_dim=par.width, num_heads=par.width // 64, qk_norm=par.qk_norm),
-                     view=ViewConfig(views=par.views, global_size=par.global_size),
-                     decoder_dim=dim, decoder_depth=depth, decoder_heads=dim // 32)
+def model_config(par: Train) -> models.LejepaConfig | models.MaeConfig:
+    """par's model's config: its objective on the encoder par says, and the view par.global_size (plus the shift of masked tokens)."""
+    m, (z, y, x), patch = par.model, par.global_size, encoder_config(par).patch_size[0]  # the encoder's token side, voxels
+    if isinstance(m, Mae):
+        dim, depth = m.decoder
+        return models.MaeConfig(encoder=encoder_config(par), view=ViewConfig(views="displace", global_size=par.global_size),
+                         decoder_dim=dim, decoder_depth=depth, decoder_heads=dim // 32)
+    if isinstance(m, Views):
+        return models.LejepaConfig(encoder=encoder_config(par), objective="views", batch_views=m.batch_views, lamb=m.lamb,
+                            view=ViewConfig(views="displace", n_global=2, n_local=4, global_size=par.global_size, local_size=(m.local,) * 3))
+    assert m.cube % patch == 0, f"{par.savedir}: the masked cube {m.cube} must be a multiple of the patch {patch}"
+    s = m.shift  # both views' region: the context's, and the targets' offset by up to the shift
+    return models.LejepaConfig(encoder=encoder_config(par), objective="mask", lamb=m.lamb, sigreg_over=m.sigreg_over, stop_grad=m.stop_grad,
+                        view=ViewConfig(views="displace", n_global=1, n_local=0, global_size=(z + s, y + s, x + s)),
+                        mask=models.MaskConfig(cube=m.cube // patch, shift=s, aligned=m.aligned, expand=m.expand))
 
-def make_model(par: Train) -> Lejepa | Mae:
+def make_model(par: Train) -> models.Lejepa | models.Mae:
     """par's model, untrained."""
     c = model_config(par)
-    return Mae(c) if isinstance(c, MaeConfig) else Lejepa(c)
+    return models.Mae(c) if isinstance(c, models.MaeConfig) else models.Lejepa(c)
 
 def load_checkpoint(e: Eval | Finetune):
     """(model on the GPU if any, step) for inference or finetuning (pca, probe, finetune): the weights e.init_from names, in
@@ -198,20 +215,12 @@ def branch_dir(trunk: Train, step: int) -> str:
     return f"{Path(trunk.savedir) / f'step_{step:07d}'}/"
 
 def eval_params(trunk: Train, step: int) -> Eval:
-    """The eval of `trunk`'s milestone at `step`: pca maps and the linear probe (pca, probe) of that checkpoint as saved, not
-    annealed, in branch_dir."""
-    return Eval(savedir=branch_dir(trunk, step), train=trunk, init_from=str(milestone(trunk, step)))
+    """The eval of `trunk`'s milestone at `step`, as saved (not annealed), in branch_dir."""
+    return Eval(savedir=branch_dir(trunk, step), train=trunk, init_from=str(milestone(trunk, step)), data=trunk.eval_on)
 
 def own_eval(t: Train) -> Eval:
     """The eval of a training run's own latest checkpoint, in its own savedir: what run() does after training."""
-    return Eval(savedir=t.savedir, train=t)
-
-def probe_evals(t: Train) -> list[Eval]:
-    """The probes run() makes of a training run's own latest checkpoint: own_eval, or, for a run probed on several sets
-    (Train.probe_sets), one per set in its own savedir, <savedir>probe_<set>/."""
-    if t.probe_sets == (DEFAULT_DATA,):
-        return [own_eval(t)]
-    return [Eval(savedir=f"{t.savedir}probe_{s}/", train=t, probe_on=s) for s in t.probe_sets]
+    return Eval(savedir=t.savedir, train=t, data=t.eval_on)
 
 def source(p: Spec) -> str:
     """The weights p starts from: an anneal's checkpoint (Train.anneal_from), or the ones an eval or finetune reads (init_from)."""

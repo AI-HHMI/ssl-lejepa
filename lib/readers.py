@@ -9,41 +9,42 @@ import lmd_catalog as lmd
 from miao import VolumeDataset
 from miao.config import MiaoConfig
 
-from lib.data import CELLMAP_VAL, TRAIN_BOXES, ProbeVolume, held_out, val_blocks
+from lib.data import Volume
 
-PROBE_SIDE = 896  # a probe block's largest side, 8 nm voxels (its box cut to it about its centre)
+PROBE_SIDE = 896  # a labelled block's largest side, 8 nm voxels (its box cut to it about its centre)
 PROBE_MARGIN = 16  # read_window: the extra read around a window, 8 nm voxels (miao's resampling and label-quantization slack)
 
 
-def held_out_crop(data: str, shape: tuple[int, ...]):
-    """A shape (Z Y X) window of dataset data's held-out region (lib.data.held_out), held out from training: 1 Z Y X in [0, 1],
-    through miao (training's data path and normalization). miao needs the box strictly larger than the patch: one extra
-    voxel per axis leaves exactly one window."""
-    h = held_out(data)
-    box = [[o, o + s + 1] for o, s in zip(h.origin, shape)]
-    assert all(lo <= b[0] and b[1] <= hi for b, (lo, hi) in zip(box, h.region)), f"crop {shape} at {h.origin} leaves {data}'s held-out region {h.region}"
-    vol = lmd.get(h.path).to_miao(bounding_box=box)
-    mcfg = MiaoConfig(volumes=[vol], patch_size=list(shape), resolutions=[[8.0, 8.0, 8.0]],
-                      samples_per_epoch=1, sampling="random", output_axes="lzyx")
-    return VolumeDataset(mcfg)[0]["img"]
+def volume_config(v: Volume, box: list[list[int]] | None, **kw):
+    """miao's VolumeConfig of v (its labels too, if it has any) within box (z y x, level-0 voxels; None: anywhere), and kw (weight)."""
+    clip = {} if v.clip is None else dict(normalize_min=v.clip[0], normalize_max=v.clip[1])
+    return lmd.get(v.crop).to_miao(bounding_box=box, label_key=f"labels/{v.label}" if v.label else None, **clip, **kw)
 
-def probe_volume_config(vol: ProbeVolume, box: list[list[int]] | None, patch: list[int]) -> MiaoConfig:
-    """miao reading patches (Z Y X, 8 nm voxels) of vol within box (Z Y X, level-0 voxels; None: anywhere), image and
-    labels, on a grid (sequential): the first is the one nearest the box's low corner miao's read margins allow."""
-    from miao.config import VolumeConfig
-    lo, hi = vol.clip or (None, None)
-    vc = VolumeConfig(name=vol.name, path=vol.path, image_key="raw", label_key=f"labels/{vol.label_key}", zarr_version="zarr3",
-                      normalize_min=lo, normalize_max=hi, bounding_box=box)
-    return MiaoConfig(volumes=[vc], patch_size=patch, resolutions=[[8.0, 8.0, 8.0]], samples_per_epoch=1, sampling="sequential", output_axes="lzyx")
 
-def volume_grid(vol: ProbeVolume) -> tuple[np.ndarray, np.ndarray]:
+def window_config(v: Volume, patch: list[int], box: list[list[int]] | None, sampling: str = "sequential") -> MiaoConfig:
+    """miao reading patches (Z Y X, 8 nm voxels) of v within box (as volume_config): on a grid (sequential), the first the one
+    nearest the box's low corner miao's read margins allow, or at random."""
+    return MiaoConfig(volumes=[volume_config(v, box)], patch_size=patch, resolutions=[[8.0, 8.0, 8.0]], samples_per_epoch=1,
+                      sampling=sampling, output_axes="lzyx")
+
+
+def crop(v: Volume, shape: tuple[int, ...]):
+    """A shape (Z Y X) window about the centre of v's box: 1 Z Y X in [0, 1], through miao (training's data path and normalization).
+    miao needs the box strictly larger than the patch: one extra voxel per axis leaves exactly one window."""
+    lo, hi = [b[0] for b in v.box[::-1]], [b[1] for b in v.box[::-1]]
+    assert all(h - l >= s + 1 for l, h, s in zip(lo, hi, shape)), f"a crop {shape} doesn't fit v's box {v.box} (x y z)"
+    origin = [(l + h - s) // 2 for l, h, s in zip(lo, hi, shape)]
+    box = [[o, o + s + 1] for o, s in zip(origin, shape)]
+    return VolumeDataset(window_config(v, list(shape), box, "random"))[0]["img"]
+
+def volume_grid(vol: Volume) -> tuple[np.ndarray, np.ndarray]:
     """(level-0 voxel size in nm, level-0 shape), each Z Y X, of vol's image, as miao resolves them (its OME transforms,
     expansion-corrected for ExM). Read off miao's VolumeInfo, which has no public accessor."""
-    info = VolumeDataset(probe_volume_config(vol, None, [8, 8, 8]).model_copy(update={"sampling": "random"}))._volumes[0]  # no grid
+    info = VolumeDataset(window_config(vol, [8, 8, 8], None, "random"))._volumes[0]  # no grid
     order = [info.img_spatial_axes.index(a) for a in "zyx"]
     return np.asarray(info.finest_voxel_size)[order], np.asarray(info.image_meta.scales[0].shape)[info.img_spatial_idx][order]
 
-def read_window(vol: ProbeVolume, center, size: list[int]):
+def read_window(vol: Volume, center, size: list[int]):
     """(img in [0, 1], labels int64), each Z Y X: size voxels at 8 nm about center (Z Y X, level-0 voxels) of vol, read as
     training reads (miao: resampled to 8 nm, normalized; labels nearest). What lies outside the volume is edge-replicated
     in the image and 0 (ignored) in the labels, as is the volume's outermost voxel (miao keeps a voxel's slack inside the
@@ -65,10 +66,10 @@ def read_window(vol: ProbeVolume, center, size: list[int]):
         for slack in (2, 4, 8, PROBE_MARGIN):
             patch = np.minimum(want + 3 * PROBE_MARGIN, ((hi - lo) * vox / 8).astype(int) - slack)
             try:
-                return patch, VolumeDataset(probe_volume_config(vol, box, patch.tolist()))[0]
+                return patch, VolumeDataset(window_config(vol, patch.tolist(), box))[0]
             except ValueError:  # "bounding_box ... too small to contain the requested window"
                 pass
-        assert False, f"{vol.name}: miao reads no window from {box}, even {PROBE_MARGIN} voxels smaller"
+        assert False, f"{vol.crop}: miao reads no window from {box}, even {PROBE_MARGIN} voxels smaller"
 
     patch, sample = first_read()
     img, lab = sample["img"][0], sample["label"][0].long()
@@ -84,7 +85,7 @@ def inner(x, m, size):
     """x's (... Z Y X) box of size (Z Y X) at offset m (Z Y X): read_block's box, within its padded region."""
     return x[..., m[0]:m[0] + size[0], m[1]:m[1] + size[1], m[2]:m[2] + size[2]]
 
-def read_block(vol: ProbeVolume, tile, p, device, side: int = PROBE_SIDE, context: bool = False):
+def read_block(vol: Volume, tile, p, device, side: int = PROBE_SIDE, context: bool = False):
     """vol's box cut to whole patches (p, Z Y X) at most side a side about its centre, read at 8 nm (read_window) with whole
     tiles of context around it: (img Z Y X [the padded region, a multiple of tile, on device], labels Z Y X [the box's],
     m [the box's offset in img, whole patches], size [the box's]). A model tiles img (tile_features, tile_logits); inner(x, m,
@@ -99,20 +100,9 @@ def read_block(vol: ProbeVolume, tile, p, device, side: int = PROBE_SIDE, contex
     return img.to(device), inner(lab, m, size).contiguous().to(device), m, size
 
 
-def image_config(name: str, box: list[list[int]], patch: list[int]) -> MiaoConfig:
-    """miao reading patch-size windows (Z Y X, 8 nm) of catalog volume name within box (x y z, level-0 voxels), images only, on a grid."""
-    return MiaoConfig(volumes=[lmd.get(name).to_miao(bounding_box=box[::-1])], patch_size=patch, resolutions=[[8.0, 8.0, 8.0]],
-                      sampling="sequential", output_axes="lzyx")
-
-def val_configs(family: str, patch: list[int]) -> list[MiaoConfig]:
-    """One miao config per held-out block of a training family: its probe set's blocks (lib.data.val_blocks), or CellMap's labelled crops."""
-    if family == "cellmap":
-        return [image_config(name, box, patch) for name, box in CELLMAP_VAL.items()]
-    return [probe_volume_config(v, [list(b) for b in v.box[::-1]], patch) for v in val_blocks(family)]
-
-def train_configs(family: str, patch: list[int]) -> list[MiaoConfig]:
-    """One per training volume of a family (lib.data.TRAIN_BOXES), as val_configs, for the same loss on what the encoder trains on."""
-    return [image_config(name, box, patch) for name, box in TRAIN_BOXES[family].items()]
+def grid_configs(volumes: list[Volume], patch: list[int]) -> list[MiaoConfig]:
+    """One miao config per volume (images only), reading patch-size windows on a grid, for grid_windows."""
+    return [window_config(v, patch, v.zyx) for v in volumes]
 
 def grid_windows(configs: list[MiaoConfig], n: int):
     """About n windows, an equal number evenly spaced over each config's grid, always the same ones: Window 1 Z Y X in [0, 1]."""

@@ -1,4 +1,4 @@
-"""Tests for lib.probe and lib.evals (probe, finetune), and experiment.score: affinity targets, token layout, fit, AP, and the probe end to end."""
+"""Tests for lib.probe and lib.evals (probe, finetune), and jobs.score: affinity targets, token layout, fit, AP, and the probe end to end."""
 
 import json
 
@@ -7,7 +7,7 @@ import pytest
 import torch
 import zarr
 
-import experiment
+from lib import jobs
 import lib.data
 import lib.probe
 import lib.readers
@@ -25,7 +25,7 @@ BOXES = {"train": [[24, 56], [24, 56], [24, 56]], "fit": [[20, 52], [24, 56], [2
 def synthetic_store(tmp_path, monkeypatch, sets=None):
     """A 64^3 store in x y z at 8 nm, like the hemibrain crop: raw a gradient in x, two objects split at x = 40. The probe
     reads it through a stand-in for read_window (the real one reads OME-zarr through miao; checked on the cluster): the
-    same z y x windows about a centre, edge-replicated (labels 0) outside. Probe sets: hemibrain_eb on BOXES (BOXES' train is its
+    same z y x windows about a centre, edge-replicated (labels 0) outside. Datasets: hemibrain on BOXES (BOXES' train is its
     fit block, its fit the tune block), plus sets: {name: {"fit": volume args, "test": [volume args], "tune"?: volume args}}."""
     x, y, z = np.meshgrid(*[np.arange(64)] * 3, indexing="ij")
     raw, lab = torch.from_numpy((x * 4).astype(np.uint8)).permute(2, 1, 0).float() / 255, torch.from_numpy(1 + (x >= 40)).permute(2, 1, 0).long()
@@ -37,11 +37,12 @@ def synthetic_store(tmp_path, monkeypatch, sets=None):
         img = torch.nn.functional.pad(raw[a[0]:b[0], a[1]:b[1], a[2]:b[2]][None, None], pad, mode="replicate")[0, 0]
         return img, torch.nn.functional.pad(lab[a[0]:b[0], a[1]:b[1], a[2]:b[2]], pad, value=0)
 
-    vol = lambda name, box, annotated=None: lib.data.ProbeVolume(name, str(tmp_path / "crop.zarr"), "cells", box, annotated=annotated)
+    vol = lambda name, box, annotated=None: lib.data.Volume(name, box, "cells", annotated=annotated, name=name)  # the crop is named for the volume
     hemibrain = {s: vol(f"hemibrain_eb_{s}", BOXES[s], BOXES[s] if s != "train" else None) for s in BOXES}
-    monkeypatch.setattr(lib.data, "PROBE_SETS", {"hemibrain_eb": lib.data.ProbeSet(fit=hemibrain["train"], test=[hemibrain["test"]], tune=hemibrain["fit"]),
-                                                 **{name: lib.data.ProbeSet(fit=vol(*roles["fit"]), test=[vol(*v) for v in roles["test"]], tune=vol(*roles["tune"]) if "tune" in roles else None)
-                                                    for name, roles in (sets or {}).items()}})
+    dataset = lambda fit, test, tune=None: lib.data.Dataset(train=[], val=[fit, *test], fit=fit, test=test, tune=tune)
+    monkeypatch.setattr(lib.data, "DATASETS", {"hemibrain": dataset(hemibrain["train"], [hemibrain["test"]], hemibrain["fit"]),
+                                               **{name: dataset(vol(*roles["fit"]), [vol(*v) for v in roles["test"]], vol(*roles["tune"]) if "tune" in roles else None)
+                                                  for name, roles in (sets or {}).items()}})
     monkeypatch.setattr(lib.readers, "volume_grid", lambda vol: (np.array([8.0, 8.0, 8.0]), np.array([64, 64, 64])))
     monkeypatch.setattr(lib.readers, "read_window", read_window)
     monkeypatch.setattr(lib.probe, "FIT_STEPS", 300)  # the linear probe's fit: plenty for the store's one split
@@ -65,8 +66,8 @@ def test_sparse_labels_score_a_labelled_cell_against_unlabelled_as_a_boundary():
     assert dense[0, 0, 0].tolist() == [True, False, False, False, False, False]  # both labelled: cell 1's inside only
     assert sparse[0, 0, 0].tolist() == [True, True, True, True, False, False]  # one labelled: its edges too, not 0 vs 0
     blocks = lambda s: [s.fit, *s.test, *([s.tune] if s.tune else [])]
-    assert all(v.sparse for n, s in lib.data.PROBE_SETS.items() if n != "hemibrain_eb" for v in blocks(s))
-    assert not any(v.sparse for v in blocks(lib.data.PROBE_SETS["hemibrain_eb"]))  # dense proofread: unchanged
+    assert all(v.sparse for n, s in lib.data.DATASETS.items() if n not in ("hemibrain", "cellmap") for v in blocks(s))
+    assert not any(v.sparse for v in blocks(lib.data.DATASETS["hemibrain"]))  # dense proofread: unchanged
 
 
 def test_tokens_voxels_round_trip():
@@ -112,7 +113,7 @@ def test_average_precision():
 @pytest.mark.parametrize("score", [True, False])
 def test_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch, score):
     synthetic_store(tmp_path, monkeypatch)
-    par = specs.Eval(savedir=str(tmp_path / "run"), train=specs.Train(global_size=(24, 24, 24)), score=score)  # 32^3 boxes -> 48^3 of context
+    par = specs.Eval(savedir=str(tmp_path / "run"), train=specs.Train(global_size=(24, 24, 24)), score=score, data="hemibrain")  # 32^3 boxes -> 48^3 of context
     (tmp_path / "run").mkdir()
     model = Lejepa(TINY)
     evals.probe(par, model.eval(), 7)
@@ -145,7 +146,7 @@ def test_finetune_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch, freeze,
     synthetic_store(tmp_path, monkeypatch)
     config = lib.decoders.UnetrConfig
     monkeypatch.setattr(lib.decoders, "UnetrConfig", lambda out_dim: config(out_dim=out_dim, hidden_dim=8))
-    par = specs.Finetune(savedir=str(tmp_path / "run"), train=specs.Train(global_size=(24, 24, 24)), fit_side=fit_side,
+    par = specs.Finetune(savedir=str(tmp_path / "run"), train=specs.Train(global_size=(24, 24, 24)), data="hemibrain", fit_side=fit_side,
                               steps=150, freeze_encoder=freeze)
     spec = dump(par)  # as submit writes it
     model = Lejepa(TINY, encoder=EncoderConfig(depth=2, embed_dim=16, num_heads=2, patch_size=(2, 2, 2)))
@@ -162,9 +163,9 @@ def test_finetune_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch, freeze,
     moved = any(not torch.equal(v, before[k]) for k, v in model.encoder.state_dict().items())
     assert moved != freeze  # the encoder trained with the decoder only when not frozen
     with pytest.raises(AssertionError, match="whole patches"):
-        evals.finetune(specs.Finetune(savedir=par.savedir, train=par.train, fit_side=25), model.eval(), 7)
+        evals.finetune(specs.Finetune(savedir=par.savedir, train=par.train, data="hemibrain", fit_side=25), model.eval(), 7)
     with pytest.raises(AssertionError, match="smaller than a crop"):
-        evals.finetune(specs.Finetune(savedir=par.savedir, train=par.train, fit_side=16), model.eval(), 7)
+        evals.finetune(specs.Finetune(savedir=par.savedir, train=par.train, data="hemibrain", fit_side=16), model.eval(), 7)
 
 
 def test_finetune_writes_the_score_artifacts_only_when_asked(tmp_path, monkeypatch):
@@ -174,7 +175,7 @@ def test_finetune_writes_the_score_artifacts_only_when_asked(tmp_path, monkeypat
     monkeypatch.setattr(lib.decoders, "UnetrConfig", lambda out_dim: config(out_dim=out_dim, hidden_dim=8))
     model = Lejepa(TINY, encoder=EncoderConfig(depth=2, embed_dim=16, num_heads=2, patch_size=(2, 2, 2)))
     for score in (False, True):
-        par = specs.Finetune(savedir=str(tmp_path / f"run{score}"), train=specs.Train(global_size=(24, 24, 24)), steps=100, score=score)
+        par = specs.Finetune(savedir=str(tmp_path / f"run{score}"), train=specs.Train(global_size=(24, 24, 24)), data="hemibrain", steps=100, score=score)
         (tmp_path / f"run{score}").mkdir()
         evals.finetune(par, model.eval(), 7)
         assert (tmp_path / f"run{score}/probe").exists() == score
@@ -183,36 +184,36 @@ def test_finetune_writes_the_score_artifacts_only_when_asked(tmp_path, monkeypat
     assert (tmp_path / "runTrue/probe/fit/hemibrain_eb_fit.zarr").is_dir()
 
 
-def test_probe_on_another_set_averages_its_test_blocks(tmp_path, monkeypatch):
-    """A probe set with two test blocks: scored on each, averaged; one png each. Its boxes are cut to whole patches."""
+def test_probe_on_another_dataset_averages_its_test_blocks(tmp_path, monkeypatch):
+    """A dataset with two test blocks: scored on each, averaged; one png each. Its boxes are cut to whole patches."""
     synthetic_store(tmp_path, monkeypatch, {"two": {"fit": ("two_train", [[24, 56], [24, 56], [24, 56]]),
                                                     "test": [("two_a", [[22, 57], [24, 56], [24, 56]]), ("two_b", [[24, 56], [24, 56], [8, 40]])]}})
-    par = specs.Eval(savedir=str(tmp_path / "run"), train=specs.Train(global_size=(24, 24, 24)), probe_on="two")
+    par = specs.Eval(savedir=str(tmp_path / "run"), train=specs.Train(global_size=(24, 24, 24)), data="two")
     (tmp_path / "run").mkdir()
     model = Lejepa(TINY).eval()
     evals.probe(par, model, 7)
     stats = json.loads((tmp_path / "run/probe.json").read_text())
-    assert stats["probe_on"] == "two" and stats["test_blocks"] == ["two_a", "two_b"]
+    assert stats["data"] == "two" and stats["test_blocks"] == ["two_a", "two_b"]
     # In both, +x crosses the x = 40 split once in 32 voxels (two_a's 35 cut to whole patches, 32): 1 of 31 valid layers.
     frac = stats["boundary_frac_(1, 0, 0)"]
     assert abs(frac - 1 / 31) < 0.003 and stats["boundary_frac_(0, 1, 0)"] == 0
-    assert (tmp_path / "run/probe.png").is_file() and (tmp_path / "run/probe_two_b.png").is_file()
+    assert (tmp_path / "run/probe.png").is_file() and (tmp_path / "run/probe_1.png").is_file()
     with pytest.raises(AssertionError, match="no mia-evals tune block for two"):
-        evals.probe(specs.Eval(savedir=str(tmp_path / "run"), train=par.train, probe_on="two", score=True), model, 7)
+        evals.probe(specs.Eval(savedir=str(tmp_path / "run"), train=par.train, data="two", score=True), model, 7)
 
 
 def test_score_artifacts_of_any_set_with_a_tune_block_are_named_for_it(tmp_path, monkeypatch):
     box = [[24, 56], [24, 56], [24, 56]]
     synthetic_store(tmp_path, monkeypatch, {"three": {"fit": ("three_train", box), "tune": ("three_fit", box, [[20, 60]] * 3), "test": [("three_test", box, [[22, 58]] * 3)]}})
     (tmp_path / "run").mkdir()
-    evals.probe(specs.Eval(savedir=str(tmp_path / "run"), train=specs.Train(global_size=(24, 24, 24)), probe_on="three", score=True), Lejepa(TINY).eval(), 7)
+    evals.probe(specs.Eval(savedir=str(tmp_path / "run"), train=specs.Train(global_size=(24, 24, 24)), data="three", score=True), Lejepa(TINY).eval(), 7)
     art = zarr.open_array(str(tmp_path / "run/probe/test/three_test.zarr"), mode="r")
     assert dict(art.attrs)["annotated_box"] == [[22, 58]] * 3 and dict(art.attrs)["source_label_key"] == "labels/cells"
     assert (tmp_path / "run/probe/fit/three_fit.zarr").is_dir()
 
 
 def test_load_checkpoint_init_from(tmp_path, monkeypatch):
-    monkeypatch.setattr(specs, "lejepa_config", lambda par: TINY)
+    monkeypatch.setattr(specs, "model_config", lambda par: TINY)
     small = specs.Train(n_layers=1, width=16)
     a, step = specs.load_checkpoint(specs.Eval(savedir=str(tmp_path), train=small, init_from="random"))
     b, _ = specs.load_checkpoint(specs.Eval(savedir=str(tmp_path), train=small, init_from="random"))
@@ -229,32 +230,32 @@ def test_load_checkpoint_init_from(tmp_path, monkeypatch):
 def test_scoring_config_reads_instances_truth_from_its_own_data_configs():
     import tomllib
     from pathlib import Path
-    path = Path(experiment.__file__).parent / experiment.SCORE_CONFIG
+    path = jobs.CODE / jobs.SCORE_CONFIG
     c = tomllib.loads(path.read_text())
     assert c["task"]["truth_kind"] == "instances"  # GT read from the store, no .gt.zarr copies
     for split, box in [("test", "[[4000, 5000], [4000, 5000], [4000, 5000]]"), ("fit", "[[4000, 5000], [4000, 5000], [3000, 4000]]")]:
         data = (path.parent / c["data"][split]["config_path"]).read_text()  # mia-evals reads these YAMLs relative to the config
-        assert box in data and lib.data.HEMIBRAIN_EB_LABELS in data
+        assert box in data and lib.data.EB_LABEL in data
 
 
 def test_score_runs_the_sister_mia_evals_on_the_probe_artifacts(tmp_path, monkeypatch):
     par = specs.Eval(savedir=str(tmp_path / "run"), train=specs.Train(), score=True)
     for split in ["fit", "test"]:
         (tmp_path / "run/probe" / split).mkdir(parents=True)
-    monkeypatch.setattr(experiment, "code_provenance", lambda: {"commit_id": "abc123"})
+    monkeypatch.setattr(jobs, "code_provenance", lambda: {"commit_id": "abc123"})
     monkeypatch.setattr(specs, "code_provenance", lambda: {"commit_id": "abc123"})  # record's
-    monkeypatch.setattr(experiment, "MIA_EVALS", tmp_path / "mia-evals")
+    monkeypatch.setattr(jobs, "MIA_EVALS", tmp_path / "mia-evals")
     calls = []
     import subprocess
     monkeypatch.setattr(subprocess, "run", lambda cmd, check, cwd: calls.append((cmd, cwd)))
     with pytest.raises(AssertionError, match="no mia-evals CLI"):  # not cloned and synced yet
-        experiment.score(par)
+        jobs.score(par)
     (tmp_path / "mia-evals/.venv/bin").mkdir(parents=True)
     (tmp_path / "mia-evals/.venv/bin/mia-evals").touch()
-    experiment.score(par)
+    jobs.score(par)
     ((cmd, cwd),) = calls
     assert cmd[0] == str(tmp_path / "mia-evals/.venv/bin/mia-evals") and cwd == tmp_path / "mia-evals"
-    assert cmd[1] == "score" and cmd[2].endswith(experiment.SCORE_CONFIG)
+    assert cmd[1] == "score" and cmd[2].endswith(jobs.SCORE_CONFIG)
     args = dict(zip(cmd[3::2], cmd[4::2]))
     assert args["--test"] == str(tmp_path / "run/probe/test") and args["--val"] == str(tmp_path / "run/probe/fit")
     assert args["--leaderboard"] == str(tmp_path / "run/mia_evals") and "--no-scored" in cmd
@@ -266,14 +267,15 @@ def test_score_runs_the_sister_mia_evals_on_the_probe_artifacts(tmp_path, monkey
 def test_lsf_score_submits_a_cpu_job_on_the_runs_own_eval(tmp_path, monkeypatch):
     run = str(tmp_path / "run")
     (tmp_path / "run/probe/test").mkdir(parents=True)
-    monkeypatch.setattr(experiment, "roots", lambda: [specs.Train(savedir=run)])
-    monkeypatch.setattr(experiment, "assert_committed", lambda: None)
-    monkeypatch.setattr(experiment, "snapshot", lambda paths, dest: tmp_path / "code")
+    exp = jobs.Experiment("e00/e01-test", {"a": specs.Train(savedir=run)})
+    monkeypatch.setattr(jobs, "assert_committed", lambda: None)
+    monkeypatch.setattr(jobs, "snapshot", lambda paths, dest: tmp_path / "code")
     submitted = []
     import subprocess
     monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: submitted.append(cmd))
-    experiment.lsf("score", 0)
+    jobs.lsf(exp, "score", "a")
     (cmd,) = submitted
-    assert f"-q {experiment.SCORE_QUEUE}" in cmd and f"-n {experiment.SCORE_SLOTS}" in cmd and "-gpu" not in cmd
-    assert f"experiment.py score {run}/eval.json" in cmd and "job_score_%J.log" in cmd
-    assert load(f"{run}/eval.json", specs.Eval) == specs.own_eval(specs.Train(savedir=run))
+    assert f"-q {jobs.SCORE_QUEUE}" in cmd and f"-n {jobs.SCORE_SLOTS}" in cmd and "-gpu" not in cmd
+    savedir = exp.roots()["a"].savedir
+    assert f"experiment.py score {savedir}eval.json" in cmd and "job_score_%J.log" in cmd
+    assert load(f"{savedir}eval.json", specs.Eval) == specs.own_eval(exp.roots()["a"])

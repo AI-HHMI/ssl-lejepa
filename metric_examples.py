@@ -116,9 +116,9 @@ def strip(path: Path, em: np.ndarray, lab: np.ndarray, pred: np.ndarray, z: int)
 
 def make():
     """Read the crop and write OUT/<case>.png and OUT/metrics.json."""
-    from lib.data import probe_set
+    from lib.data import dataset
     from lib.readers import read_window
-    vol = probe_set("hemibrain_eb").test[0]
+    vol = dataset("hemibrain").test[0]
     center = np.array([(b[0] + b[1]) / 2 for b in vol.box][::-1])  # z y x, level-0 voxels
     em, lab = read_window(vol, center, [SIDE] * 3)
     em, lab = em.numpy(), lab.numpy()

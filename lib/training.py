@@ -15,14 +15,14 @@ from pprint import pprint
 
 import numpy as np
 
-import lmd_catalog as lmd
 from miao import VolumeDataset, collate_deferred, finish_images
 from miao.config import MiaoConfig
 
 from lib.benchmark import Benchmark
-from lib.data import train_volumes
+from lib.data import sampling
 from lib.losses import LejepaOutput
 from lib.models import Lejepa, Mae
+from lib.readers import volume_config
 from lib.specs import Rank, Train, make_model, milestone_steps, model_config
 from lib.util import *
 from lib.views import ViewMaker
@@ -49,7 +49,6 @@ def compile_model(model: Lejepa | Mae, par: Train):
     if par.cudagraphs:
         # CUDA graphs replay whole kernel sequences, removing per-kernel CPU launch cost.
         # They need static shapes: displace has exactly 2 encoder shapes (the whole view, and its visible tokens), basic has ~9.
-        assert par.views == "displace", "cudagraphs needs views='displace' (few static shapes)"
         kwargs = dict(mode="reduce-overhead", dynamic=False)
     else:
         kwargs = dict(dynamic=True)  # Views change shape every step.
@@ -86,10 +85,8 @@ def save_view_pngs(par: Train, dataset, n_samples: int = 3):
 
 def dataloader(par: Train):
     import torch
-    # Training volumes (lib/data.py), images only. Boxes are x y z; output is z y x.
-    # miao samples each volume by its weight alone (size_weighting_exponent=0): equally within a family (lib.data.train_volumes),
-    # and a joint set's families by their voxel count ^ its exponent (lmd4: 0, lmd4_pow04: 0.4). Every volume is read at 8 nm (resolutions below), resampled where it is stored otherwise.
-    volumes = [lmd.get(name).to_miao(bounding_box=box[::-1], weight=w) for name, box, w in train_volumes(par.data)]
+    # The datasets' train volumes (lib/data.py), images only, each sampled by its weight alone (lib.data.sampling); output is z y x.
+    volumes = [volume_config(v, v.zyx, weight=w) for v, w in sampling(par.data, par.data_power)]
     mcfg = MiaoConfig(
         volumes=volumes,
         patch_size=list(par.patch_size),

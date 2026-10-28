@@ -83,7 +83,7 @@ class ProjectorMLP(nn.Module):
 @dataclass
 class MaskConfig:
     """What the model predicts from what: one block of tokens is masked per sample."""
-    block: float = 0.6  # the masked cube's side, as a fraction of the view's token grid side (~22% of the tokens)
+    cube: int = 2  # the masked cube's side, tokens (the same for every sample: static shapes)
     predictor_depth: int = 4  # transformer blocks of the predictor, at the encoder's width and heads
     # >0: the targets are the tokens of a second view of the sample, up to this many voxels (per axis, a multiple of the patch)
     # off the context's: both cut at random from the crop ViewMaker makes, each that much smaller (Lejepa.forward). Their token
@@ -97,10 +97,9 @@ class MaskConfig:
 
 
 def mask_side(mask: MaskConfig, grid: tuple[int, ...]) -> tuple[int, ...]:
-    """Side, in tokens, of the masked cube in a view with this token grid (the same for every sample: static shapes)."""
-    side = tuple(max(1, round(mask.block * g)) for g in grid)
-    assert all(s < g for s, g in zip(side, grid)), f"mask block {side} leaves no visible token in grid {grid}"
-    return side
+    """Side, in tokens, of the masked cube in a view with this token grid."""
+    assert all(mask.cube < g for g in grid), f"mask cube {mask.cube} leaves no visible token in grid {grid}"
+    return (mask.cube,) * len(grid)
 
 
 def hidden_side(mask: MaskConfig, grid: tuple[int, ...]) -> tuple[int, ...]:

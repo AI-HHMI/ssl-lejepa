@@ -7,13 +7,13 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
-from lib.types import Tup3Int, Views
+from lib.types import Tup3Int, ViewMode
 
 
 @dataclass
 class ViewConfig:
     """Configuration for multi-crop view creation (see ViewMaker)."""
-    views: Views = "basic"  # 'none': Lejepa makes no views
+    views: ViewMode = "basic"  # 'none': Lejepa makes no views
     n_global: int = 1  # Lejepa trains on one view per sample (see its mask); other counts are for ViewMaker's own use
     n_local: int = 0
     global_scale: Tuple[float, float] = (0.5, 1.0)  # basic

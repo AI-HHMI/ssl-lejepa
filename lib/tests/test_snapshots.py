@@ -58,7 +58,7 @@ def test_probe_snapshot(tmp_path, monkeypatch):
     synthetic_store(tmp_path, monkeypatch)
     (tmp_path / "run").mkdir()
     model = small_encoder()
-    evals.probe(specs.Eval(savedir=str(tmp_path / "run"), train=specs.Train(global_size=(24, 24, 24))), model, 7)
+    evals.probe(specs.Eval(savedir=str(tmp_path / "run"), train=specs.Train(global_size=(24, 24, 24)), data="hemibrain"), model, 7)
     for f in ("probe.png", "probe.json", "probe_fit.json"):
         check(tmp_path / "run" / f, f"probe/{f}")
 
@@ -69,7 +69,7 @@ def test_unetr_snapshot(tmp_path, monkeypatch, fn, files):
     config = lib.decoders.UnetrConfig
     monkeypatch.setattr(lib.decoders, "UnetrConfig", lambda out_dim: config(out_dim=out_dim, hidden_dim=8))
     model = small_encoder(patch=2)  # Unetr: one block per upsample stage
-    par = specs.Finetune(savedir=str(tmp_path / "run"), train=specs.Train(global_size=(24, 24, 24)), fit_side=24, steps=100)
+    par = specs.Finetune(savedir=str(tmp_path / "run"), train=specs.Train(global_size=(24, 24, 24)), data="hemibrain", fit_side=24, steps=100)
     (tmp_path / "run").mkdir()
     torch.manual_seed(0)  # the decoder's init
     getattr(evals, fn)(par, model, 7)
@@ -79,10 +79,10 @@ def test_unetr_snapshot(tmp_path, monkeypatch, fn, files):
 
 def test_pca_snapshot(tmp_path, monkeypatch):
     model = small_encoder()
-    monkeypatch.setattr(evals, "held_out_crop", lambda data, shape: torch.rand(1, *shape, generator=torch.Generator().manual_seed(1)))
+    monkeypatch.setattr(evals, "crop", lambda volume, shape: torch.rand(1, *shape, generator=torch.Generator().manual_seed(1)))
     monkeypatch.setattr(evals, "TEST_TILES", (8, 16))
-    e = specs.Eval(savedir=f"{tmp_path}/", train=specs.Train(global_size=(16, 16, 16)))
-    evals.pca_maps(model.encoder, e.train, tmp_path, 7, "hemibrain_eb")
+    e = specs.Eval(savedir=f"{tmp_path}/", train=specs.Train(global_size=(16, 16, 16)), data="hemibrain")
+    evals.pca_maps(model.encoder, e.train, tmp_path, 7, "hemibrain")
     evals.pca_sizes(e, model, 7)
     for f in ("pca2.png", "pca.json", "pca_tile_008.png", "pca_tile_016.png", "pca_sizes.json"):
         check(tmp_path / f, f"pca/{f}")

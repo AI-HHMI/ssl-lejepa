@@ -33,3 +33,12 @@ git checkout main
 # Watch the spawned jobs.
 bjobs -w
 ```
+
+Design an experiment: `experiment.py` is only its table of runs (`BASE.but(...)`, one line per run, named; `H200` and `B300` are whole
+nodes) and `lib/jobs.py` the rest. `python experiment.py -h` lists the tasks of the pipeline with the hardware each needs and the data
+it reads (by role: train, val, fit, test, tune, the parts every dataset of `lib/data.py` has).
+```sh
+# [On the Janelia cluster, from the experiment's commit.]
+sh jrun.sh exp experiment.py submitall        # every run not submitted yet
+sh jrun.sh exp experiment.py lsf benchmark mask7   # one task of one run (or of a spec json)
+```

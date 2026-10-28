@@ -5,6 +5,7 @@ import json
 import torch
 
 from lib import evals
+from lib.data import Dataset
 from lib.encoders import EncoderConfig
 from lib.models import Lejepa, LejepaConfig, ProjectorConfig
 from lib.specs import Eval, Train
@@ -17,8 +18,8 @@ def test_pca_sizes_maps_one_crop_at_each_test_tile(tmp_path, monkeypatch):
     torch.manual_seed(0)
     model = Lejepa(LejepaConfig(encoder=EncoderConfig(depth=1, embed_dim=16, num_heads=2, patch_size=(4, 4, 4)), projector=ProjectorConfig(dim=8, hidden=16))).eval()
     monkeypatch.setattr(evals, "TEST_TILES", (8, 16))
-    monkeypatch.setattr(evals, "held_out_crop", lambda data, shape: torch.rand(1, *shape))
-    e = Eval(savedir=f"{tmp_path}/", train=Train(), init_from="outdir/e00/x/d0", jobs=("pca_sizes",))
+    monkeypatch.setattr(evals, "crop", lambda volume, shape: torch.rand(1, *shape))
+    e = Eval(savedir=f"{tmp_path}/", train=Train(), init_from="outdir/e00/x/a", data="hemibrain", jobs=("pca_sizes",))
     assert load(str(dump(e)), Eval) == e  # the spec round-trips, jobs and all
     evals.pca_sizes(e, model, 7)
     rows = [json.loads(line) for line in (tmp_path / "pca_sizes.json").read_text().splitlines()]
@@ -32,20 +33,20 @@ def test_val_loss_measures_the_same_windows_every_time_on_held_out_and_training_
     from lib.models import Lejepa
     torch.manual_seed(0)
     model = Lejepa(LejepaConfig(encoder=EncoderConfig(depth=1, embed_dim=16, num_heads=2, patch_size=(4, 4, 4)), projector=ProjectorConfig(dim=8, hidden=16)))
-    seen, kinds = [], {}
-    monkeypatch.setattr(evals, "val_configs", lambda f, patch: kinds.setdefault(("val", f), f"val {f}") and [("val", f)])
-    monkeypatch.setattr(evals, "train_configs", lambda f, patch: [("train", f)])
+    seen = []
+    monkeypatch.setattr(evals, "dataset", lambda name: Dataset(train=[("train", name)], val=[("val", name)]))
+    monkeypatch.setattr(evals, "grid_configs", lambda volumes, patch: volumes)
 
-    def grid_windows(configs, n):  # a different fixed image for each (kind, family)
+    def grid_windows(configs, n):  # a different fixed image for each (kind, dataset)
         seen.append((configs, n))
         return torch.rand(6, 1, 16, 16, 16, generator=torch.Generator().manual_seed(hash(configs[0]) % 1000))
 
     monkeypatch.setattr(evals, "grid_windows", grid_windows)
-    e = Eval(savedir=str(tmp_path), train=Train(data="lmd4", patch_size=(16, 16, 16), batch_size=4, amp=False), init_from="random")
+    e = Eval(savedir=str(tmp_path), train=Train(data=("hemibrain", "fish2", "liconn_mouse", "microns"), patch_size=(16, 16, 16), batch_size=4, amp=False), init_from="random")
     evals.val_loss(e, model, 5)
     first = json.loads((tmp_path / "val.json").read_text())
     evals.val_loss(e, model, 5)
     assert json.loads((tmp_path / "val.json").read_text()) == first  # seeded views and masks, fixed windows: the same numbers
-    assert first["step"] == 5 and set(first["val"]) == set(first["train"]) == {"hemibrain_wide", "fish2", "liconn_mouse", "microns"}
+    assert first["step"] == 5 and set(first["val"]) == set(first["train"]) == {"hemibrain", "fish2", "liconn_mouse", "microns"}
     assert all({"loss", "inv", "sigreg"} <= set(v) and v["loss"] > 0 for d in ("val", "train") for v in first[d].values())
     assert all(n == evals.VAL_WINDOWS for _, n in seen)

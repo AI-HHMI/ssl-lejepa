@@ -9,10 +9,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from lib import specs, training
+from lib import readers, specs, training
+from lib.data import Volume
 from lib.encoders import EncoderConfig
 from lib.losses import LejepaOutput, SIGRegConfig
-from lib.models import Lejepa, LejepaConfig, MaeConfig, ProjectorConfig
+from lib.models import Lejepa, LejepaConfig, MaeConfig, MaskConfig, ProjectorConfig
 from lib.specs import Train
 from lib.views import ViewConfig
 
@@ -55,21 +56,23 @@ class NanGrad(torch.autograd.Function):
 
 def patch_training(monkeypatch):
     """Point lib.training at a synthetic dataset and a tiny model, with no volumes or GPU."""
-    monkeypatch.setattr(training.lmd, "get", lambda name: SimpleNamespace(to_miao=lambda **kw: None))
+    monkeypatch.setattr(readers.lmd, "get", lambda name: SimpleNamespace(to_miao=lambda **kw: None))
+    monkeypatch.setattr(training, "sampling", lambda names, power: [(Volume("synthetic", [[0, 1]] * 3), 1.0)])
     monkeypatch.setattr(training, "MiaoConfig", SimpleNamespace)
     monkeypatch.setattr(training, "VolumeDataset", SyntheticDataset)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
     def small_model_config(par):  # par's objective, tiny
         encoder = EncoderConfig(depth=1, embed_dim=16, num_heads=2, patch_size=(4, 4, 4))
-        if par.objective == "mae":
+        if par.model.kind == "mae":
             return MaeConfig(encoder=encoder, decoder_dim=8, decoder_heads=2, decoder_depth=1)
         return LejepaConfig(
-            encoder=encoder, objective=par.objective, view=ViewConfig(n_global=2, n_local=1) if par.objective == "views" else ViewConfig(),
-            projector=ProjectorConfig(dim=8, hidden=16), sigreg=SIGRegConfig(num_slices=4, knots=3),
+            encoder=encoder, objective=par.model.kind, view=ViewConfig(n_global=2, n_local=1) if par.model.kind == "views" else ViewConfig(),
+            mask=MaskConfig(cube=1), projector=ProjectorConfig(dim=8, hidden=16), sigreg=SIGRegConfig(num_slices=4, knots=3),
         )
 
     monkeypatch.setattr(specs, "model_config", small_model_config)
+    monkeypatch.setattr(training, "model_config", small_model_config)
 
 
 @pytest.mark.parametrize(
@@ -93,7 +96,7 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
         model.register_forward_pre_hook(record_batch)
         return model
 
-    monkeypatch.setattr(specs, "Lejepa", small_model)
+    monkeypatch.setattr(specs.models, "Lejepa", small_model)
     training.train(params, NO_MILESTONE_EVAL)
 
     assert consumed == list(range(n_steps * params.batch_size))
@@ -127,7 +130,7 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
 
 @pytest.mark.parametrize("objective", ["views", "mae"])
 def test_each_objective_trains_logs_its_terms_and_reloads_for_eval(tmp_path, monkeypatch, objective):
-    params = Train(savedir=str(tmp_path), objective=objective, patch_size=(8, 8, 8), batch_size=2, total_steps=3,
+    params = Train(savedir=str(tmp_path), model={"views": specs.Views(), "mae": specs.Mae()}[objective], patch_size=(8, 8, 8), batch_size=2, total_steps=3,
                               warmup_steps=1, benchmark_steps=1, profile_steps=0, n_workers=0, defer_image_ops=False)
     patch_training(monkeypatch)
     training.train(params, NO_MILESTONE_EVAL)
@@ -162,7 +165,7 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
                 out.loss = NanGrad.apply(out.loss)
             return out
 
-    monkeypatch.setattr(specs, "Lejepa", PoisonedStep)
+    monkeypatch.setattr(specs.models, "Lejepa", PoisonedStep)
     training.train(params, NO_MILESTONE_EVAL)
 
     metrics = [json.loads(line) for line in (run / "metrics.json").read_text().splitlines()]
