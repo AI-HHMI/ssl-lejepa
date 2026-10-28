@@ -19,6 +19,9 @@ def provenance(monkeypatch):  # run records independent of git state
     monkeypatch.setattr(specs, "code_provenance", lambda: {"commit_id": "test-commit", "subject": "test", "dirty": False, "diff_hash": "test-diff"})
 
 
+INSIDE_RUN = [fn for fn, t in experiment.TASKS.items() if t.inside == "run"]  # what a run calls in its own process, in pipeline order
+
+
 def test_pca_keeps_its_milestone(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(experiment, "EXPERIMENT", "e00/e01-test")
@@ -48,7 +51,8 @@ def test_start_submits_an_evals_own_jobs(tmp_path, monkeypatch):
 def test_every_task_is_an_entrypoint_and_its_where_is_known():
     entrypoints = {f.__name__ for f in experiment.ENTRYPOINTS}
     assert set(experiment.TASKS) <= entrypoints, set(experiment.TASKS) - entrypoints
-    assert {t.where for t in experiment.TASKS.values()} <= {"train", "gpu", "cpu"}
+    assert {t.needs for t in experiment.TASKS.values()} <= {"gpus", "gpu", "cpu"}
+    assert {t.inside for t in experiment.TASKS.values()} <= {"", "run"}  # no task is called inside another task's process but run's
 
 
 def test_every_data_use_names_a_role_and_a_source_in_lib_data():
@@ -106,7 +110,7 @@ def test_run_trains_then_evals(tmp_path, monkeypatch, max_hours):
         monkeypatch.setattr(experiment, fn, lambda job, fn=fn: calls.append(fn))
     monkeypatch.delenv("RANK", raising=False)
     experiment.run(experiment.Train(max_hours=max_hours))
-    assert calls == ["train", "pca", "val", "probe"]  # evals after train() has torn down the process group; a benchmark is its own entrypoint
+    assert calls == ["train", *INSIDE_RUN]  # evals after train() has torn down the process group; a benchmark is its own entrypoint
 
 
 def test_a_run_probed_on_several_sets_probes_each_in_its_own_dir(tmp_path, monkeypatch):
@@ -147,11 +151,11 @@ def test_a_trunk_evaluates_its_end_only_off_a_milestone(tmp_path, monkeypatch, f
     (tmp_path / "outdir/e00/e01-test/d0/checkpoints").mkdir(parents=True)
     (tmp_path / f"outdir/e00/e01-test/d0/checkpoints/step_{final_step:07d}.pt").touch()
     experiment.run(trunk)
-    assert calls == ["train", *(["pca", "val", "probe"] if evals else [])]  # on one, train() evaluated it
+    assert calls == ["train", *(INSIDE_RUN if evals else [])]  # on one, train() evaluated it
     anneal = replace(trunk, savedir="outdir/e00/e01-test/d0/step_0001000/", anneal_from=str(specs.milestone(trunk, 1000)))
     calls.clear()
     experiment.run(anneal)  # an anneal has no milestones: it evaluates its end
-    assert calls == ["train", "pca", "val", "probe"]
+    assert calls == ["train", *INSIDE_RUN]
 
 
 def test_submit_refuses_a_job_its_spec_cant_run(tmp_path, monkeypatch):

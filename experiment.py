@@ -74,27 +74,31 @@ class Use(NamedTuple):
     when: str = ""  # the spec flag it needs, e.g. "score" (the tune block's predictions are written only for a score): "" always
 
 class Task(NamedTuple):
-    """One task of the pipeline: the specs it runs on, where, the data it uses and what it writes."""
+    """One task of the pipeline: the specs it runs on, the hardware it needs, whether a task's process runs it itself or only a job does,
+    the data it uses and what it writes."""
     spec: type | tuple[type, ...]  # the spec(s) its entrypoint takes
-    where: str  # "train": the spec's own GPUs (torchrun); "gpu": one, on the trained run's queue; "cpu": SCORE_QUEUE
-    minutes: int  # LSF wall limit (a run with max_hours: that + 60)
+    needs: str  # the hardware: "gpus": the spec's own, torchrun; "gpu": one, on the trained run's queue; "cpu": SCORE_QUEUE's slots
+    minutes: int  # the LSF wall limit if it is its own job (a run with max_hours: that + 60)
+    inside: str  # "": only ever its own LSF job (submit); else the task whose process also calls it, in that process, without a new job
     data: tuple[Use, ...]
     writes: tuple[str, ...]  # into its savedir
 
 TRAIN, VAL, CROP = Use("train", "TrainData", False), Use("val", "VAL_SETS", False), Use("crop", "HELD_OUT", False)
 FIT, TEST, TUNE = Use("fit", "ProbeSet.fit", True), Use("test", "ProbeSet.test", True), Use("tune", "ProbeSet.tune", True)
+TUNE_IF_SCORE = TUNE._replace(labels=False, when="score")  # probe and finetune write the tune block's predictions only for a score
 
-# Every LSF task, in pipeline order: submit() reads where and minutes, `python experiment.py -h` the rest.
+# Every task, in pipeline order: submit() reads needs and minutes, run() and eval_milestone call the tasks inside "run", and
+# `python experiment.py -h` prints the rest.
 TASKS = {
-    "run": Task(Train, "train", 15, (TRAIN,), ("checkpoints/", "metrics.json", "the evals of each milestone and of its end")),
-    "benchmark": Task(Train, "train", 15, (TRAIN,), ("performance.json", "profile.out")),
-    "pca": Task(Eval, "gpu", 30, (CROP,), ("pca.json", "pca2.png")),
-    "pca_sizes": Task(Eval, "gpu", 60, (CROP,), ("pca_sizes.json", "pca_tile_<side>.png")),
-    "val": Task(Eval, "gpu", 30, (VAL, TRAIN), ("val.json",)),
-    "probe": Task(Eval, "gpu", 60, (FIT, TEST, TUNE._replace(labels=False, when="score")), ("probe.json", "probe_fit.json", "probe.png", "probe/{fit,test}/ (score)")),
-    "finetune": Task(Finetune, "gpu", 120, (FIT, TEST, TUNE._replace(labels=False, when="score")), ("finetune_curve.json", "finetune.png", "probe/{fit,test}/ (score)")),
-    "tiles": Task(Finetune, "gpu", 120, (FIT, TEST), ("tiles.png",)),
-    "score": Task((Eval, Finetune), "cpu", SCORE_MINUTES, (TUNE, TEST), ("mia_evals/<task>/records/*.json",)),
+    "run":       Task(Train,            "gpus", 15,            "",    (TRAIN,),                   ("checkpoints/", "metrics.json", "the evals of each milestone and of its end")),
+    "benchmark": Task(Train,            "gpus", 15,            "",    (TRAIN,),                   ("performance.json", "profile.out")),
+    "pca":       Task(Eval,             "gpu",  30,            "run", (CROP,),                    ("pca.json", "pca2.png")),
+    "pca_sizes": Task(Eval,             "gpu",  60,            "",    (CROP,),                    ("pca_sizes.json", "pca_tile_<side>.png")),
+    "val":       Task(Eval,             "gpu",  30,            "run", (VAL, TRAIN),               ("val.json",)),
+    "probe":     Task(Eval,             "gpu",  60,            "run", (FIT, TEST, TUNE_IF_SCORE), ("probe.json", "probe_fit.json", "probe.png", "probe/{fit,test}/ (score)")),
+    "finetune":  Task(Finetune,         "gpu",  120,           "",    (FIT, TEST, TUNE_IF_SCORE), ("finetune_curve.json", "finetune.png", "probe/{fit,test}/ (score)")),
+    "tiles":     Task(Finetune,         "gpu",  120,           "",    (FIT, TEST),                ("tiles.png",)),
+    "score":     Task((Eval, Finetune), "cpu",  SCORE_MINUTES, "",    (TUNE, TEST),               ("mia_evals/<task>/records/*.json",)),
 }
 
 # This experiment's id (README: experiment ids): its roots are outdir/<EXPERIMENT>/d<i>/, a trunk's branches in its own dir.
@@ -343,8 +347,9 @@ def bsub(savedir: str, job: str, minutes: int, n_gpus: int, queue: str, cmd: str
 
 def submit(fn: str, job: Spec, after: str = ""):
     """Run the entrypoint fn on the spec job as an LSF job: job written to its savedir (dump: train.json, eval.json or
-    finetune.json), and `experiment.py <fn> <that file>` submitted (bsub), which loads it. Resources by TASKS[fn].where: a training
-    job on job's queue and GPUs (torchrun), one GPU on the trained run's queue, or a CPU job on SCORE_QUEUE. A finetune of one of this
+    finetune.json), and `experiment.py <fn> <that file>` submitted (bsub), which loads it. Resources by TASKS[fn].needs: a training
+    job on job's queue and GPUs (torchrun), one GPU on the trained run's queue, or a CPU job on SCORE_QUEUE. (The tasks a run calls inside
+    its own process, TASKS[fn].inside, are not submitted by it.) A finetune of one of this
     experiment's own trunks waits in LSF for the trunk's run job, unless the trunk is done (its own probe.json is written). No
     commit check: callers from the shared checkout (submitall, lsf) assert_committed() first; a job submitting one is committed
     code. after: the name of an LSF job a score waits for (start)."""
@@ -353,11 +358,11 @@ def submit(fn: str, job: Spec, after: str = ""):
     assert not isinstance(job, Train) or job.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={job.n_workers} leaves no core for the training process"
     spec = dump(job)
     cmd = f"python {{code}}/experiment.py {fn} {spec}"
-    if task.where == "train":
+    if task.needs == "gpus":
         # Slack: startup, final checkpoint, pca + probe. A run without max_hours (a fixed step count) or a benchmark: task.minutes.
         minutes = int(job.max_hours * 60) + 60 if job.max_hours and fn == "run" else task.minutes
         bsub(job.savedir, fn, minutes, job.n_gpus, job.queue, f"torchrun --standalone --nproc_per_node={job.n_gpus} {{code}}/experiment.py {fn} {spec}")
-    elif task.where == "cpu":
+    elif task.needs == "cpu":
         bsub(job.savedir, fn, task.minutes, 0, SCORE_QUEUE, cmd, slots=SCORE_SLOTS, after=after)
     else:
         b1 = isinstance(job, Finetune) and job.init_from.startswith(f"outdir/{EXPERIMENT}/")
@@ -469,7 +474,9 @@ if __name__ == "__main__":
             print(f"  {name}{inspect.signature(f)}  {(f.__doc__ or '').strip().splitlines()[0]}")
             if name in TASKS:
                 uses = [f"{u.role} = {u.source}, {'labels' if u.labels else 'images'}{f', if {u.when}' if u.when else ''}" for u in TASKS[name].data]
-                print(f"      data: {'; '.join(uses)}\n      writes: {', '.join(TASKS[name].writes)}")
+                t = TASKS[name]
+                print(f"      needs: {t.needs}; as a job, and also inside {t.inside}'s own process" if t.inside else f"      needs: {t.needs}; as a job")
+                print(f"      data: {'; '.join(uses)}\n      writes: {', '.join(t.writes)}")
         print("data roles:\n" + "\n".join(f"  {role}: {what}" for role, what in ROLES.items()))
         sys.exit()
     assert sys.argv[1] in names, f"unknown entrypoint {sys.argv[1]!r}: {', '.join(names)}"
