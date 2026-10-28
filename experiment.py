@@ -10,7 +10,7 @@ from dataclasses import replace
 from functools import partial
 
 from lib.task_utils import B300, H200, Experiment, main
-from lib.specs import Data, Encoder, Mae, Masked, Optim, Speed, Train, Views
+from lib.training import Data, Encoder, Mae, Masked, Optim, Speed, Train, Views
 from tasks import Trunk, trunk
 
 DATA = ("hemibrain", "fish2", "liconn_mouse", "microns", "cellmap")

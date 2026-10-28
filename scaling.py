@@ -6,7 +6,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
-from lib.specs import Data, Encoder, Train, model_config
+from lib.training import Data, Encoder, Train, model_config
 from lib.models import Lejepa, train_flops
 
 N_PARAMS_CACHE = Path(".cache/lejepa_n_params.json")  # machine-local (gitignored): see lejepa_n_params

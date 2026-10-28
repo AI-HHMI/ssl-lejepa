@@ -12,13 +12,13 @@ import pytest
 
 import experiment
 import tasks
-from lib import evals, task_utils, specs
+from lib import evals, task_utils, training
 from lib.task_utils import Experiment
 
 
 @pytest.fixture(autouse=True)
 def provenance(monkeypatch):  # run records independent of git state
-    monkeypatch.setattr(specs, "code_provenance", lambda: {"commit_id": "test-commit", "subject": "test", "dirty": False, "diff_hash": "test-diff"})
+    monkeypatch.setattr(task_utils, "code_provenance", lambda: {"commit_id": "test-commit", "subject": "test", "dirty": False, "diff_hash": "test-diff"})
 
 
 class FakeTrainer:
@@ -61,7 +61,7 @@ def gone(tmp_path, monkeypatch):
     return gone
 
 
-TRUNK = tasks.Trunk(savedir="outdir/e00/e01-test/a/", train=specs.Train(optim=specs.Optim(lr=1e-3)), segments=3, segment_steps=100,
+TRUNK = tasks.Trunk(savedir="outdir/e00/e01-test/a/", train=training.Train(optim=training.Optim(lr=1e-3)), segments=3, segment_steps=100,
                    anneal_steps=40, anneal_to=0.1, eval_data="hemibrain")
 
 
@@ -140,7 +140,7 @@ def test_go_writes_the_spec_its_job_loads_and_asks_for_the_hardware_the_task_nee
     monkeypatch.chdir(tmp_path)
     submitted = []
     monkeypatch.setattr(task_utils, "bsub", lambda savedir, job, minutes, n_gpus, queue, cmd, **kw: submitted.append((job, minutes, n_gpus, queue, cmd)))
-    trunk = replace(TRUNK, savedir="outdir/e00/x/a/", hours=3, train=specs.Train(hardware=specs.Hardware(queue="gpu_b300", n_gpus=2, n_workers=11)))
+    trunk = replace(TRUNK, savedir="outdir/e00/x/a/", hours=3, train=training.Train(hardware=training.Hardware(queue="gpu_b300", n_gpus=2, n_workers=11)))
     b = tasks.Branch(savedir="outdir/e00/x/a/step_0000100/", trunk=trunk, init_from="outdir/e00/x/a/step_0000100/start.pt")
     s = tasks.Score(savedir=b.savedir, branch=b)
     task_utils.go(tasks.trunk, trunk)
@@ -166,7 +166,7 @@ def test_the_experiment_file_names_runs_that_load_as_a_job_loads_them(tmp_path, 
     for name, r in experiment.EXPERIMENT.roots().items():  # a job validates its json (pydantic's Literals), which building the dataclass doesn't
         assert r.savedir == f"outdir/{experiment.EXPERIMENT.id}/{name}/"
         assert task_utils.parse(type(r), asdict(r)) == r, name
-        specs.model_config(r.train)  # its model builds on its encoder's patch
+        training.model_config(r.train)  # its model builds on its encoder's patch
         assert r.hours * 60 > 0 and r.segments * r.segment_steps > 0
         assert r.train.hardware.n_workers + 1 <= task_utils.CPUS_PER_GPU
     assert experiment.EXPERIMENT.task is tasks.trunk

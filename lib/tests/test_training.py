@@ -2,27 +2,27 @@
 non-finite step and its replay, benchmark. The data is synthetic and the model tiny; no cluster, git or GPU."""
 
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from lib import readers, specs, training
+from lib import readers, task_utils, training
 from lib.data import Volume
 from lib.encoders import EncoderConfig
 from lib.losses import LejepaOutput, SIGRegConfig
 from lib.models import Lejepa, LejepaConfig, MaeConfig, MaskConfig, ProjectorConfig
-from lib.specs import Train
+from lib.training import Train
 from lib.views import ViewConfig
 
 
 def small(objective=None, profile_steps=0, compile=True, qk_norm=False) -> Train:
     """A Train on 8^3 windows and a synthetic loader (no workers)."""
-    return Train(model=objective or specs.Masked(), encoder=specs.Encoder(qk_norm=qk_norm), data=specs.Data(window=(8, 8, 8)),
-                 optim=specs.Optim(batch_size=2), hardware=specs.Hardware(n_workers=0), speed=specs.Speed(defer_image_ops=False, compile=compile),
-                 profile=specs.Profile(warmup_steps=1, benchmark_steps=2, profile_steps=profile_steps))
+    return Train(model=objective or training.Masked(), encoder=training.Encoder(qk_norm=qk_norm), data=training.Data(window=(8, 8, 8)),
+                 optim=training.Optim(batch_size=2), hardware=training.Hardware(n_workers=0), speed=training.Speed(defer_image_ops=False, compile=compile),
+                 profile=training.Profile(warmup_steps=1, benchmark_steps=2, profile_steps=profile_steps))
 
 
 def train(par: Train, savedir, steps: int, lr1: float | None = None):
@@ -83,7 +83,6 @@ def patch_training(monkeypatch):
             mask=MaskConfig(cube=1), projector=ProjectorConfig(dim=8, hidden=16), sigreg=SIGRegConfig(num_slices=4, knots=3),
         )
 
-    monkeypatch.setattr(specs, "model_config", small_model_config)
     monkeypatch.setattr(training, "model_config", small_model_config)
 
 
@@ -104,7 +103,7 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
         model.register_forward_pre_hook(record_batch)
         return model
 
-    monkeypatch.setattr(specs.models, "Lejepa", small_model)
+    monkeypatch.setattr(training.models, "Lejepa", small_model)
     train(params, tmp_path, n_steps)
 
     assert consumed == list(range(n_steps * params.optim.batch_size))
@@ -138,7 +137,7 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
 
 @pytest.mark.parametrize("objective", ["views", "mae"])
 def test_each_objective_trains_logs_its_terms_and_reloads_for_eval(tmp_path, monkeypatch, objective):
-    params = small({"views": specs.Views(), "mae": specs.Mae()}[objective])
+    params = small({"views": training.Views(), "mae": training.Mae()}[objective])
     patch_training(monkeypatch)
     train(params, tmp_path, 3).save(tmp_path / "checkpoint.pt")
     metrics = [json.loads(line) for line in (tmp_path / "metrics.json").read_text().splitlines()]
@@ -147,7 +146,7 @@ def test_each_objective_trains_logs_its_terms_and_reloads_for_eval(tmp_path, mon
         assert all(row["loss"] == pytest.approx(row["inv"] + LejepaConfig().lamb * row["sigreg"], rel=1e-5) for row in metrics)
     else:  # an MAE's reconstruction error alone
         assert not {"inv", "sigreg"} & set(metrics[-1])
-    model, step = specs.load_checkpoint(params, str(tmp_path / "checkpoint.pt"))  # strict: the saved weights fit the objective's model
+    model, step = task_utils.load_checkpoint(params, str(tmp_path / "checkpoint.pt"))  # strict: the saved weights fit the objective's model
     assert step == 3 and type(model).__name__ == {"views": "Lejepa", "mae": "Mae"}[objective]
 
 
@@ -168,7 +167,7 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
                 out.loss = NanGrad.apply(out.loss)
             return out
 
-    monkeypatch.setattr(specs.models, "Lejepa", PoisonedStep)
+    monkeypatch.setattr(training.models, "Lejepa", PoisonedStep)
     train(params, run, 6).save(run / "checkpoint.pt")
 
     metrics = [json.loads(line) for line in (run / "metrics.json").read_text().splitlines()]
@@ -254,3 +253,37 @@ def test_a_trainer_stops_on_a_non_finite_loss_and_trains_no_more(tmp_path, monke
         assert t.stopped == "diverged" and t.step == 100  # agreed every 100 steps
         t.train(200, lr, lr)
         assert t.step == 100
+
+
+def test_mae_decoder_sets_the_mae_models_decoder():
+    c = training.model_config(training.Train(model=training.Mae(decoder=(512, 8))))
+    assert isinstance(c, MaeConfig) and (c.decoder_dim, c.decoder_depth, c.decoder_heads) == (512, 8, 16)
+
+
+def test_load_checkpoint_reads_a_milestone_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    par = training.Train(data=training.Data(window=(8, 8, 8), view=(8, 8, 8)))
+    monkeypatch.setattr(training, "model_config", lambda par: LejepaConfig(
+        encoder=EncoderConfig(depth=1, embed_dim=16, num_heads=2, patch_size=(4, 4, 4)), projector=ProjectorConfig(dim=8, hidden=16)))
+    model = Lejepa(training.model_config(par))
+    path = tmp_path / "step_0000130.pt"
+    torch.save({"step": 130, "model": model.state_dict()}, path)
+    loaded, step = task_utils.load_checkpoint(par, str(path))
+    assert step == 130 and torch.equal(loaded.encoder.blocks[0].attn.qkv.weight.cpu(), model.encoder.blocks[0].attn.qkv.weight)
+
+
+def test_each_objective_takes_its_own_knobs_from_the_spec():
+    masked = training.model_config(training.Train(model=training.Masked(cube=40, shift=16, lamb=0.02), data=training.Data(view=(96, 96, 96))))
+    assert masked.objective == "mask" and masked.mask.cube == 5 and masked.lamb == 0.02  # tokens: the cube's voxels over the patch of 8
+    assert masked.view.global_size == (112, 112, 112) and masked.view.n_local == 0  # the context's region, and the shift
+    views = training.model_config(training.Train(model=training.Views(local=64, batch_views=True)))
+    assert views.objective == "views" and views.batch_views and views.view.local_size == (64, 64, 64) and views.view.n_local == 4
+    with pytest.raises(AssertionError, match="multiple of the patch"):
+        training.model_config(training.Train(model=training.Masked(cube=44)))
+
+
+def test_the_models_round_trip_through_a_spec_json():
+    from lib.util import parse
+    for model in (training.Mae(decoder=(512, 8)), training.Masked(cube=56, sigreg_over="both"), training.Views(local=96)):
+        par = training.Train(model=model)
+        assert parse(training.Train, asdict(par)) == par and type(parse(training.Train, asdict(par)).model) is type(model)

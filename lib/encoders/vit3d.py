@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from lib.types import Tup3Int
+Tup3Int = tuple[int, int, int]  # Z Y X
 
 
 def get_3d_sincos_pos_embed(
@@ -208,7 +208,7 @@ class EncoderConfig:
     patch_size: Union[int, Tup3Int] = (8, 8, 8)
     embed_dim: int = 512
     depth: int = 12
-    num_heads: int = 8  # lib.specs.encoder_config sets embed_dim // 64
+    num_heads: int = 8  # lib.training.encoder_config sets embed_dim // 64
     mlp_ratio: float = 4.0
     dropout: float = 0.0
     attention_dropout: float = 0.0

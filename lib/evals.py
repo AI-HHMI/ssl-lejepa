@@ -14,7 +14,7 @@ import numpy as np
 from lib.data import Volume, dataset
 from lib.inference import boundary_png, mean_scores, pca_rgb, score_block, tile_features, tile_logits, write_affinities
 from lib.readers import PROBE_SIDE, crop, inner, read_block
-from lib.specs import Train
+from lib.training import Train
 from lib.util import *
 
 FINETUNE_STEPS = 10_000  # finetune: fit steps (lib.decoders.unetr.fit_unetr, batch 4), scored at 100, 200, 400, ... and the last

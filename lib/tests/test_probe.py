@@ -13,7 +13,7 @@ from lib import task_utils
 import lib.data
 import lib.probe
 import lib.readers
-from lib import evals, specs
+from lib import evals, training
 from lib.util import dump, load
 from lib.encoders import EncoderConfig
 from lib.models import Lejepa, LejepaConfig, ProjectorConfig
@@ -26,11 +26,11 @@ BOXES = {"train": [[24, 56], [24, 56], [24, 56]], "fit": [[20, 52], [24, 56], [2
 
 def branch(tmp_path, data="hemibrain", view=24, **trunk) -> tasks.Branch:
     """A Branch of a trunk that evaluates on data, at view^3 crops, in tmp_path/run."""
-    return tasks.Branch(savedir=str(tmp_path / "run"), trunk=tasks.Trunk(train=specs.Train(data=specs.Data(view=(view,) * 3)), eval_data=data, **trunk), init_from="")
+    return tasks.Branch(savedir=str(tmp_path / "run"), trunk=tasks.Trunk(train=training.Train(data=training.Data(view=(view,) * 3)), eval_data=data, **trunk), init_from="")
 
 
-def train_of(view: int = 24) -> specs.Train:
-    return specs.Train(data=specs.Data(view=(view,) * 3))
+def train_of(view: int = 24) -> training.Train:
+    return training.Train(data=training.Data(view=(view,) * 3))
 
 
 def probe(tmp_path, model, data="hemibrain", view=24):
@@ -206,18 +206,18 @@ def test_score_artifacts_of_any_set_with_a_tune_block_are_named_for_it(tmp_path,
 
 
 def test_load_checkpoint_init_from(tmp_path, monkeypatch):
-    monkeypatch.setattr(specs, "model_config", lambda par: TINY)
-    small = specs.Train(encoder=specs.Encoder(n_layers=1, width=16))
-    a, step = specs.load_checkpoint(small, "random")
-    b, _ = specs.load_checkpoint(small, "random")
+    monkeypatch.setattr(training, "model_config", lambda par: TINY)
+    small = training.Train(encoder=training.Encoder(n_layers=1, width=16))
+    a, step = task_utils.load_checkpoint(small, "random")
+    b, _ = task_utils.load_checkpoint(small, "random")
     assert step == 0 and all(torch.equal(x, y) for x, y in zip(a.state_dict().values(), b.state_dict().values()))  # seeded
     # Another run's checkpoint: loaded into small's architecture even though its saved params differ from small's.
     trained = {k: v + 1 if v.is_floating_point() else v for k, v in a.state_dict().items()}
     torch.save({"step": 42, "params": {"encoder": {"width": 16}}, "model": trained}, tmp_path / "checkpoint.pt")
-    c, step = specs.load_checkpoint(small, str(tmp_path / "checkpoint.pt"))
+    c, step = task_utils.load_checkpoint(small, str(tmp_path / "checkpoint.pt"))
     assert step == 42 and all(torch.equal(x, trained[k]) for k, x in c.state_dict().items())
     with pytest.raises(AssertionError, match="no checkpoint"):
-        specs.load_checkpoint(small, str(tmp_path))
+        task_utils.load_checkpoint(small, str(tmp_path))
 
 
 def test_scoring_config_reads_instances_truth_from_its_own_data_configs():
@@ -238,7 +238,6 @@ def test_score_calls_mia_evals_on_the_probe_artifacts(tmp_path, monkeypatch):
     for split in ["fit", "test"]:
         (tmp_path / "run/probe" / split).mkdir(parents=True)
     monkeypatch.setattr(task_utils, "code_provenance", lambda: {"commit_id": "abc123"})
-    monkeypatch.setattr(specs, "code_provenance", lambda: {"commit_id": "abc123"})  # record's
     calls = []
     def fake_score(args):  # mia-evals writes its record into the leaderboard dir
         calls.append(args)

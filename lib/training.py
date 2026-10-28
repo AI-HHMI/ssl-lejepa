@@ -1,6 +1,7 @@
-"""Training a Train spec: the data loader, DDP setup, model and optimizer, the step, the Trainer that takes a few at a time,
-checkpoints, the stop rules, throughput benchmark and replay of a skipped step. Phases and their bookkeeping (code snapshot
-check, run records, evals, branches) are tasks.py's and lib.task_utils'."""
+"""Train (how a model is trained, in groups: the spec every task of an experiment shares), what follows from one (its model), and
+training it: the data loader, DDP setup, model and optimizer, the step, the Trainer that takes a few at a time, checkpoints, the stop
+rules, throughput benchmark and replay of a skipped step. Tasks and their bookkeeping (code snapshot check, run records, evals,
+branches) are tasks.py's and lib.task_utils'."""
 
 from __future__ import annotations
 
@@ -8,24 +9,25 @@ import json
 import math
 import os
 import time
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
 from pprint import pprint
+from typing import Literal
 
 import numpy as np
 
 from miao import VolumeDataset, collate_deferred, finish_images
 from miao.config import MiaoConfig
 
+from lib import models
 from lib.benchmark import Benchmark
 from lib.data import sampling
+from lib.encoders import EncoderConfig
 from lib.losses import LejepaOutput
-from lib.models import Lejepa, Mae
 from lib.readers import volume_config
-from lib.specs import Rank, Train, make_model, model_config
 from lib.util import *
-from lib.views import ViewMaker
+from lib.views import ViewConfig, ViewMaker
 
 # Training (Trainer): the lr warmup (steps from a fresh model), the max global grad norm, and steps whose gradient is
 # non-finite (skipped, not applied: the run stops after MAX_SKIPPED; the first BAD_BATCHES_KEPT dumped).
@@ -33,11 +35,147 @@ LR_WARMUP, GRAD_CLIP = 1000, 1.0
 MAX_SKIPPED, BAD_BATCHES_KEPT = 100, 2
 
 
+# The pretraining objectives: each its own knobs, whole. Train.model is one of them.
+@dataclass(slots=True)
+class Mae:
+    """A masked autoencoder, the pixel-space baseline (lib.models.Mae), on the view Train.data.view."""
+    decoder: tuple[int, int] = (192, 2)  # the decoder's (width, depth), heads width // 32
+    kind: Literal["mae"] = "mae"
+
+
+@dataclass(slots=True)
+class Masked:
+    """Masked-token prediction (lib.models.Lejepa): a cube of the view's tokens is hidden from the encoder and a predictor makes
+    their embeddings, loss = prediction error + lamb x SIGReg. The view is Train.data.view, plus shift (both views' region)."""
+    cube: int = 48  # the masked cube's side, voxels (a multiple of the patch)
+    shift: int = 0  # >0: the targets are a second view's tokens, up to this many voxels off the context's (a multiple of the patch)
+    aligned: bool = False  # shift only: whole-token view origins (lib.models.MaskConfig.aligned)
+    expand: bool = False  # shift only: hide a token more of the context around the masked target tokens (MaskConfig.expand)
+    # SIGReg's pull is lamb x its sample count (its statistic is N x an empirical-CF distance); it sees each view's N tokens.
+    lamb: float = 0.002
+    sigreg_over: Literal["view", "batch", "both"] = "view"  # SIGReg's samples: each view's tokens, each position's batch, or both
+    stop_grad: bool = False  # detach the targets (lib.models.LejepaConfig.stop_grad)
+    kind: Literal["mask"] = "mask"
+
+
+@dataclass(slots=True)
+class Views:
+    """LeJEPA's multi-view invariance (lib.models.Lejepa): 2 global views of Train.data.view and 4 local ones, each pulled to the
+    mean of the globals, loss = invariance + lamb x SIGReg."""
+    local: int = 56  # the local views' side, voxels
+    batch_views: bool = False  # one encoder call per group of same-shape views
+    lamb: float = 0.002
+    kind: Literal["views"] = "views"
+
+
+# How a model is trained, in groups: Train is what every task of a trunk shares (a trunk trains it, a branch anneals it, a score reads it).
+@dataclass(slots=True)
+class Encoder:
+    n_layers: int = 12
+    width: int = 512  # heads = width // 64
+    qk_norm: bool = False  # LayerNorm on the encoder's queries and keys (lib.encoders.EncoderConfig.qk_norm)
+
+@dataclass(slots=True)
+class Data:
+    sets: tuple[str, ...] = ()  # the lib.data.DATASETS whose train volumes pretraining samples
+    power: float = 0.0  # their sampling: a dataset's share, and a volume's within it, go as voxel count ^ this (lib.data.sampling)
+    window: tuple[int, int, int] = (104, 104, 104)  # what the loader reads per sample, voxels (8 nm isotropic: it reads every volume at 8 nm)
+    view: tuple[int, int, int] = (88, 88, 88)  # the view each sample trains on, voxels (a multiple of the encoder's patch)
+
+@dataclass(slots=True)
+class Optim:
+    batch_size: int = 84  # per GPU
+    lr: float = 1e-4  # a trunk: linear warmup, then held; a branch: down to lr x Trunk.anneal_to
+    weight_decay: float = 0.0  # AdamW decay on weight matrices (biases/norms excluded); 0 = the original plain Adam
+    adam_beta2: float = 0.999  # Adam second-moment decay; 0.999 = torch default (all runs so far), mia-muvit uses 0.95
+    grad_compress: bool = False  # DDP bf16_compress_hook: all-reduce gradients in bf16 (half the bytes)
+
+@dataclass(slots=True)
+class Hardware:
+    queue: str = "gpu_h200"  # LSF queue
+    n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); Optim.batch_size and n_workers are per GPU
+    n_workers: int = 16  # data loader workers per GPU (lib.task_utils.CPUS_PER_GPU - 1 at most)
+    prefetch_factor: int = 2
+
+@dataclass(slots=True)
+class Speed:
+    f32mode: Literal["highest", "high", "medium"] = "high"
+    amp: bool = True  # bf16 autocast for forward + loss
+    compile: bool = True  # torch.compile(dynamic=True) the encoder
+    cudagraphs: bool = False  # instead compile static with CUDA graphs (mode="reduce-overhead"); needs compile
+    compile_blocks: bool = False  # compile each transformer block separately so DDP can overlap all-reduce with backward
+    defer_image_ops: bool = True  # workers ship uint8 crops; cast + normalize on the GPU (miao.finish_images)
+    eager_patch_embed: bool = True  # keep PatchEmbed3d out of torch.compile (see compile_model); False only to study the bug
+
+@dataclass(slots=True)
+class Profile:
+    warmup_steps: int = 10
+    benchmark_steps: int = 50
+    profile_steps: int = 10  # Set to zero to disable trace collection.
+
+@dataclass(slots=True)
+class Train:
+    """How a model is trained: its objective, encoder, data, optimizer, hardware, speed settings and profiling."""
+    model: Mae | Masked | Views = field(default_factory=Masked)
+    encoder: Encoder = field(default_factory=Encoder)
+    data: Data = field(default_factory=Data)
+    optim: Optim = field(default_factory=Optim)
+    hardware: Hardware = field(default_factory=Hardware)
+    speed: Speed = field(default_factory=Speed)
+    profile: Profile = field(default_factory=Profile)
+
+    def but(self, **changes) -> Train:
+        """This spec with these groups replaced: how an experiment writes each run as a difference from its base."""
+        return replace(self, **changes)
+
+
+@dataclass(slots=True)
+class Rank:
+    """This process's place in a training job's DDP run (setup: torchrun's environment); a plain process is rank 0 of 1."""
+    rank: int
+    world: int
+    local: int  # the GPU on this node
+
+    @property
+    def rank0(self) -> bool:
+        return self.rank == 0
+
+    def device(self):
+        import torch
+        return torch.device(f"cuda:{self.local}" if torch.cuda.is_available() else "cpu")
+
+def encoder_config(par: Train) -> EncoderConfig:
+    e = par.encoder
+    return EncoderConfig(depth=e.n_layers, embed_dim=e.width, num_heads=e.width // 64, qk_norm=e.qk_norm)
+
+def model_config(par: Train) -> models.LejepaConfig | models.MaeConfig:
+    """par's model's config: its objective on the encoder par says, and the view par.global_size (plus the shift of masked tokens)."""
+    m, (z, y, x), patch = par.model, par.data.view, encoder_config(par).patch_size[0]  # the encoder's token side, voxels
+    if isinstance(m, Mae):
+        dim, depth = m.decoder
+        return models.MaeConfig(encoder=encoder_config(par), view=ViewConfig(views="displace", global_size=par.data.view),
+                         decoder_dim=dim, decoder_depth=depth, decoder_heads=dim // 32)
+    if isinstance(m, Views):
+        return models.LejepaConfig(encoder=encoder_config(par), objective="views", batch_views=m.batch_views, lamb=m.lamb,
+                            view=ViewConfig(views="displace", n_global=2, n_local=4, global_size=par.data.view, local_size=(m.local,) * 3))
+    assert m.cube % patch == 0, f"the masked cube {m.cube} must be a multiple of the patch {patch}"
+    s = m.shift  # both views' region: the context's, and the targets' offset by up to the shift
+    return models.LejepaConfig(encoder=encoder_config(par), objective="mask", lamb=m.lamb, sigreg_over=m.sigreg_over, stop_grad=m.stop_grad,
+                        view=ViewConfig(views="displace", n_global=1, n_local=0, global_size=(z + s, y + s, x + s)),
+                        mask=models.MaskConfig(cube=m.cube // patch, shift=s, aligned=m.aligned, expand=m.expand))
+
+def make_model(par: Train) -> models.Lejepa | models.Mae:
+    """par's model, untrained."""
+    c = model_config(par)
+    return models.Mae(c) if isinstance(c, models.MaeConfig) else models.Lejepa(c)
+
+
+
 def collate_images(samples):
     import torch
     return torch.stack([s["img"] for s in samples])
 
-def compile_model(model: Lejepa | Mae, par: Train):
+def compile_model(model: models.Lejepa | models.Mae, par: Train):
     """torch.compile the encoder in place, as par says (no-op unless par.speed.compile)."""
     import torch
     assert par.speed.compile or not (par.speed.cudagraphs or par.speed.compile_blocks), "cudagraphs / compile_blocks require compile"

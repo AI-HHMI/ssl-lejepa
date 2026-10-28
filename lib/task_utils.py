@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
 from lib import training
-from lib.specs import Hardware
+from lib.training import Hardware, make_model
 from lib.util import *
 
 CODE = Path(__file__).resolve().parent.parent  # the code root: the shared checkout, or the .tmpcode/ snapshot a job runs
@@ -135,6 +135,35 @@ def keep_if_best(par, score: float):
         else:
             weights.unlink()
     print(f"{par.savedir}: score {score:.4f} {'beats' if score > best else 'does not beat'} the best so far, {best:.4f}", flush=True)
+
+def load_checkpoint(train: Train, init_from: str):
+    """(model on the GPU if any, step) for inference or finetuning: the weights init_from names, in train's architecture.
+
+    A checkpoint .pt, loaded strictly into train's architecture so an incompatible one fails loudly (Conv3d-era patch embeds
+    load, see PatchEmbed3d). Inference depends on lib/, so like training it only runs for this commit's own experiment: for an
+    older sweep, go back to its commit.
+    "random": untrained weights, seeded (the baseline every trained encoder must beat). Step 0.
+    """
+    import torch
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if init_from == "random":
+        torch.manual_seed(0)
+        return make_model(train).to(device).eval(), 0
+    assert Path(init_from).is_file(), f"no checkpoint at {init_from!r}: a checkpoint .pt or \"random\""
+    ckpt = torch.load(init_from, map_location="cpu", weights_only=False)
+    model = make_model(train)
+    model.load_state_dict(ckpt["model"])  # strict: architecture drift fails loudly
+    return model.to(device).eval(), ckpt["step"]
+
+def record(par, fn: str):
+    """Append one row to par.savedir/runs.json: which task ran (fn), its spec par (a dataclass: params), code_provenance(),
+    argv and LSF job. Written first thing, so even a run that crashes before any results describes itself.
+    Repro for the dir's artifacts: that commit + argv. The command that submitted the job is in
+    outdir/_log/commands.jsonl (log_command)."""
+    row = {"fn": fn, "params": asdict(par), **code_provenance(), "argv": sys.argv, "lsf_job": os.environ.get("LSB_JOBID")}
+    Path(par.savedir).mkdir(parents=True, exist_ok=True)
+    with open(Path(par.savedir) / "runs.json", "a") as f:
+        f.write(json.dumps(row) + "\n")
 
 def job_name(savedir: str, job: str) -> str:
     """The LSF name of the run dir savedir's job: <series>-<experiment>-<run>-<job>, e.g. e00-e12-cellmap-mae-run, so bjobs shows which is which."""

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 import torch
 from torch import Tensor
 
-from lib.types import Tup3Int, ViewMode
+from lib.encoders.vit3d import Tup3Int
+
+ViewMode = Literal["basic", "displace", "none"]  # 'none': Lejepa skips view making
 
 
 @dataclass

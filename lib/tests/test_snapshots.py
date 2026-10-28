@@ -14,7 +14,7 @@ import torch
 from PIL import Image
 
 import lib.decoders
-from lib import evals, specs
+from lib import evals, training
 from lib.encoders import EncoderConfig
 from lib.models import Lejepa
 from test_probe import TINY, finetune, probe, synthetic_store
@@ -79,6 +79,6 @@ def test_finetune_snapshot(tmp_path, monkeypatch):
 def test_pca_snapshot(tmp_path, monkeypatch):
     model = small_encoder()
     monkeypatch.setattr(evals, "crop", lambda volume, shape: torch.rand(1, *shape, generator=torch.Generator().manual_seed(1)))
-    evals.pca_maps(model.encoder, specs.Train(data=specs.Data(view=(16, 16, 16))), tmp_path, 7, "hemibrain")
+    evals.pca_maps(model.encoder, training.Train(data=training.Data(view=(16, 16, 16))), tmp_path, 7, "hemibrain")
     for f in ("pca2.png", "pca.json"):
         check(tmp_path / f, f"pca/{f}")

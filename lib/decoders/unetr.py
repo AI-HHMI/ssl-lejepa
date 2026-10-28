@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from lib.encoders import ViT3DEncoder
-from lib.types import Tup3Int
+from lib.encoders.vit3d import Tup3Int
 
 
 def default_skip_layers(depth: int, num_stages: int) -> tuple[int, ...]:

@@ -20,9 +20,8 @@ from pathlib import Path
 from typing import Literal
 
 from lib import evals, training
-from lib.task_utils import SCORE_MINUTES, check_snapshot, go, keep_if_best, mia_eval, task
-from lib.specs import Train, load_checkpoint, record
-from lib.training import Trainer
+from lib.task_utils import SCORE_MINUTES, check_snapshot, go, keep_if_best, load_checkpoint, mia_eval, record, task
+from lib.training import Train, Trainer
 from lib.util import load
 
 
