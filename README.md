@@ -34,15 +34,15 @@ git checkout main
 bjobs -w
 ```
 
-Design an experiment: `experiment.py` is its tasks and its table of runs. Words: an *experiment* is one `experiment.py` (an id and its
-runs); a *run* is one named line of its table, a `Trunk` spec you write; a *task* is a function of the pipeline (`trunk`, `branch`,
-`score`), declared with `@task` beside the spec dataclass of its own name that it takes; a *job* is a task submitted to LSF by `go()`. The specs nest, each
-holding its parent's (all in `experiment.py`, except `Train`): `Score(branch)`, `Branch(trunk)`, `Trunk(train)`, and `Train` (model, encoder, data, optim, hardware, speed,
-profile) is how a model is trained, shared by all. A trunk pretrains in one job and forks a branch at its start and after every
-segment; a branch anneals, runs pca and tiled inference, and goes to `score`, a CPU job after which the trunk keeps `best.pt`. The
-module docstring says which volumes each task uses (train, val, fit, test, tune: the parts every dataset of `lib/data.py` has). The
-table is `BASE.but(...)` per run (`H200` and `B300` are whole nodes); `lib/jobs.py` is the rest.
-`python experiment.py -h` lists the tasks with their hardware.
+Design an experiment: `experiment.py` is declarative: `BASE` (a `Train`: model, encoder, data, optim, hardware, speed, profile) and a
+table of runs, one `Trunk` per line (`BASE.but(...)`, named; `H200` and `B300` are whole nodes). `tasks.py` is what a run does: three
+tasks, `trunk`, `branch` and `score`, each beside the spec dataclass of its name that it takes (JSON-able; each holds its parent's:
+`Score(branch)`, `Branch(trunk)`, `Trunk(train)`). A task is a job's entrypoint: it loads its spec, reads and writes files and
+checkpoints, submits the next tasks with `go()` and calls the library (`lib/`: straight-line code on loaded models and specs, no
+callbacks) in its own process. A trunk pretrains in one job and forks a branch at its start and after every segment; a branch anneals,
+runs pca and tiled inference, and goes to `score`, a CPU job after which the trunk keeps `best.pt`. `lib/jobs.py` is the LSF and
+registry helpers. Words: *experiment* is one `experiment.py`; a *run* a line of its table; a *task* a function of `tasks.py`; a *job* a
+task submitted to LSF. `python experiment.py -h` lists the tasks with their hardware.
 ```sh
 # [On the Janelia cluster, from the experiment's commit.]
 sh jrun.sh exp experiment.py submitall        # every run not submitted yet

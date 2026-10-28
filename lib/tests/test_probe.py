@@ -8,6 +8,7 @@ import torch
 import zarr
 
 import experiment
+import tasks
 from lib import jobs
 import lib.data
 import lib.probe
@@ -23,9 +24,22 @@ TINY = LejepaConfig(encoder=EncoderConfig(depth=1, embed_dim=16, num_heads=2, pa
 BOXES = {"train": [[24, 56], [24, 56], [24, 56]], "fit": [[20, 52], [24, 56], [24, 56]], "test": [[24, 56], [20, 52], [24, 56]]}
 
 
-def branch(tmp_path, data="hemibrain", view=24, **trunk) -> experiment.Branch:
+def branch(tmp_path, data="hemibrain", view=24, **trunk) -> tasks.Branch:
     """A Branch of a trunk that evaluates on data, at view^3 crops, in tmp_path/run."""
-    return experiment.Branch(savedir=str(tmp_path / "run"), trunk=experiment.Trunk(train=specs.Train(data=specs.Data(view=(view,) * 3)), eval_data=data, **trunk), init_from="")
+    return tasks.Branch(savedir=str(tmp_path / "run"), trunk=tasks.Trunk(train=specs.Train(data=specs.Data(view=(view,) * 3)), eval_data=data, **trunk), init_from="")
+
+
+def train_of(view: int = 24) -> specs.Train:
+    return specs.Train(data=specs.Data(view=(view,) * 3))
+
+
+def probe(tmp_path, model, data="hemibrain", view=24):
+    """evals.probe of model at step 7, on data at view^3 crops, in tmp_path/run."""
+    evals.probe(model, train_of(view), data, str(tmp_path / "run"), 7)
+
+
+def finetune(tmp_path, model, data="hemibrain", view=24):
+    evals.finetune(model, train_of(view), data, str(tmp_path / "run"), 7)
 
 
 def synthetic_store(tmp_path, monkeypatch, sets=None):
@@ -118,10 +132,8 @@ def test_average_precision():
 
 def test_probe_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch):
     synthetic_store(tmp_path, monkeypatch)
-    par = branch(tmp_path)  # 32^3 boxes -> 48^3 of context
-    (tmp_path / "run").mkdir()
-    model = Lejepa(TINY)
-    evals.probe(par, model.eval(), 7)
+    (tmp_path / "run").mkdir()  # 32^3 boxes -> 48^3 of context
+    probe(tmp_path, Lejepa(TINY).eval())
 
     stats = json.loads((tmp_path / "run/probe.json").read_text())
     assert stats["step"] == 7 and 0 <= stats["boundary_ap_short"] <= 1
@@ -148,14 +160,11 @@ def test_finetune_end_to_end_on_a_synthetic_store(tmp_path, monkeypatch):
     config = lib.decoders.UnetrConfig
     monkeypatch.setattr(lib.decoders, "UnetrConfig", lambda out_dim: config(out_dim=out_dim, hidden_dim=8))
     monkeypatch.setattr(evals, "FINETUNE_STEPS", 150)
-    par = branch(tmp_path)
-    spec = dump(par)  # as go writes it
     model = Lejepa(TINY, encoder=EncoderConfig(depth=2, embed_dim=16, num_heads=2, patch_size=(2, 2, 2)))
     before = {k: v.clone() for k, v in model.encoder.state_dict().items()}
     (tmp_path / "run").mkdir(exist_ok=True)
-    evals.finetune(par, model.eval(), 7)
+    finetune(tmp_path, model.eval())
 
-    assert load(str(spec), experiment.Branch) == par  # its results didn't overwrite its spec
     data, *curve = [json.loads(l) for l in (tmp_path / "run/finetune_curve.json").read_text().splitlines()]
     assert data == {"tbl": "finetune_data", "step": 7, "fit_size": [32] * 3, "fit_labelled": 32 ** 3, "test_blocks": ["hemibrain_eb_test"]}
     assert [c["step"] for c in curve] == [100, 150] and all(c["tbl"] == "finetune" for c in curve)
@@ -173,10 +182,9 @@ def test_probe_on_another_dataset_averages_its_test_blocks(tmp_path, monkeypatch
     two = {"fit": ("two_train", [[24, 56], [24, 56], [24, 56]]),
            "test": [("two_a", [[22, 57], [24, 56], [24, 56]]), ("two_b", [[24, 56], [24, 56], [8, 40]])]}
     synthetic_store(tmp_path, monkeypatch, {"two": {**two, "tune": ("two_fit", [[24, 56]] * 3, [[20, 60]] * 3)}, "two-untuned": two})
-    par = branch(tmp_path, data="two")
     (tmp_path / "run").mkdir()
     model = Lejepa(TINY).eval()
-    evals.probe(par, model, 7)
+    probe(tmp_path, model, "two")
     stats = json.loads((tmp_path / "run/probe.json").read_text())
     assert stats["data"] == "two" and stats["test_blocks"] == ["two_a", "two_b"]
     # In both, +x crosses the x = 40 split once in 32 voxels (two_a's 35 cut to whole patches, 32): 1 of 31 valid layers.
@@ -184,14 +192,14 @@ def test_probe_on_another_dataset_averages_its_test_blocks(tmp_path, monkeypatch
     assert abs(frac - 1 / 31) < 0.003 and stats["boundary_frac_(0, 1, 0)"] == 0
     assert (tmp_path / "run/probe.png").is_file() and (tmp_path / "run/probe_1.png").is_file()
     with pytest.raises(AssertionError, match="no mia-evals tune block for two-untuned"):  # nothing to score it on
-        evals.probe(branch(tmp_path, data="two-untuned"), model, 7)
+        probe(tmp_path, model, "two-untuned")
 
 
 def test_score_artifacts_of_any_set_with_a_tune_block_are_named_for_it(tmp_path, monkeypatch):
     box = [[24, 56], [24, 56], [24, 56]]
     synthetic_store(tmp_path, monkeypatch, {"three": {"fit": ("three_train", box), "tune": ("three_fit", box, [[20, 60]] * 3), "test": [("three_test", box, [[22, 58]] * 3)]}})
     (tmp_path / "run").mkdir()
-    evals.probe(branch(tmp_path, data="three"), Lejepa(TINY).eval(), 7)
+    probe(tmp_path, Lejepa(TINY).eval(), "three")
     art = zarr.open_array(str(tmp_path / "run/probe/test/three_test.zarr"), mode="r")
     assert dict(art.attrs)["annotated_box"] == [[22, 58]] * 3 and dict(art.attrs)["source_label_key"] == "labels/cells"
     assert (tmp_path / "run/probe/fit/three_fit.zarr").is_dir()
@@ -224,7 +232,7 @@ def test_scoring_config_reads_instances_truth_from_its_own_data_configs():
 
 
 def test_score_calls_mia_evals_on_the_probe_artifacts(tmp_path, monkeypatch):
-    par = experiment.Score(savedir=str(tmp_path / "run"), branch=branch(tmp_path))
+    par = tasks.Score(savedir=str(tmp_path / "run"), branch=branch(tmp_path))
     with pytest.raises(AssertionError, match="no probe artifacts"):
         jobs.mia_eval(par)
     for split in ["fit", "test"]:

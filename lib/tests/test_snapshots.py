@@ -17,7 +17,7 @@ import lib.decoders
 from lib import evals, specs
 from lib.encoders import EncoderConfig
 from lib.models import Lejepa
-from test_probe import TINY, branch, synthetic_store
+from test_probe import TINY, finetune, probe, synthetic_store
 
 SNAPSHOTS = Path(__file__).parent / "snapshots"
 VOLATILE = {"seconds", "time", "run"}  # json keys that differ per run (run: the tmp dir's name)
@@ -58,7 +58,7 @@ def test_probe_snapshot(tmp_path, monkeypatch):
     synthetic_store(tmp_path, monkeypatch)
     (tmp_path / "run").mkdir()
     model = small_encoder()
-    evals.probe(branch(tmp_path), model, 7)
+    probe(tmp_path, model)
     for f in ("probe.png", "probe.json", "probe_fit.json"):
         check(tmp_path / "run" / f, f"probe/{f}")
 
@@ -71,7 +71,7 @@ def test_finetune_snapshot(tmp_path, monkeypatch):
     model = small_encoder(patch=2)  # Unetr: one block per upsample stage
     (tmp_path / "run").mkdir()
     torch.manual_seed(0)  # the decoder's init
-    evals.finetune(branch(tmp_path), model, 7)
+    finetune(tmp_path, model)
     for f in ("finetune.png", "finetune_curve.json"):
         check(tmp_path / "run" / f, f"finetune/{f}")
 

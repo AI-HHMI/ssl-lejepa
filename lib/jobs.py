@@ -1,5 +1,5 @@
-"""What an experiment.py is made of, and the LSF code that runs it. An experiment is a table of runs (Experiment), each a Trunk spec,
-and the tasks that process each run: functions in experiment.py (trunk, branch, score), each declared with @task (its spec class,
+"""What an experiment.py and its tasks.py are made of, and the LSF code that runs it. An experiment is a table of runs (Experiment), each a Trunk spec,
+and the tasks that process each run: functions in tasks.py (trunk, branch, score), each declared with @task (its spec class,
 defined beside it, and its hardware) and each calling the next with go(), which submits it as an LSF job: a job is a task
 submitted. A spec has a savedir; a gpus task says which Hardware (queue, GPUs) its spec asks LSF for. A task takes its spec, or the path of the
 spec's json (`branch outdir/.../branch.json`), so one can be redone by hand: `lsf <task> <run or spec file>`. Depends on lib/, so a
@@ -26,7 +26,7 @@ from lib.util import *
 CODE = Path(__file__).resolve().parent.parent  # the code root: the shared checkout, or the .tmpcode/ snapshot a job runs
 # Code copied into .tmpcode/<experiment>/ at submission (bsub); jobs import only from these. Add files here if the experiment
 # starts depending on others. Dependencies (pyproject.toml / uv.lock) are not frozen.
-SNAPSHOT_PATHS = ["experiment.py", "lib", "mia_evals"]
+SNAPSHOT_PATHS = ["experiment.py", "tasks.py", "lib", "mia_evals"]
 CPUS_PER_GPU = 12  # LSF slots per GPU: 8 GPUs -> all 96 cores; training processes need cores beyond the data workers
 # Whole nodes (Optim.batch_size and Hardware.n_workers are per GPU); an H200 node has one GPU taken by someone else's job.
 H200 = Hardware(queue="gpu_h200", n_gpus=7, n_workers=CPUS_PER_GPU - 1)

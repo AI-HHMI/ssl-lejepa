@@ -131,12 +131,11 @@ def setup(par: Train) -> Rank:
     print(f"Rank {r.rank}/{r.world} is using torch device {r.device()} .")
     return r
 
-def build(par: Train, r: Rank, init_from: str):
+def build(par: Train, r: Rank, ckpt: dict | None):
     """(model to step: compiled, and DDP-wrapped across ranks; the bare Lejepa, for checkpoints and logging; AdamW; the step it
-    starts at) for training par: fresh (init_from ""), or from the checkpoint init_from's weights, Adam moments and step."""
+    starts at) for training par: fresh, or from the loaded checkpoint ckpt's weights, Adam moments and step."""
     import torch
     model = make_model(par)
-    ckpt = torch.load(init_from, map_location="cpu", weights_only=False) if init_from else None
     if ckpt is not None:
         model.load_state_dict(ckpt["model"])  # strict: architecture drift fails loudly
     if r.rank0: pprint(model)
@@ -245,13 +244,13 @@ class Trainer:
     often as you like, t.save(path) between. Every DDP rank makes one; leaving the block destroys the process group.
     Rank 0 writes metrics.json, and the throughput window and profile of Benchmark (at the first steps)."""
 
-    def __init__(self, par: Train, savedir: str, steps: int, init_from: str = ""):
+    def __init__(self, par: Train, savedir: str, steps: int, init: dict | None = None):
         """savedir: where it writes. steps: the most it will train in all (the loader's supply, the benchmark's windows).
-        init_from: "" fresh, or a checkpoint .pt."""
+        init: None fresh, or a loaded checkpoint (what save() wrote: torch.load of a .pt)."""
         self.par, self.savedir = par, savedir
         self.r = setup(par)
         self.batches = dataloader(par, savedir, steps)  # each rank its own, with its own miao seed (see setup)
-        self.model, self.lejepa, self.opt, self.step = build(par, self.r, init_from)  # step: steps done, in all
+        self.model, self.lejepa, self.opt, self.step = build(par, self.r, init)  # step: steps done, in all
         self.first, self.n_skipped, self.stopped, self.start_time, self.lr = self.step, 0, "", time.time(), par.optim.lr
         self.bench = Benchmark(par, savedir, steps, self.r.device(), self.r.world, self.r.rank0)
 

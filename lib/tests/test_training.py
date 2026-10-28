@@ -234,7 +234,7 @@ def test_a_trainer_trains_in_calls_and_a_checkpoint_continues_it(tmp_path, monke
     assert all(r["lr"] == pytest.approx(lr * min(1, (r["idx_step"] + 1) / 100)) for r in trunk)  # warmup, then constant
     assert trunk[-1]["lr"] == lr
 
-    with training.Trainer(par, str(branch_dir), 12, str(branch_dir / "start.pt")) as t:
+    with training.Trainer(par, str(branch_dir), 12, torch.load(branch_dir / "start.pt", weights_only=False)) as t:
         assert t.step == 130  # the checkpoint's
         t.train(12, lr, 0.01 * lr)
     metrics = [json.loads(line) for line in (branch_dir / "metrics.json").read_text().splitlines()]
