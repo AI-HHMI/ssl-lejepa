@@ -54,21 +54,19 @@ def trunk(job: Trunk | str):
     """Pretrain at a constant lr, with a branch at the start and after every segment (step_<N>/ each; metrics.json, best.pt)."""
     check_snapshot()
     t = load(job, Trunk)
-    lr = t.train.optim.lr
     with Trainer(t.train, t.savedir, t.segments * t.segment_steps, load_checkpoint_file(t.init_from)) as trainer:
         def fork():
-            if trainer.r.rank0:  # the branch's start: weights and optimizer, deleted by the branch that took them
-                start = Path(t.savedir) / f"step_{trainer.step:07d}/start.pt"
-                trainer.save(start)
-                go(branch, Branch(savedir=f"{start.parent}/", trunk=t, init_from=str(start)))
+            start = Path(t.savedir) / f"step_{trainer.step:07d}/start.pt"
+            trainer.save(start)
+            go(branch, Branch(savedir=f"{start.parent}/", trunk=t, init_from=str(start)))
         if trainer.r.rank0:
             record(t, "trunk")
-        fork()
+            fork()
+        lr = t.train.optim.lr
         for _ in range(t.segments):
             trainer.train(t.segment_steps, lr, lr)
-            if trainer.stopped:
-                break  # diverged: no branch of its weights
-            fork()
+            if trainer.stopped: break  # diverged: no branch of its weights
+            if trainer.r.rank0: fork()
 
 
 @dataclass(slots=True)
@@ -93,15 +91,15 @@ def branch(job: Branch | str):
         trainer.train(t.anneal_steps, lr, lr * t.anneal_to)
         if trainer.r.rank0:
             trainer.save(end)
-    if trainer.r.rank0:  # the other ranks are done
-        Path(b.init_from).unlink()
-        model, step = load_checkpoint(t.train, str(end))  # a fresh eager model: the compiled one is gone with the trainer
-        evals.pca_maps(model.encoder, t.train, Path(b.savedir), step, t.eval_data)
-        if t.eval_head == "linear":
-            evals.probe(model, t.train, t.eval_data, b.savedir, step, t.standardize)
-        else:
-            evals.finetune(model, t.train, t.eval_data, b.savedir, step)
-        go(score, Score(savedir=b.savedir, branch=b))
+    if not trainer.r.rank0: return  # the other ranks are done
+    Path(b.init_from).unlink()
+    model, step = load_checkpoint(t.train, str(end))  # a fresh eager model: the compiled one is gone with the trainer
+    evals.pca_maps(model.encoder, t.train, Path(b.savedir), step, t.eval_data)
+    if t.eval_head == "linear":
+        evals.probe(model, t.train, t.eval_data, b.savedir, step, t.standardize)
+    else:
+        evals.finetune(model, t.train, t.eval_data, b.savedir, step)
+    go(score, Score(savedir=b.savedir, branch=b))
 
 
 @dataclass(slots=True)
