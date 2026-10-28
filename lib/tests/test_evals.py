@@ -19,7 +19,7 @@ def test_pca_sizes_maps_one_crop_at_each_test_tile(tmp_path, monkeypatch):
     model = Lejepa(LejepaConfig(encoder=EncoderConfig(depth=1, embed_dim=16, num_heads=2, patch_size=(4, 4, 4)), projector=ProjectorConfig(dim=8, hidden=16))).eval()
     monkeypatch.setattr(evals, "TEST_TILES", (8, 16))
     monkeypatch.setattr(evals, "crop", lambda volume, shape: torch.rand(1, *shape))
-    e = Eval(savedir=f"{tmp_path}/", train=Train(), init_from="outdir/e00/x/a", data="hemibrain", jobs=("pca_sizes",))
+    e = Eval(savedir=f"{tmp_path}/", train=Train(), init_from="outdir/e00/x/a", data="hemibrain")
     assert load(str(dump(e)), Eval) == e  # the spec round-trips, jobs and all
     evals.pca_sizes(e, model, 7)
     rows = [json.loads(line) for line in (tmp_path / "pca_sizes.json").read_text().splitlines()]

@@ -1,4 +1,4 @@
-"""Tests for lib.training: the step, its logs and profile, checkpoints and the callback at each milestone, the skipped
+"""Tests for lib.training: the step, its logs and profile, the Trainer's lr and checkpoints, the skipped
 non-finite step and its replay, benchmark. The data is synthetic and the model tiny; no cluster, git or GPU."""
 
 import json
@@ -17,7 +17,12 @@ from lib.models import Lejepa, LejepaConfig, MaeConfig, MaskConfig, ProjectorCon
 from lib.specs import Train
 from lib.views import ViewConfig
 
-NO_MILESTONE_EVAL = lambda par, step: None
+
+def train(par: Train, steps: int, lr1: float | None = None):
+    """A Trainer's one train() of steps steps, the lr par.lr (to lr1, if given); the Trainer, closed."""
+    with training.Trainer(par, steps) as t:
+        t.train(steps, par.lr, par.lr if lr1 is None else lr1)
+    return t
 
 
 class SyntheticDataset:
@@ -82,7 +87,7 @@ def patch_training(monkeypatch):
 def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorded_steps):
     params = Train(
         savedir=str(tmp_path), patch_size=(8, 8, 8), batch_size=2,
-        total_steps=n_steps, warmup_steps=1, benchmark_steps=2, profile_steps=profile_steps,
+        warmup_steps=1, benchmark_steps=2, profile_steps=profile_steps,
         n_workers=0, defer_image_ops=False,  # synthetic dataset yields finished float images; loaded in-process (no worker startup)
     )
     patch_training(monkeypatch)
@@ -97,7 +102,7 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
         return model
 
     monkeypatch.setattr(specs.models, "Lejepa", small_model)
-    training.train(params, NO_MILESTONE_EVAL)
+    train(params, n_steps)
 
     assert consumed == list(range(n_steps * params.batch_size))
     metrics = [json.loads(line) for line in (tmp_path / "metrics.json").read_text().splitlines()]
@@ -130,17 +135,17 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
 
 @pytest.mark.parametrize("objective", ["views", "mae"])
 def test_each_objective_trains_logs_its_terms_and_reloads_for_eval(tmp_path, monkeypatch, objective):
-    params = Train(savedir=str(tmp_path), model={"views": specs.Views(), "mae": specs.Mae()}[objective], patch_size=(8, 8, 8), batch_size=2, total_steps=3,
+    params = Train(savedir=str(tmp_path), model={"views": specs.Views(), "mae": specs.Mae()}[objective], patch_size=(8, 8, 8), batch_size=2,
                               warmup_steps=1, benchmark_steps=1, profile_steps=0, n_workers=0, defer_image_ops=False)
     patch_training(monkeypatch)
-    training.train(params, NO_MILESTONE_EVAL)
+    train(params, 3).save(tmp_path / "checkpoint.pt")
     metrics = [json.loads(line) for line in (tmp_path / "metrics.json").read_text().splitlines()]
     assert metrics[-1]["idx_step"] == 2 and all(torch.isfinite(torch.tensor(row["loss"])) for row in metrics)
     if objective == "views":  # LeJEPA's two terms, logged apart
         assert all(row["loss"] == pytest.approx(row["inv"] + LejepaConfig().lamb * row["sigreg"], rel=1e-5) for row in metrics)
     else:  # an MAE's reconstruction error alone
         assert not {"inv", "sigreg"} & set(metrics[-1])
-    model, step = specs.load_checkpoint(specs.own_eval(params))  # strict: the saved weights fit the objective's model
+    model, step = specs.load_checkpoint(specs.Eval(savedir=str(tmp_path), train=params, init_from=str(tmp_path)))  # strict: the saved weights fit the objective's model
     assert step == 3 and type(model).__name__ == {"views": "Lejepa", "mae": "Mae"}[objective]
 
 
@@ -148,7 +153,7 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
     run = tmp_path / "d0"
     run.mkdir()
     params = Train(
-        savedir=f"{run}/", patch_size=(8, 8, 8), batch_size=2, total_steps=6,
+        savedir=f"{run}/", patch_size=(8, 8, 8), batch_size=2,
         warmup_steps=1, benchmark_steps=2, profile_steps=0, n_workers=0, defer_image_ops=False,
         compile=False,  # eager on CPU, so the replay below must reproduce the step's loss exactly
     )
@@ -166,13 +171,13 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
             return out
 
     monkeypatch.setattr(specs.models, "Lejepa", PoisonedStep)
-    training.train(params, NO_MILESTONE_EVAL)
+    train(params, 6).save(run / "checkpoint.pt")
 
     metrics = [json.loads(line) for line in (run / "metrics.json").read_text().splitlines()]
     assert metrics[-1]["idx_step"] == 5 and metrics[-1]["skipped"] == 1  # training continued past the bad step
     dump = torch.load(run / "bad_batch_0000003.pt", weights_only=False)
     assert dump["step"] == 3 and dump["x_uint8"].dtype == torch.uint8 and dump["rng_cpu"] is not None
-    ckpt = torch.load(sorted((run / "checkpoints").glob("step_*.pt"))[-1], weights_only=False)
+    ckpt = torch.load(run / "checkpoint.pt", weights_only=False)
     assert all(torch.isfinite(v).all() for v in ckpt["model"].values() if v.is_floating_point())
 
     # Replay: same weights, input and RNG give the same views and SIGReg slices, so the same loss
@@ -184,7 +189,7 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
 
 def test_benchmark_times_and_profiles_the_training_step_only(tmp_path, monkeypatch):
     params = Train(
-        savedir=str(tmp_path), patch_size=(8, 8, 8), batch_size=2, total_steps=1000, max_hours=1.0,
+        savedir=str(tmp_path), patch_size=(8, 8, 8), batch_size=2,
         warmup_steps=1, benchmark_steps=2, profile_steps=2, n_workers=0, defer_image_ops=False,
     )
     patch_training(monkeypatch)
@@ -192,19 +197,20 @@ def test_benchmark_times_and_profiles_the_training_step_only(tmp_path, monkeypat
     performance = json.loads((tmp_path / "performance.json").read_text())
     assert performance["steps"] == 2 and performance["samples_per_second"] > 0
     assert (tmp_path / "profile.json").is_file() and (tmp_path / "trace_summary.json").is_file()
-    assert not (tmp_path / "metrics.json").exists() and not (tmp_path / "checkpoints").exists()  # not a training run
+    assert not (tmp_path / "metrics.json").exists()  # not a training run
 
 
-def test_lr_decay_falls_linearly_to_zero_after_the_warmup(tmp_path, monkeypatch):
-    monkeypatch.setattr(training, "LR_WARMUP", 100)
-    par = Train(savedir=f"{tmp_path}/d0/", patch_size=(8, 8, 8), batch_size=2, total_steps=200, max_hours=1.0, lr_decay=True, qk_norm=True,
+def test_the_lr_goes_linearly_from_lr0_to_lr1_after_the_warmup(tmp_path, monkeypatch):
+    monkeypatch.setattr(training, "LR_WARMUP", 20)
+    par = Train(savedir=f"{tmp_path}/d0/", patch_size=(8, 8, 8), batch_size=2, qk_norm=True,
                 warmup_steps=1, benchmark_steps=2, profile_steps=0, n_workers=0, defer_image_ops=False, compile=False)
     patch_training(monkeypatch)
-    training.train(par, lambda par, step: None)
+    Path(par.savedir).mkdir()
+    train(par, 200, lr1=0.0)
     rows = [json.loads(line) for line in (Path(par.savedir) / "metrics.json").read_text().splitlines()]
-    scale = lambda s: min(1, (s + 1) / 100) * (1 - min(1, max(0, (s - 100) / 100)))
-    assert all(r["lr"] == pytest.approx(par.lr * scale(r["idx_step"] + 1)) for r in rows)
-    assert max(r["lr"] for r in rows) == pytest.approx(par.lr, rel=0.02) and rows[-1]["lr"] < 0.02 * par.lr  # up, then down to ~0
+    lerp = lambda i: par.lr * (1 - i / 200) * min(1, (i + 1) / 20)  # lr0 -> lr1 over the call, times the warmup
+    assert all(r["lr"] == pytest.approx(lerp(r["idx_step"])) for r in rows)
+    assert max(r["lr"] for r in rows) == pytest.approx(par.lr * 0.9, rel=0.1) and rows[-1]["lr"] < 0.02 * par.lr  # up, then down to ~0
 
 
 def test_qk_norm_normalizes_each_heads_queries_and_keys():
@@ -216,31 +222,41 @@ def test_qk_norm_normalizes_each_heads_queries_and_keys():
     assert len(list(normed.parameters())) == len(list(plain.parameters())) + 4  # a weight and bias each, for q and k
 
 
-def test_a_trunk_hands_each_milestone_to_its_callback_and_an_anneal_continues_one(tmp_path, monkeypatch):
+def test_a_trainer_trains_in_calls_and_a_checkpoint_continues_it(tmp_path, monkeypatch):
     monkeypatch.setattr(training, "LR_WARMUP", 100)  # a short warmup, so a short trunk gets past it
-    src = Train(
-        savedir=f"{tmp_path}/d0/", patch_size=(8, 8, 8), batch_size=2, total_steps=130, max_hours=1.0,  # past LR_WARMUP
-        warmup_steps=1, benchmark_steps=2, profile_steps=0, n_workers=0, defer_image_ops=False, compile=False,
-    )
+    src = Train(savedir=f"{tmp_path}/d0/", patch_size=(8, 8, 8), batch_size=2,
+                warmup_steps=1, benchmark_steps=2, profile_steps=0, n_workers=0, defer_image_ops=False, compile=False)
     patch_training(monkeypatch)
-    seen = []
-    training.train(src, lambda par, step: seen.append((step, specs.milestone(par, step).is_file())))  # its milestone is on disk when called
-
-    steps = range(13, 131, 13)
-    assert seen == [(s, True) for s in steps]  # the last once only
-    ckdir = Path(src.savedir) / "checkpoints"
-    assert [p.name for p in ckdir.glob("step_*.pt")] == ["step_0000130.pt"]  # rolling: the newest only
-    assert [p.name for p in sorted((ckdir / "milestones").glob("*.pt"))] == [f"step_{s:07d}.pt" for s in steps]  # the callback released none
+    Path(src.savedir).mkdir()
+    with training.Trainer(src, 130) as t:
+        t.train(65, src.lr, src.lr)
+        t.train(65, src.lr, src.lr)  # the second call goes on where the first stopped: the step, the warmup, the loader
+        assert t.step == 130
+        t.save(Path(src.savedir) / "step_0000130/start.pt")
     trunk = [json.loads(line) for line in (Path(src.savedir) / "metrics.json").read_text().splitlines()]
-    assert all(r["lr"] == pytest.approx(src.lr * min(1, (r["idx_step"] + 2) / 100)) for r in trunk)  # warmup, then constant, no decay
+    assert [r["idx_step"] for r in trunk] == list(range(0, 70, 10)) + [64] + list(range(70, 130, 10)) + [129]  # one run of steps
+    assert all(r["lr"] == pytest.approx(src.lr * min(1, (r["idx_step"] + 1) / 100)) for r in trunk)  # warmup, then constant
     assert trunk[-1]["lr"] == src.lr
 
-    par = replace(src, savedir=specs.branch_dir(src, 117), total_steps=12, anneal_from=str(specs.milestone(src, 117)))
-    training.train(par, lambda par, step: pytest.fail("an anneal has no milestones"))
-    start = torch.load(par.anneal_from, weights_only=False)
+    start = Path(src.savedir) / "step_0000130/start.pt"
+    par = replace(src, savedir=f"{src.savedir}step_0000130/")
+    with training.Trainer(par, 12, str(start)) as t:
+        assert t.step == 130  # the checkpoint's
+        t.train(12, par.lr, 0.01 * par.lr)
     metrics = [json.loads(line) for line in (Path(par.savedir) / "metrics.json").read_text().splitlines()]
-    lr0 = start["opt"]["param_groups"][0]["lr"]
-    assert lr0 == src.lr and metrics[0]["lr"] <= lr0 and metrics[-1]["lr"] == pytest.approx(0.01 * lr0)  # trunk's lr down to 1%
-    done = torch.load(sorted((Path(par.savedir) / "checkpoints").glob("step_*.pt"))[-1], weights_only=False)
-    assert not (Path(par.savedir) / "checkpoints/milestones").exists()
-    assert done["step"] == 12 and done["opt"]["state"][0]["step"] == 117 + 12  # Adam's step count carried over
+    assert metrics[0]["idx_step"] == 130 and metrics[0]["lr"] == pytest.approx(par.lr) and metrics[-1]["lr"] == pytest.approx(par.lr * (1 - 0.99 * 11 / 12))  # lr0 -> lr1 over the call
+    t.save(Path(par.savedir) / "checkpoint.pt")
+    done = torch.load(Path(par.savedir) / "checkpoint.pt", weights_only=False)
+    assert done["step"] == 142 and done["opt"]["state"][0]["step"] == 142  # Adam's moments and step count carried over
+
+
+def test_a_trainer_stops_on_a_non_finite_loss_and_trains_no_more(tmp_path, monkeypatch):
+    par = Train(savedir=str(tmp_path), patch_size=(8, 8, 8), batch_size=2, warmup_steps=1, benchmark_steps=2, profile_steps=0,
+                n_workers=0, defer_image_ops=False, compile=False)
+    patch_training(monkeypatch)
+    monkeypatch.setattr(training, "stop_reason", lambda *a: "diverged")
+    with training.Trainer(par, 500) as t:
+        t.train(200, par.lr, par.lr)
+        assert t.stopped == "diverged" and t.step == 100  # agreed every 100 steps
+        t.train(200, par.lr, par.lr)
+        assert t.step == 100

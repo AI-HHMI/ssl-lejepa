@@ -132,7 +132,7 @@ def pca_sizes(e: Eval, model, step: int):
 
 def val_loss(par: Eval, model, step: int):
     """The pretraining loss of par's weights on held-out EM, beside the same loss on the training volumes, per training family:
-    VAL_WINDOWS patch-size windows, evenly spaced on a grid, the same ones at every milestone, and the same seeded views and masks;
+    VAL_WINDOWS patch-size windows, evenly spaced on a grid, the same ones at every branch, and the same seeded views and masks;
     the model in train mode (the projector's BatchNorm uses each batch's statistics, as training's loss does), no gradient.
       savedir/val.json   {"step", "val": {family: {loss, inv, sigreg}}, "train": {same, windows of the training volumes}}
     A gap that opens between "val" and "train" is the encoder fitting the volumes it trains on."""
@@ -182,7 +182,7 @@ def probe(par: Eval, model, step: int):
       savedir/probe.json          test-block BCE and boundary AP per channel (cheap, immediate)
       savedir/probe_fit.json      the fit curve every 100 steps: training loss, and BCE and boundary AP on a
                                   fixed held-out sample (monitoring only, nothing selects on it)
-    Weights: par.init_from (load_checkpoint): this run's checkpoint, an older run's, or random (the baseline).
+    Weights: par.init_from (load_checkpoint): a branch's checkpoint, an older run's, or random (the baseline).
       savedir/probe/{fit,test}/<name>.zarr   mia-evals affinity artifacts, (6, X, Y, Z) float16, for
                                   `mia-evals score` with truth_kind = "instances" (reads the GT from the store)
       savedir/probe.png           test block, middle z: EM | true boundaries | predicted boundaries (probe_<k>.png

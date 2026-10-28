@@ -34,11 +34,14 @@ git checkout main
 bjobs -w
 ```
 
-Design an experiment: `experiment.py` is only its table of runs (`BASE.but(...)`, one line per run, named; `H200` and `B300` are whole
-nodes) and `lib/jobs.py` the rest. `python experiment.py -h` lists the tasks of the pipeline with the hardware each needs and the data
-it reads (by role: train, val, fit, test, tune, the parts every dataset of `lib/data.py` has).
+Design an experiment: `experiment.py` is its phases and its table of runs. The phases are functions declared with `@task` (spec,
+hardware, the data they use by role: train, val, fit, test, tune, the parts every dataset of `lib/data.py` has; and what they write),
+each calling the next with `go()`, which submits it as an LSF job: a `trunk` pretrains in one job and forks a `branch` at its start and
+after every segment; a branch anneals, runs pca and tiled inference, and goes to `scores`, a CPU job after which the trunk keeps
+`best.pt`. The table is `BASE.but(...)`, one line per run, named (`H200` and `B300` are whole nodes); `lib/jobs.py` is the rest.
+`python experiment.py -h` lists the phases with their hardware and data.
 ```sh
 # [On the Janelia cluster, from the experiment's commit.]
 sh jrun.sh exp experiment.py submitall        # every run not submitted yet
-sh jrun.sh exp experiment.py lsf benchmark mask7   # one task of one run (or of a spec json)
+sh jrun.sh exp experiment.py lsf benchmark mask7   # one phase of one run (or of a spec json, e.g. a branch's eval.json)
 ```

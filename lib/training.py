@@ -1,6 +1,6 @@
-"""Training a Train spec: the data loader, DDP setup, model and optimizer, the step, checkpoints (with a callback for each
-milestone's eval), the stop rules, throughput benchmark and replay of a skipped step. Entrypoints and their bookkeeping
-(code snapshot check, run records, evals) are experiment.py's."""
+"""Training a Train spec: the data loader, DDP setup, model and optimizer, the step, the Trainer that takes a few at a time,
+checkpoints, the stop rules, throughput benchmark and replay of a skipped step. Phases and their bookkeeping (code snapshot
+check, run records, evals, branches) are experiment.py's and lib.jobs'."""
 
 from __future__ import annotations
 
@@ -23,15 +23,13 @@ from lib.data import sampling
 from lib.losses import LejepaOutput
 from lib.models import Lejepa, Mae
 from lib.readers import volume_config
-from lib.specs import Rank, Train, make_model, milestone_steps, model_config
+from lib.specs import Rank, Train, make_model, model_config
 from lib.util import *
 from lib.views import ViewMaker
 
-# Training (train): the lr schedule (a trunk's linear warmup steps; an anneal's cosine ends at LR_FLOOR x the checkpoint's lr),
-# the max global grad norm, checkpoints (every CHECKPOINT_EVERY steps, ~15 min at 8 GPUs; the newest CHECKPOINT_KEEP kept), and
-# steps whose gradient is non-finite (skipped, not applied: the run stops after MAX_SKIPPED; the first BAD_BATCHES_KEPT dumped).
-LR_WARMUP, LR_FLOOR, GRAD_CLIP = 1000, 0.01, 1.0
-CHECKPOINT_EVERY, CHECKPOINT_KEEP = 2000, 1
+# Training (Trainer): the lr warmup (steps from a fresh model), the max global grad norm, and steps whose gradient is
+# non-finite (skipped, not applied: the run stops after MAX_SKIPPED; the first BAD_BATCHES_KEPT dumped).
+LR_WARMUP, GRAD_CLIP = 1000, 1.0
 MAX_SKIPPED, BAD_BATCHES_KEPT = 100, 2
 
 
@@ -83,7 +81,7 @@ def save_view_pngs(par: Train, dataset, n_samples: int = 3):
         Image.fromarray(np.concatenate(panels, axis=1)).save(savedir / f"views_{b}.png")
     print(f"Saved {n_samples} input + view slices to {savedir}/views_*.png", flush=True)
 
-def dataloader(par: Train):
+def dataloader(par: Train, steps: int):
     import torch
     # The datasets' train volumes (lib/data.py), images only, each sampled by its weight alone (lib.data.sampling); output is z y x.
     volumes = [volume_config(v, v.zyx, weight=w) for v, w in sampling(par.data, par.data_power)]
@@ -92,7 +90,7 @@ def dataloader(par: Train):
         patch_size=list(par.patch_size),
         resolutions=[[8.0, 8.0, 8.0]],
         # Extra batches keep workers busy (as in real training) through the last, profiled steps.
-        samples_per_epoch=par.batch_size * (par.total_steps + par.n_workers * par.prefetch_factor),
+        samples_per_epoch=par.batch_size * (steps + par.n_workers * par.prefetch_factor),
         sampling="random",
         output_axes="lzyx",
         defer_image_ops=par.defer_image_ops,
@@ -128,17 +126,17 @@ def setup(par: Train) -> Rank:
     if torch.cuda.is_available():
         torch.cuda.set_device(r.local)
     if r.world > 1:
-        # The other ranks wait at their next collective while rank 0 evaluates a milestone (eval_milestone): minutes, past NCCL's default 10.
+        # The other ranks wait at their next collective while rank 0 saves a checkpoint: minutes for a big one, past NCCL's default 10.
         dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo", timeout=timedelta(hours=1))
     print(f"Rank {r.rank}/{r.world} is using torch device {r.device()} .")
     return r
 
-def build(par: Train, r: Rank):
-    """(model to step: compiled, and DDP-wrapped across ranks; the bare Lejepa, for checkpoints and logging; AdamW; its lr
-    schedule) for training par: fresh, or from par.anneal_from's weights and Adam moments."""
+def build(par: Train, r: Rank, init_from: str):
+    """(model to step: compiled, and DDP-wrapped across ranks; the bare Lejepa, for checkpoints and logging; AdamW; the step it
+    starts at) for training par: fresh (init_from ""), or from the checkpoint init_from's weights, Adam moments and step."""
     import torch
     model = make_model(par)
-    ckpt = torch.load(par.anneal_from, map_location="cpu", weights_only=False) if par.anneal_from else None
+    ckpt = torch.load(init_from, map_location="cpu", weights_only=False) if init_from else None
     if ckpt is not None:
         model.load_state_dict(ckpt["model"])  # strict: architecture drift fails loudly
     if r.rank0: pprint(model)
@@ -156,25 +154,13 @@ def build(par: Train, r: Rank):
     no_decay = [p for p in model.parameters() if p.ndim < 2]
     opt = torch.optim.AdamW([{"params": decay, "weight_decay": par.weight_decay},
                              {"params": no_decay, "weight_decay": 0.0}],
-                            lr=ckpt["opt"]["param_groups"][0]["lr"] if ckpt else par.lr,
-                            betas=(0.9, par.adam_beta2))
-    if ckpt is not None:  # the Adam moments and step count only: the fresh param groups keep the checkpoint's lr as the schedule's start
+                            lr=par.lr, betas=(0.9, par.adam_beta2))  # the lr is set at every step (Trainer.train)
+    if ckpt is not None:  # the Adam moments and step count only: the fresh param groups keep their own lr
         ckpt["opt"]["param_groups"] = opt.state_dict()["param_groups"]
         opt.load_state_dict(ckpt["opt"])
-    # By step count, so every rank uses the same lr. A trunk run warms up, then holds par.lr until it stops, so its milestone
-    # checkpoints are branch points (Train.anneal_from); with par.lr_decay it falls linearly to 0 at total_steps instead. An anneal has no warmup (the loaded moments
-    # are warm) and cosine-decays from the checkpoint's lr to LR_FLOOR of it over total_steps.
-    if ckpt is None:
-        def lr_scale(s):
-            warm = min(1.0, (s + 1) / LR_WARMUP)
-            b1 = par.lr_decay
-            b2 = min(1.0, max(0.0, (s - LR_WARMUP) / (par.total_steps - LR_WARMUP)))  # how far through the decay
-            return warm * (1 - b2 if b1 else 1.0)
-    else:
-        lr_scale = lambda s: LR_FLOOR + (1 - LR_FLOOR) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / par.total_steps)))
-    return model, lejepa, opt, torch.optim.lr_scheduler.LambdaLR(opt, lr_scale)
+    return model, lejepa, opt, ckpt["step"] if ckpt else 0
 
-def train_step(model, opt, sched, batches, par: Train, r: Rank, bench: Benchmark):
+def train_step(model, opt, batches, par: Train, r: Rank, bench: Benchmark):
     """One optimizer step on the next batch, each part in its profiler phase (bench). A step whose gradient is non-finite is
     skipped, not applied: a single one would write NaN into every weight via opt.step() (the sudden divergences in
     e00/viewsizes*); DDP ranks share the all-reduced norm, so they skip together, at one host sync per step.
@@ -202,7 +188,6 @@ def train_step(model, opt, sched, batches, par: Train, r: Rank, bench: Benchmark
         if not skipped:
             opt.step()
         opt.zero_grad(set_to_none=True)
-        sched.step()
     return x, out, grad_norm, skipped, rng
 
 def save_bad_batch(par: Train, lejepa, x, rng, step: int):
@@ -213,33 +198,7 @@ def save_bad_batch(par: Train, lejepa, x, rng, step: int):
                 "x_uint8": (x.clamp(0, 1) * 255).round().byte().cpu(), "rng_cpu": rng[0], "rng_cuda": rng[1]},
                Path(par.savedir) / f"bad_batch_{step:07d}.pt")
 
-def save_checkpoint(par: Train, lejepa, opt, sched, step: int, on_milestone):
-    """checkpoints/step_<step>.pt, keeping the newest CHECKPOINT_KEEP; a milestone step's also kept in checkpoints/milestones/
-    and handed to on_milestone(par, step) there and then (experiment.eval_milestone: it evaluates it, then deletes it). Never non-finite weights."""
-    import torch
-    state = lejepa.state_dict()
-    bad = [k for k, v in state.items() if v.is_floating_point() and not torch.isfinite(v).all()]
-    if bad:  # never let a diverged model overwrite good checkpoints
-        print(f"Not saving step {step}: {len(bad)} non-finite tensors, e.g. {bad[0]}", flush=True)
-        return
-    ckdir = Path(par.savedir) / "checkpoints"
-    ckdir.mkdir(exist_ok=True)
-    tmp, path = ckdir / "tmp.pt", ckdir / f"step_{step:07d}.pt"
-    torch.save({"step": step, "params": asdict(par), "model_config": asdict(lejepa.config), "model": state,
-                "opt": opt.state_dict(), "sched": sched.state_dict()}, tmp)
-    tmp.replace(path)  # never leave a half-written checkpoint
-    kept = ckdir / "milestones" / path.name
-    b1 = not par.anneal_from and step in milestone_steps(par)  # an anneal has none: its own checkpoint is the one eval
-    b2 = not kept.exists()
-    for old in sorted(ckdir.glob("step_*.pt"))[:-CHECKPOINT_KEEP]:
-        old.unlink()
-    print(f"Saved {path}", flush=True)
-    if b1 and b2:
-        kept.parent.mkdir(exist_ok=True)
-        os.link(path, kept)  # a hard link outlives the rolling checkpoints' prune
-        on_milestone(par, step)
-
-def log_metrics(f, par: Train, lejepa, x, out, grad_norm, sched, step: int, n_skipped: int, seconds: float):
+def log_metrics(f, par: Train, lejepa, x, out, grad_norm, lr: float, step: int, n_skipped: int, seconds: float):
     """One metrics.json row (and a progress line) for this step."""
     import torch
     loss = out.loss.detach().item()
@@ -253,24 +212,22 @@ def log_metrics(f, par: Train, lejepa, x, out, grad_norm, sched, step: int, n_sk
     # with how Gaussian the projections are. An MAE's loss is its reconstruction error alone.
     f.write(json.dumps({"tbl": "metrics", "idx_step": step, "time": seconds, "loss": loss,
                         **{k: out[k].detach().item() for k in ("inv", "sigreg") if k in out},
-                        "grad_norm": grad_norm.item(), "lr": sched.get_last_lr()[0],
+                        "grad_norm": grad_norm.item(), "lr": lr,
                         "resid_norm": resid.float().norm(dim=-1).median().item(), "skipped": n_skipped}) + "\n")
     f.flush()
-    print(f"finished step {step + 1}/{par.total_steps}, loss={loss:.4f}", flush=True)
+    print(f"finished step {step + 1}, loss={loss:.4f}", flush=True)
 
-def stop_reason(par: Train, r: Rank, out, n_skipped: int, seconds: float, step: int) -> str:
-    """Why every rank stops after this step ("" to go on), agreed by one all-reduce: a non-finite loss (divergence), past
-    max_hours, or too many skipped (non-finite gradient) steps."""
+def stop_reason(r: Rank, out, n_skipped: int, step: int) -> str:
+    """Why every rank stops after this step ("" to go on), agreed by one all-reduce: a non-finite loss (divergence), or too many
+    skipped (non-finite gradient) steps."""
     import torch
     import torch.distributed as dist
     b1 = not torch.isfinite(out.loss.detach()).item()
-    b2 = bool(par.max_hours) and seconds > par.max_hours * 3600
-    b3 = n_skipped >= MAX_SKIPPED
-    stop = torch.tensor([float(b1), float(b2), float(b3)], device=r.device())
+    b2 = n_skipped >= MAX_SKIPPED
+    stop = torch.tensor([float(b1), float(b2)], device=r.device())
     if r.world > 1:
         dist.all_reduce(stop, op=dist.ReduceOp.MAX)
     reasons = [f"Non-finite loss by step {step + 1}; stopping (checkpoints keep the last finite weights)",
-               f"Reached max_hours={par.max_hours} at step {step + 1}",
                f"{n_skipped} steps skipped for non-finite gradients by step {step + 1}; stopping"]
     return next((m for m, s in zip(reasons, stop.tolist()) if s), "")
 
@@ -283,66 +240,88 @@ def record_oom(par: Train, r: Rank, step: int, err: Exception):
     with open(Path(par.savedir) / "performance.json", "a") as f:
         f.write(json.dumps(row) + "\n")
 
-def train(par: Train, on_milestone):
-    """Train par on every DDP rank; ends with no process group left. Rank 0 writes metrics.json, checkpoints (calling
-    on_milestone(par, step) at each milestone: save_checkpoint), and the throughput window and profile of Benchmark."""
-    import torch
-    import torch.distributed as dist
-    start_time = time.time()
-    r = setup(par)
-    batches = dataloader(par)  # each rank its own, with its own miao seed (see setup)
-    model, lejepa, opt, sched = build(par, r)
-    n_skipped, step = 0, -1
-    try:
-        with open(Path(par.savedir) / "metrics.json" if r.rank0 else os.devnull, "a") as f, Benchmark(par, r.device(), r.world, r.rank0) as bench:
-            for step in range(par.total_steps):
-                bench.begin(step)
-                x, out, grad_norm, skipped, rng = train_step(model, opt, sched, batches, par, r, bench)
+class Trainer:
+    """A model, its optimizer and its data, trained a few steps at a time: `with Trainer(par, steps) as t:` then t.train(...) as
+    often as you like, t.save(path) between. Every DDP rank makes one; leaving the block destroys the process group.
+    Rank 0 writes metrics.json, and the throughput window and profile of Benchmark (at the first steps)."""
+
+    def __init__(self, par: Train, steps: int, init_from: str = ""):
+        """steps: the most it will train in all (the loader's supply, the benchmark's windows). init_from: "" fresh, or a checkpoint .pt."""
+        self.par = par
+        self.r = setup(par)
+        self.batches = dataloader(par, steps)  # each rank its own, with its own miao seed (see setup)
+        self.model, self.lejepa, self.opt, self.step = build(par, self.r, init_from)  # step: steps done, in all
+        self.first, self.n_skipped, self.stopped, self.start_time, self.lr = self.step, 0, "", time.time(), par.lr
+        self.bench = Benchmark(par, steps, self.r.device(), self.r.world, self.r.rank0)
+
+    def __enter__(self) -> Trainer:
+        self.bench.__enter__()
+        return self
+
+    def __exit__(self, kind, err, tb):
+        import torch
+        import torch.distributed as dist
+        self.bench.__exit__(kind, err, tb)
+        if isinstance(err, torch.OutOfMemoryError) and self.r.rank0:
+            record_oom(self.par, self.r, self.step, err)  # then the job fails as usual
+        if self.r.world > 1:
+            dist.destroy_process_group()
+
+    def advance(self, lr: float):
+        """One step at lr (times the warmup of a fresh model): train_step's results."""
+        self.lr = lr * min(1.0, (self.step + 1) / LR_WARMUP)
+        for g in self.opt.param_groups:
+            g["lr"] = self.lr
+        return train_step(self.model, self.opt, self.batches, self.par, self.r, self.bench)
+
+    def train(self, steps: int, lr0: float, lr1: float):
+        """steps more steps, the lr going linearly from lr0 to lr1. No validation, no checkpoints: those are the caller's. Stops
+        early (self.stopped says why) on a non-finite loss or too many skipped steps; later calls then train nothing."""
+        r, par = self.r, self.par
+        with open(Path(par.savedir) / "metrics.json" if r.rank0 else os.devnull, "a") as f:
+            for i in range(steps * (not self.stopped)):
+                lr = lr0 + (lr1 - lr0) * i / steps
+                self.bench.begin(self.step - self.first)
+                x, out, grad_norm, skipped, rng = self.advance(lr)
                 if skipped:
-                    n_skipped += 1
-                    print(f"Non-finite grad norm at step {step}; skipped ({n_skipped} so far)", flush=True)
-                    if r.rank0 and n_skipped <= BAD_BATCHES_KEPT:
-                        save_bad_batch(par, lejepa, x, rng, step)
-                with bench.phase("07_LOGGING"):
-                    if r.rank0 and (step % 10 == 0 or step + 1 == par.total_steps):
-                        log_metrics(f, par, lejepa, x, out, grad_norm, sched, step, n_skipped, time.time() - start_time)
-                bench.end(step)
-                if step % 100 == 99 and (reason := stop_reason(par, r, out, n_skipped, time.time() - start_time, step)):
+                    self.n_skipped += 1
+                    print(f"Non-finite grad norm at step {self.step}; skipped ({self.n_skipped} so far)", flush=True)
+                    if r.rank0 and self.n_skipped <= BAD_BATCHES_KEPT:
+                        save_bad_batch(par, self.lejepa, x, rng, self.step)
+                with self.bench.phase("07_LOGGING"):
+                    if r.rank0 and (self.step % 10 == 0 or i + 1 == steps):
+                        log_metrics(f, par, self.lejepa, x, out, grad_norm, self.lr, self.step, self.n_skipped, time.time() - self.start_time)
+                self.bench.end(self.step - self.first)
+                self.step += 1
+                if self.step % 100 == 0 and (reason := stop_reason(r, out, self.n_skipped, self.step - 1)):
                     print(reason, flush=True)
+                    self.stopped = reason
                     break
-                b1 = step % CHECKPOINT_EVERY == CHECKPOINT_EVERY - 1
-                b2 = not par.anneal_from and step + 1 in milestone_steps(par)
-                if r.rank0 and (b1 or b2):
-                    save_checkpoint(par, lejepa, opt, sched, step + 1, on_milestone)
-    except torch.OutOfMemoryError as err:
-        if r.rank0:
-            record_oom(par, r, step, err)
-        raise  # then fail the job as usual
-    if r.rank0 and latest_step(par) < step + 1:  # not saved in the loop already (that would evaluate a milestone twice)
-        save_checkpoint(par, lejepa, opt, sched, step + 1, on_milestone)
-    if r.world > 1:
-        dist.destroy_process_group()
+
+    def save(self, path: Path):
+        """Rank 0: the weights and optimizer at this step -> path (written whole, then moved into place)."""
+        import torch
+        state = self.lejepa.state_dict()
+        bad = [k for k, v in state.items() if v.is_floating_point() and not torch.isfinite(v).all()]
+        assert not bad, f"not saving step {self.step}: {len(bad)} non-finite tensors, e.g. {bad[0]}"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        torch.save({"step": self.step, "params": asdict(self.par), "model_config": asdict(self.lejepa.config), "model": state,
+                    "opt": self.opt.state_dict()}, tmp)
+        tmp.replace(path)  # never leave a half-written checkpoint
+        print(f"Saved {path}", flush=True)
+
 
 def benchmark(par: Train):
     """Throughput and a profiler trace of par's training step, with no training run:
     warmup_steps untimed, benchmark_steps timed (performance.json), then profile_steps traced (profile.json, profile.out,
-    trace_summary.json); no metrics, checkpoints or evals. Same setup, data and step as train(). Every DDP rank."""
-    import torch.distributed as dist
-    par = replace(par, total_steps=par.warmup_steps + par.benchmark_steps + 1 + par.profile_steps)  # Benchmark's windows, no more
-    r = setup(par)
-    batches = dataloader(par)
-    model, _, opt, sched = build(par, r)
-    with Benchmark(par, r.device(), r.world, r.rank0) as bench:
-        for step in range(par.total_steps):
-            bench.begin(step)
-            train_step(model, opt, sched, batches, par, r, bench)
-            bench.end(step)
-    if r.world > 1:
-        dist.destroy_process_group()
-
-def latest_step(par: Train) -> int:
-    """The step of par's newest checkpoint (-1 if it has none)."""
-    return max((int(p.stem.split("_")[1]) for p in (Path(par.savedir) / "checkpoints").glob("step_*.pt")), default=-1)
+    trace_summary.json); no metrics, checkpoints or evals. Same setup, data and step as Trainer.train. Every DDP rank."""
+    steps = par.warmup_steps + par.benchmark_steps + 1 + par.profile_steps  # Benchmark's windows, no more
+    with Trainer(par, steps) as t:
+        for i in range(steps):
+            t.bench.begin(i)
+            t.advance(par.lr)
+            t.bench.end(i)
 
 def replay_bad_batch(dump: dict):
     """Replay a skipped (non-finite gradient) training step from its bad_batch_*.pt dump (save_bad_batch's dict, torch.load'ed).

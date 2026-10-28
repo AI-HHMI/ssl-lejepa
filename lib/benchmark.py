@@ -44,11 +44,11 @@ class Benchmark:
     following profile_steps are traced (rank 0 only) to profile.json, profile.out and
     trace_summary.json. Use as a context manager around the loop, and each step call
     begin(i), phase(name) around each part, count(out) after the forward, and end(i).
-    `par` needs savedir, warmup_steps, benchmark_steps, profile_steps, total_steps,
-    batch_size and patch_size.
+    `par` needs savedir, warmup_steps, benchmark_steps, profile_steps, batch_size and patch_size;
+    total_steps is how many steps the loop will take at most.
     """
 
-    def __init__(self, par, device: torch.device, world_size: int, rank0: bool):
+    def __init__(self, par, total_steps: int, device: torch.device, world_size: int, rank0: bool):
         self.par = par
         self.device = device
         self.world_size = world_size
@@ -56,8 +56,8 @@ class Benchmark:
         self.savedir = Path(par.savedir)
         self.use_cuda = device.type == "cuda"
         self.profile_start = par.warmup_steps + par.benchmark_steps
-        self.profile_stop = min(self.profile_start + 1 + par.profile_steps, par.total_steps)
-        self.benchmark_stop = min(self.profile_start, par.total_steps)
+        self.profile_stop = min(self.profile_start + 1 + par.profile_steps, total_steps)
+        self.benchmark_stop = min(self.profile_start, total_steps)
         self.started: float | None = None  # perf_counter at the start of the timed window
         self.n_tokens = 0  # encoder tokens since the window started
         self.n_flops = 0  # model training FLOPs since the window started (see Lejepa.forward)

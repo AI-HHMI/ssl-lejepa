@@ -220,9 +220,9 @@ def test_load_checkpoint_init_from(tmp_path, monkeypatch):
     assert step == 0 and all(torch.equal(x, y) for x, y in zip(a.state_dict().values(), b.state_dict().values()))  # seeded
     # Another run's checkpoint: loaded into par's architecture even though its saved params differ from par's.
     other = tmp_path / "old/d0"
-    (other / "checkpoints").mkdir(parents=True)
+    other.mkdir(parents=True)
     trained = {k: v + 1 if v.is_floating_point() else v for k, v in a.state_dict().items()}
-    torch.save({"step": 42, "params": {"savedir": str(other), "width": 16}, "model": trained}, other / "checkpoints/step_0000042.pt")
+    torch.save({"step": 42, "params": {"savedir": str(other), "width": 16}, "model": trained}, other / "checkpoint.pt")
     c, step = specs.load_checkpoint(specs.Eval(savedir=str(tmp_path / "new/d0"), train=small, init_from=str(other)))
     assert step == 42 and all(torch.equal(x, trained[k]) for k, x in c.state_dict().items())
 
@@ -230,7 +230,7 @@ def test_load_checkpoint_init_from(tmp_path, monkeypatch):
 def test_scoring_config_reads_instances_truth_from_its_own_data_configs():
     import tomllib
     from pathlib import Path
-    path = jobs.CODE / jobs.SCORE_CONFIG
+    path = jobs.CODE / jobs.BOARDS["neuron-instance"]
     c = tomllib.loads(path.read_text())
     assert c["task"]["truth_kind"] == "instances"  # GT read from the store, no .gt.zarr copies
     for split, box in [("test", "[[4000, 5000], [4000, 5000], [4000, 5000]]"), ("fit", "[[4000, 5000], [4000, 5000], [3000, 4000]]")]:
@@ -238,44 +238,28 @@ def test_scoring_config_reads_instances_truth_from_its_own_data_configs():
         assert box in data and lib.data.EB_LABEL in data
 
 
-def test_score_runs_the_sister_mia_evals_on_the_probe_artifacts(tmp_path, monkeypatch):
+def test_score_calls_mia_evals_on_the_probe_artifacts(tmp_path, monkeypatch):
     par = specs.Eval(savedir=str(tmp_path / "run"), train=specs.Train(), score=True)
+    with pytest.raises(AssertionError, match="no probe artifacts"):
+        jobs.mia_eval(par)
     for split in ["fit", "test"]:
         (tmp_path / "run/probe" / split).mkdir(parents=True)
     monkeypatch.setattr(jobs, "code_provenance", lambda: {"commit_id": "abc123"})
     monkeypatch.setattr(specs, "code_provenance", lambda: {"commit_id": "abc123"})  # record's
-    monkeypatch.setattr(jobs, "MIA_EVALS", tmp_path / "mia-evals")
     calls = []
-    import subprocess
-    monkeypatch.setattr(subprocess, "run", lambda cmd, check, cwd: calls.append((cmd, cwd)))
-    with pytest.raises(AssertionError, match="no mia-evals CLI"):  # not cloned and synced yet
-        jobs.score(par)
-    (tmp_path / "mia-evals/.venv/bin").mkdir(parents=True)
-    (tmp_path / "mia-evals/.venv/bin/mia-evals").touch()
-    jobs.score(par)
-    ((cmd, cwd),) = calls
-    assert cmd[0] == str(tmp_path / "mia-evals/.venv/bin/mia-evals") and cwd == tmp_path / "mia-evals"
-    assert cmd[1] == "score" and cmd[2].endswith(jobs.SCORE_CONFIG)
-    args = dict(zip(cmd[3::2], cmd[4::2]))
-    assert args["--test"] == str(tmp_path / "run/probe/test") and args["--val"] == str(tmp_path / "run/probe/fit")
-    assert args["--leaderboard"] == str(tmp_path / "run/mia_evals") and "--no-scored" in cmd
-    assert (tmp_path / "run/git_commit.txt").read_text() == "abc123\n"  # copied into the record by --run-dir
+    def fake_score(args):  # mia-evals writes its record into the leaderboard dir
+        calls.append(args)
+        record = args.leaderboard / "task/records/run.step0.mws.json"
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(json.dumps({"scores": {"voxel_instance": {"pq": 0.25}}}))
+    from mia_evals import evaluate
+    monkeypatch.setattr(evaluate, "cmd_score", fake_score)
+    assert jobs.mia_eval(par) == 0.25  # the panoptic quality, which ranks
+    (args,) = calls
+    assert str(args.config).endswith(jobs.BOARDS["neuron-instance"])
+    assert args.test == tmp_path / "run/probe/test" and args.val == tmp_path / "run/probe/fit"
+    assert args.leaderboard == tmp_path / "run/mia_evals" and args.no_scored
+    assert args.run_dir == tmp_path / "run"
+    assert (tmp_path / "run/git_commit.txt").read_text() == "abc123\n"  # copied into the record from run_dir
     assert json.loads((tmp_path / "run/resolved_config.json").read_text())["savedir"] == par.savedir
     assert not (tmp_path / "run/probe").exists()  # scored: its artifacts (GBs) are deleted, the record is in mia_evals/
-
-
-def test_lsf_score_submits_a_cpu_job_on_the_runs_own_eval(tmp_path, monkeypatch):
-    run = str(tmp_path / "run")
-    (tmp_path / "run/probe/test").mkdir(parents=True)
-    exp = jobs.Experiment("e00/e01-test", {"a": specs.Train(savedir=run)})
-    monkeypatch.setattr(jobs, "assert_committed", lambda: None)
-    monkeypatch.setattr(jobs, "snapshot", lambda paths, dest: tmp_path / "code")
-    submitted = []
-    import subprocess
-    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: submitted.append(cmd))
-    jobs.lsf(exp, "score", "a")
-    (cmd,) = submitted
-    assert f"-q {jobs.SCORE_QUEUE}" in cmd and f"-n {jobs.SCORE_SLOTS}" in cmd and "-gpu" not in cmd
-    savedir = exp.roots()["a"].savedir
-    assert f"experiment.py score {savedir}eval.json" in cmd and "job_score_%J.log" in cmd
-    assert load(f"{savedir}eval.json", specs.Eval) == specs.own_eval(exp.roots()["a"])

@@ -1,4 +1,4 @@
-"""Tests for lib.specs: a spec's model, its milestones and the weights it loads."""
+"""Tests for lib.specs: a spec's model and the weights it loads."""
 
 from dataclasses import asdict, replace
 
@@ -42,11 +42,3 @@ def test_the_models_round_trip_through_a_spec_json():
     for model in (specs.Mae(decoder=(512, 8)), specs.Masked(cube=56, sigreg_over="both"), specs.Views(local=96)):
         par = specs.Train(model=model)
         assert parse(specs.Train, asdict(par)) == par and type(parse(specs.Train, asdict(par)).model) is type(model)
-
-
-def test_milestones_are_every_n_steps_or_every_tenth():
-    assert specs.milestone_steps(specs.Train(total_steps=1300)) == list(range(130, 1301, 130))
-    assert specs.milestone_steps(specs.Train(total_steps=100, milestone_every=30)) == [30, 60, 90]  # the cap lists them
-    doubling = specs.Train(total_steps=100, milestone_every=10, milestone_doubling=True)
-    assert specs.milestone_steps(doubling) == [10, 20, 40, 80]
-    assert specs.milestone_steps(replace(doubling, total_steps=80)) == [10, 20, 40, 80]  # the cap itself, if on the doubling

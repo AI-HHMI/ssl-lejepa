@@ -5,7 +5,6 @@ and drawn against the EM. Run where the data is, from the experiment checkout (i
   PYTHONPATH=. uv run python metric_examples.py   -> outdir/e00/metric-examples/{<case>.png, metrics.json} (pull.sh brings them)"""
 
 import json
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +12,6 @@ import numpy as np
 OUT = Path("outdir/e00/metric-examples")
 SIDE = 128  # the crop's side, 8 nm voxels
 SCALE = 3  # panel pixels per voxel
-MIA_EVALS = Path.home() / "proj/mia-evals/src"
 METRICS = ["pq", "sq", "rq", "voi_split", "voi_merge", "adapted_rand_error", "ap_short", "ap_long"]
 CASES = {  # name: what was done to the labels
     "exact": "The ground truth itself: every metric at its best.",
@@ -73,8 +71,7 @@ def edit(name: str, lab: np.ndarray, rng: np.random.Generator) -> tuple[np.ndarr
 def score(lab: np.ndarray, pred: np.ndarray) -> dict:
     """The mistakes' metrics: mia-evals' voxel_instance and the hard prediction's boundary AP over the truth's valid pairs."""
     import torch
-    sys.path.insert(0, str(MIA_EVALS))
-    from metrics.voxel_instance import VoxelInstance
+    from mia_evals.metrics.voxel_instance import VoxelInstance
     from lib.probe import AFFINITY_OFFSETS_XYZ, affinities, average_precision
     s = VoxelInstance()(pred, lab)
     offsets = [o[::-1] for o in AFFINITY_OFFSETS_XYZ]

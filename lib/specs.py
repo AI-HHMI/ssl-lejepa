@@ -1,5 +1,5 @@
 """The specs of a job (Train, Eval, Finetune: what an experiment's runs are and lib.jobs submits), what follows from one
-(its model and the milestones it keeps), and the weights it loads."""
+(its model), and the weights it loads."""
 
 from __future__ import annotations
 
@@ -55,19 +55,24 @@ class Train:
     savedir: str = "outdir/e00/scratch/"
     data: tuple[str, ...] = ()  # the lib.data.DATASETS whose train volumes pretraining samples
     data_power: float = 0.0  # their sampling: a dataset's share, and a volume's within it, go as voxel count ^ this (lib.data.sampling)
-    eval_on: str = ""  # run(): the lib.data.DATASETS its end of training is evaluated on (its val images, and its fit and test blocks)
+    eval_on: str = ""  # the lib.data.DATASETS a branch is evaluated on (its val images, and its fit, test and tune blocks)
     model: Mae | Masked | Views = field(default_factory=Masked)
     patch_size: Tup3Int = (104, 104, 104)  # voxels are 8 nm isotropic (the dataloader reads every volume at 8 nm)
     batch_size: int = 84
-    total_steps: int = 71  # warmup + benchmark + 1 profiler warmup + profile steps: stop right after profiling.
-    # Training runs set it to the expected step count: milestone checkpoints are every 10% of it.
-    max_hours: float = 0.0  # >0: stop after this many hours (total_steps is then an upper bound); sets LSF walltime
-    milestone_every: int = 0  # steps between a trunk's milestone checkpoints (milestone_steps); 0: every 10% of total_steps
-    milestone_doubling: bool = False  # milestones at milestone_every x 1, 2, 4, ...: log-spaced, a few evals however fast it steps
+
+    # The trunk: segments x segment_steps steps at lr, from init_from; each segment's end is a branch point.
+    init_from: str = ""  # the trunk's starting weights: "" random, or a checkpoint .pt (its weights and optimizer)
+    lr: float = 1e-4  # linear warmup over the first LR_WARMUP steps of a trunk, then held
+    segments: int = 10
+    segment_steps: int = 10_000
+    hours: float = 12.0  # the trunk's LSF wall limit: one killed at it keeps the branches of its finished segments
+    # A branch: anneal_steps more steps from a branch point, the lr falling linearly to lr x anneal_to; then evaluated and scored.
+    anneal_steps: int = 10_000
+    anneal_to: float = 0.01
+    branch_eval: Literal["probe", "unetr"] = "probe"  # the branch's tiled inference: a Linear on the frozen encoder, or a UNETR
+    board: Literal["neuron-instance"] = "neuron-instance"  # the mia-evals leaderboard (lib.jobs.BOARDS) a branch is scored on
     n_layers: int = 12
     width: int = 512  # encoder width; heads = width // 64
-    lr: float = 1e-4  # run(): linear warmup, then held at this lr (or lr_decay; see anneal_from)
-    lr_decay: bool = False  # run(): after the warmup, lr falls linearly to 0 at total_steps (a run stopped by max_hours first ends mid-way)
     qk_norm: bool = False  # LayerNorm on the encoder's queries and keys (lib.encoders.EncoderConfig.qk_norm)
     global_size: Tup3Int = (88, 88, 88)  # the view each sample trains on, voxels (a multiple of the patch)
 
@@ -87,9 +92,6 @@ class Train:
     queue: str = "gpu_h200"  # LSF queue
     n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); batch_size and n_workers are per GPU
 
-    anneal_from: str = ""  # a checkpoint .pt (e.g. a trunk's milestone): train() continues it for total_steps steps, Adam moments kept,
-                           # lr cosine-decaying from the checkpoint's lr to 1% of it; run() then evals the result (pca, probe)
-
     # profiling params
     warmup_steps: int = 10
     benchmark_steps: int = 50
@@ -101,14 +103,12 @@ class Train:
 
 @dataclass(slots=True)
 class Eval:
-    """The spec of pca, probe and score: one set of weights, in the architecture of the run that made them, measured as they
-    are (frozen; the probe fits only a per-token Linear). A run's own end-of-training eval (own_eval), a trunk milestone's
-    (eval_params), or an older run's or untrained weights. Training anything bigger on labels is a Finetune."""
+    """The spec of a branch, its pca, probe and score: one set of weights, in the architecture of the run that made them, measured as they
+    are (frozen; the probe fits only a per-token Linear). A branch's (the weights it annealed to), an older run's or untrained weights. Training anything bigger on labels is a Finetune."""
     savedir: str
-    train: Train  # the run the weights are of: its architecture, its view size (the tiles pca and probe encode), its queue
-    init_from: str = ""  # the weights: "" train's own latest checkpoint; a run dir, its latest; a checkpoint .pt; "random" untrained
+    train: Train  # the trunk the weights are of: its architecture, its view size (the tiles pca and probe encode), its queue
+    init_from: str = ""  # the weights: a checkpoint .pt; a run dir, its checkpoint.pt; "random" untrained. A branch: its branch point, then its own end
     score: bool = False  # probe() also writes the affinity artifacts `score` reads (probe/{fit,test}, GBs each; score deletes them after)
-    jobs: tuple[str, ...] = ("pca", "probe")  # the entrypoints start() submits for it
     data: str = ""  # the lib.data.DATASETS it is measured on: pca and pca_sizes on its first val volume, probe on its fit and test blocks
     standardize: bool = False  # probe(): fit on features standardized per channel (fit block's mean and std; folded back into the Linear)
 
@@ -168,14 +168,11 @@ def make_model(par: Train) -> models.Lejepa | models.Mae:
     return models.Mae(c) if isinstance(c, models.MaeConfig) else models.Lejepa(c)
 
 def load_checkpoint(e: Eval | Finetune):
-    """(model on the GPU if any, step) for inference or finetuning (pca, probe, finetune): the weights e.init_from names, in
-    e.train's architecture.
+    """(model on the GPU if any, step) for inference or finetuning: the weights e.init_from names, in e.train's architecture.
 
-    "" (default): e.train's own latest checkpoint, whose saved params must match e.train. Inference depends on lib/, so
-    like training it only runs for this commit's own experiment: for an older sweep, go back to its commit.
-    A run dir (e.g. outdir/e00/viewsizes/d0): that run's latest checkpoint, loaded strictly into e.train's architecture,
-    so an incompatible one fails loudly (Conv3d-era patch embeds load, see PatchEmbed3d). The run dir is an
-    artifact in outdir/'s append-only log, so this is how a probe reuses a known-good older model.
+    A checkpoint .pt, or a run dir (its checkpoint.pt), loaded strictly into e.train's architecture so an incompatible one
+    fails loudly (Conv3d-era patch embeds load, see PatchEmbed3d). Inference depends on lib/, so like training it only runs
+    for this commit's own experiment: for an older sweep, go back to its commit.
     "random": untrained weights, seeded (the baseline every trained encoder must beat). Step 0.
     """
     import torch
@@ -183,48 +180,14 @@ def load_checkpoint(e: Eval | Finetune):
     if e.init_from == "random":
         torch.manual_seed(0)
         return make_model(e.train).to(device).eval(), 0
-    src = Path(e.init_from or e.train.savedir)
-    paths = [src] if src.suffix == ".pt" else sorted((src / "checkpoints").glob("step_*.pt")) or sorted(src.glob("checkpoint.pt"))
-    assert paths, f"no checkpoints in {src}"
-    ckpt = torch.load(paths[-1], map_location="cpu", weights_only=False)
-    if not e.init_from:
-        assert json_equal(ckpt["params"], asdict(e.train)), f"{paths[-1]} was made by other params: run from its experiment's commit"
+    assert e.init_from, f"{e.savedir}: no weights: init_from is a checkpoint .pt, a run dir or \"random\""
+    src = Path(e.init_from)
+    path = src if src.suffix == ".pt" else src / "checkpoint.pt"
+    assert path.is_file(), f"no checkpoint at {path}"
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
     model = make_model(e.train)
     model.load_state_dict(ckpt["model"])  # strict: architecture drift fails loudly
     return model.to(device).eval(), ckpt["step"]
-
-def milestone_steps(trunk: Train) -> list[int]:
-    """The steps whose checkpoints train() keeps in checkpoints/milestones/: every milestone_every steps up to total_steps,
-    or, if that is 0, every 10% of it (the last is the final checkpoint of a trunk that ran to completion). A trunk stopped
-    early by max_hours never reaches the later ones: with a time budget, total_steps is just the cap that lists them.
-    With milestone_doubling, they double from milestone_every instead."""
-    if trunk.milestone_doubling:
-        assert trunk.milestone_every > 0, f"{trunk.savedir}: doubling milestones start at milestone_every, which is 0"
-        return [trunk.milestone_every * 2 ** k for k in range((trunk.total_steps // trunk.milestone_every).bit_length())]
-    if trunk.milestone_every:
-        return list(range(trunk.milestone_every, trunk.total_steps + 1, trunk.milestone_every))
-    return sorted({round(k * trunk.total_steps / 10) for k in range(1, 11)})
-
-def milestone(trunk: Train, step: int) -> Path:
-    """The checkpoint train() keeps at this milestone step (0.6 GB for m: a milestone eval, or a branch, can reload it any time)."""
-    assert step in milestone_steps(trunk), f"step {step} is not a milestone of {trunk.savedir}: {milestone_steps(trunk)}"
-    return Path(trunk.savedir) / "checkpoints/milestones" / f"step_{step:07d}.pt"
-
-def branch_dir(trunk: Train, step: int) -> str:
-    """A milestone branch's savedir: inside its trunk's, <trunk>/step_<step>/."""
-    return f"{Path(trunk.savedir) / f'step_{step:07d}'}/"
-
-def eval_params(trunk: Train, step: int) -> Eval:
-    """The eval of `trunk`'s milestone at `step`, as saved (not annealed), in branch_dir."""
-    return Eval(savedir=branch_dir(trunk, step), train=trunk, init_from=str(milestone(trunk, step)), data=trunk.eval_on)
-
-def own_eval(t: Train) -> Eval:
-    """The eval of a training run's own latest checkpoint, in its own savedir: what run() does after training."""
-    return Eval(savedir=t.savedir, train=t, data=t.eval_on)
-
-def source(p: Spec) -> str:
-    """The weights p starts from: an anneal's checkpoint (Train.anneal_from), or the ones an eval or finetune reads (init_from)."""
-    return p.anneal_from if isinstance(p, Train) else p.init_from
 
 def record(par: Spec, fn: str):
     """Append one row to par.savedir/runs.json: which experiment function ran (fn), its spec (params), code_provenance(),
