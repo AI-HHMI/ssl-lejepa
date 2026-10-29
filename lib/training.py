@@ -124,10 +124,6 @@ class Train:
     speed: Speed = field(default_factory=Speed)
     profile: Profile = field(default_factory=Profile)
 
-    def but(self, **changes) -> Train:
-        """This spec with these groups replaced: how an experiment writes each run as a difference from its base."""
-        return replace(self, **changes)
-
 
 @dataclass(slots=True)
 class Rank:

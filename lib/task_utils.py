@@ -1,13 +1,14 @@
-"""What an experiment.py and its tasks.py are made of, and the LSF code that runs it. An experiment is a table of runs (Experiment), each a Trunk spec,
-and the tasks that process each run: functions in tasks.py (trunk, branch, score), each declared with @task (its spec class,
-defined beside it, and its hardware) and each calling the next with go(), which submits it as an LSF job: a job is a task
-submitted. A spec has a savedir; a gpus task says which Hardware (queue, GPUs) its spec asks LSF for. A task takes its spec, or the path of the
-spec's json (`branch outdir/.../branch.json`), so one can be redone by hand: `lsf <task> <run or spec file>`. Depends on lib/, so a
-task runs only from its experiment's commit. `python experiment.py` or `-h` lists the commands and tasks (main)."""
+"""What an experiment.py and its tasks.py are made of, and the LSF code that runs it. An experiment is a table of runs (Experiment),
+each a Trunk, and the tasks that process each run: plain functions in tasks.py (trunk, branch, score) with JSON-able arguments
+(dataclasses, strings), each calling the next with go(), which submits it as an LSF job: a job is a task submitted. go() writes the
+arguments and the job's resources to <savedir>/<task>.json and runs `experiment.py <task> <that file>`, which loads the arguments by
+the task's type hints and calls it, so a task runs the same in-process, called with its arguments, and as a job; `lsf <task> <run
+or job file>` redoes one by hand. Depends on lib/, so a task runs only from its experiment's commit. `python experiment.py` or `-h`
+lists the commands and tasks (main)."""
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 import fcntl
 from functools import partial
 import inspect
@@ -17,7 +18,8 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Callable, NamedTuple
+import typing
+from typing import Any, Callable
 
 from lib import training
 from lib.training import Hardware, make_model
@@ -41,11 +43,11 @@ BOARDS = {"neuron-instance": "mia_evals/gary_comparison_neuron_instance/mws.toml
 
 @dataclass
 class Experiment:
-    """An experiment (README: experiment ids): the task that starts each run, and its runs, each a Trunk whose savedir is
+    """An experiment (README: experiment ids): the task every run starts with, and its runs, each a Trunk whose savedir is
     outdir/<id>/<name>/."""
     id: str  # <series>/e<NN>[-<NN>...]-<slug>, e.g. e00/e15-02-pca
-    task: Callable  # the first task of every run (one taking its Trunk)
-    runs: dict[str, Any]  # its Trunks (experiment.py's), by name: [a-z][a-z0-9_-]*
+    task: Callable  # takes a run (its `t`): submitted for each on the run's t.train.hardware for t.hours (start)
+    runs: dict[str, Any]  # its Trunks (tasks.py's), by name: [a-z][a-z0-9_-]*
 
     def roots(self) -> dict[str, Any]:
         assert all(re.fullmatch(r"[a-z][a-z0-9_-]*", name) for name in self.runs), f"run names are lowercase words: {list(self.runs)}"
@@ -55,25 +57,6 @@ class Experiment:
 def experiment_dir(savedir: str) -> str:
     """The experiment of a run dir, <series>/<experiment>: outdir/e00/e12-x/mae/ -> e00/e12-x."""
     return "/".join(Path(savedir).parts[1:3])
-
-
-class Task(NamedTuple):
-    """A task: the function, the spec class it takes, and the hardware it needs."""
-    fn: Callable
-    spec: type  # the spec it takes (a dataclass with a savedir)
-    needs: str  # "gpus": the Train's own, torchrun; "cpu": SCORE_QUEUE's slots
-    minutes: int | Callable[[Any], int]  # the LSF wall limit (of the spec)
-    hardware: Callable[[Any], Hardware] | None  # the Hardware (queue, GPUs) a "gpus" task's spec says; a "cpu" task has none
-
-TASKS: dict[str, Task] = {}  # every task, in the order declared: submit() reads it, `-h` prints it
-
-def task(spec: type, needs: str, minutes, hardware=None):
-    """Declare a function a task of the pipeline (TASKS) and an entrypoint of experiment.py, taking a `spec`."""
-    assert (needs == "gpus") == (hardware is not None), f"{needs!r} task {spec.__name__}: hardware is for (and only for) gpus tasks"
-    def declare(fn):
-        TASKS[fn.__name__] = Task(fn, spec, needs, minutes, hardware)
-        return fn
-    return declare
 
 
 def check_snapshot():
@@ -92,8 +75,8 @@ def replay_bad_batch(exp: Experiment, path: str):
     dump = torch.load(path, map_location="cpu", weights_only=False)
     return training.replay_bad_batch(dump)
 
-def mia_eval(par) -> float:
-    """Score par's branch's affinities (probe/{fit,test}, written by its probe or finetune) as mia-evals' neuron-instance task on its trunk's board
+def mia_eval(t, savedir: str) -> float:
+    """Score the affinities in savedir (probe/{fit,test}, written by a branch's probe or finetune) as mia-evals' neuron-instance task on trunk t's board
     (mutex watershed + size filter, fitted on the fit block, reported on the test block); panoptic quality, which ranks, comes
     back (VOI and ARE are in the record).
 
@@ -106,11 +89,11 @@ def mia_eval(par) -> float:
     from argparse import Namespace
 
     from mia_evals import evaluate
-    savedir = Path(par.savedir)
+    savedir = Path(savedir)
     assert (savedir / "probe/test").is_dir() and (savedir / "probe/fit").is_dir(), f"no probe artifacts in {savedir}: probe or finetune first"
-    (savedir / "resolved_config.json").write_text(json.dumps(asdict(par)) + "\n")
+    (savedir / "resolved_config.json").write_text(json.dumps({"savedir": str(savedir), "trunk": asdict(t)}) + "\n")
     (savedir / "git_commit.txt").write_text(code_provenance()["commit_id"] + "\n")
-    config = CODE / BOARDS[par.branch.trunk.board]  # the snapshot's copy when run as a job
+    config = CODE / BOARDS[t.board]  # the snapshot's copy when run as a job
     root = savedir.resolve()
     evaluate.cmd_score(Namespace(
         config=config, test=root / "probe/test", val=root / "probe/fit", leaderboard=root / "mia_evals", run_dir=root,
@@ -120,21 +103,21 @@ def mia_eval(par) -> float:
     record_file = sorted(savedir.glob("mia_evals/*/records/*.json"))[-1]
     return json.loads(record_file.read_text())["scores"]["voxel_instance"]["pq"]
 
-def keep_if_best(par, score: float):
-    """Keep par's branch's weights (savedir/checkpoint.pt, its end) as its trunk's best.pt if score beats the best so far (best.json, in the
+def keep_if_best(t, savedir: str, score: float):
+    """Keep the branch's weights (savedir/checkpoint.pt, its end) as its trunk's best.pt if score beats the best so far (best.json, in the
     trunk's dir); else delete them. The scores of one trunk's branches finish in any order, so the compare-and-move is under a lock
     held only for it (a rename, not a copy)."""
-    trunk, weights = Path(par.savedir).parent, Path(par.savedir) / "checkpoint.pt"
-    step = int(Path(par.savedir).name.split("_")[1])
+    trunk, weights = Path(savedir).parent, Path(savedir) / "checkpoint.pt"
+    step = int(Path(savedir).name.split("_")[1])
     with open(trunk / "best.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)  # released when the file closes
         best = json.loads((trunk / "best.json").read_text())["score"] if (trunk / "best.json").is_file() else float("-inf")
         if score > best:
             weights.replace(trunk / "best.pt")
-            (trunk / "best.json").write_text(json.dumps({"score": score, "step": step, "board": par.branch.trunk.board, "from": par.savedir}) + "\n")
+            (trunk / "best.json").write_text(json.dumps({"score": score, "step": step, "board": t.board, "from": str(savedir)}) + "\n")
         else:
             weights.unlink()
-    print(f"{par.savedir}: score {score:.4f} {'beats' if score > best else 'does not beat'} the best so far, {best:.4f}", flush=True)
+    print(f"{savedir}: score {score:.4f} {'beats' if score > best else 'does not beat'} the best so far, {best:.4f}", flush=True)
 
 def load_checkpoint(train: Train, init_from: str):
     """(model on the GPU if any, step) for inference or finetuning: the weights init_from names, in train's architecture.
@@ -155,14 +138,14 @@ def load_checkpoint(train: Train, init_from: str):
     model.load_state_dict(ckpt["model"])  # strict: architecture drift fails loudly
     return model.to(device).eval(), ckpt["step"]
 
-def record(par, fn: str):
-    """Append one row to par.savedir/runs.json: which task ran (fn), its spec par (a dataclass: params), code_provenance(),
-    argv and LSF job. Written first thing, so even a run that crashes before any results describes itself.
-    Repro for the dir's artifacts: that commit + argv. The command that submitted the job is in
-    outdir/_log/commands.jsonl (log_command)."""
-    row = {"fn": fn, "params": asdict(par), **code_provenance(), "argv": sys.argv, "lsf_job": os.environ.get("LSB_JOBID")}
-    Path(par.savedir).mkdir(parents=True, exist_ok=True)
-    with open(Path(par.savedir) / "runs.json", "a") as f:
+def record(savedir: str, fn: str, **args):
+    """Append one row to savedir/runs.json: which task ran (fn), its arguments (dataclasses as dicts), code_provenance(), argv and LSF
+    job. Written first thing, so even a run that crashes before any results describes itself. Repro for the dir's artifacts: that
+    commit + argv. The command that submitted the job is in outdir/_log/commands.jsonl (log_command)."""
+    params = {k: asdict(v) if is_dataclass(v) else v for k, v in args.items()}
+    row = {"fn": fn, "params": params, **code_provenance(), "argv": sys.argv, "lsf_job": os.environ.get("LSB_JOBID")}
+    Path(savedir).mkdir(parents=True, exist_ok=True)
+    with open(Path(savedir) / "runs.json", "a") as f:
         f.write(json.dumps(row) + "\n")
 
 def job_name(savedir: str, job: str) -> str:
@@ -195,41 +178,61 @@ def bsub(savedir: str, job: str, minutes: int, n_gpus: int, queue: str, cmd: str
     subprocess.run(full, shell=True, stdin=subprocess.DEVNULL, check=True)
     print(f"Submitted {name} (code {code}) to LSF.")
 
-def go(fn: Callable, job):
-    """Run the task fn on the spec job as its own LSF job: job written to its savedir (dump: trunk.json, branch.json or
-    score.json), and `experiment.py <fn> <that file>` submitted (bsub), which loads it. Hardware by the task's needs: its
-    Train's own GPUs (torchrun), or a CPU job on SCORE_QUEUE. No commit check: callers from the shared checkout (start, lsf)
-    assert_committed() first; a job calling it is committed code."""
-    name = fn.__name__
-    t = TASKS[name]
-    assert isinstance(job, t.spec), f"{job.savedir}: task {name!r} takes a {t.spec}, not a {type(job).__name__}: {list(TASKS)}"
-    h = t.hardware(job) if t.hardware else None
-    assert h is None or h.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={h.n_workers} leaves no core for the training process"
-    spec = dump(job)
-    minutes = t.minutes(job) if callable(t.minutes) else t.minutes
+def submit(file: str):
+    """Submit the job file (go's <savedir>/<task>.json) to LSF, with the resources it says: the task's GPUs (torchrun), or a CPU job on
+    SCORE_QUEUE. No commit check: callers from the shared checkout (start, lsf) assert_committed() first; a job calling go() is
+    committed code."""
+    job = json.loads(Path(file).read_text())
+    h, name, savedir = parse(Hardware | None, job["hardware"]), job["task"], str(Path(file).parent)
     if h:
-        bsub(job.savedir, name, minutes, h.n_gpus, h.queue, f"torchrun --standalone --nproc_per_node={h.n_gpus} {{code}}/experiment.py {name} {spec}")
+        bsub(savedir, name, job["minutes"], h.n_gpus, h.queue, f"torchrun --standalone --nproc_per_node={h.n_gpus} {{code}}/experiment.py {name} {file}")
     else:
-        bsub(job.savedir, name, minutes, 0, SCORE_QUEUE, f"python {{code}}/experiment.py {name} {spec}", slots=SCORE_SLOTS)
+        bsub(savedir, name, job["minutes"], 0, SCORE_QUEUE, f"python {{code}}/experiment.py {name} {file}", slots=SCORE_SLOTS)
+
+def go(fn: Callable, savedir: str, hardware: Hardware | None, minutes: int, **args):
+    """Run the task fn(**args) as its own LSF job in savedir, on hardware (None: a CPU job), for at most minutes. The arguments must
+    be the task's own parameters, JSON-able by its type hints: written, with the resources, to savedir/<fn>.json (job_file), which
+    the job loads (load_args). The same file is what `lsf <task> <file>` resubmits."""
+    name = fn.__name__
+    hints = typing.get_type_hints(fn)
+    assert set(args) == set(inspect.signature(fn).parameters), f"task {name} takes {list(inspect.signature(fn).parameters)}, not {list(args)}"
+    assert hardware is None or hardware.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={hardware.n_workers} leaves no core for the training process"
+    dumped = {k: pydantic_dump(hints[k], v) for k, v in args.items()}
+    file = Path(savedir) / f"{name}.json"
+    file.parent.mkdir(parents=True, exist_ok=True)
+    file.write_text(json.dumps({"task": name, "hardware": asdict(hardware) if hardware else None, "minutes": minutes, "args": dumped}, indent=1) + "\n")
+    submit(str(file))
+
+def pydantic_dump(tp, value):
+    """value as JSON-able data of the type tp (parse's inverse)."""
+    import pydantic
+    return pydantic.TypeAdapter(tp).dump_python(value)
+
+def load_args(fn: Callable, file: str) -> dict:
+    """The arguments of the job file for the task fn, validated against fn's type hints (parse): a stale or hand-edited file fails
+    here, before any GPU work."""
+    hints, args = typing.get_type_hints(fn), json.loads(Path(file).read_text())["args"]
+    assert set(args) == set(inspect.signature(fn).parameters), f"{file}: has arguments {list(args)}, but task {fn.__name__} takes {list(inspect.signature(fn).parameters)}"
+    return {k: parse(hints[k], v) for k, v in args.items()}
 
 def start(exp: Experiment, run):
-    """Submit run fresh: its savedir emptied (old contents -> outdir/.trash/), then the experiment's first task."""
+    """Submit run fresh: its savedir emptied (old contents -> outdir/.trash/), then the experiment's task on its Train's hardware for its hours."""
     trash(run.savedir)
-    go(exp.task, run)
+    go(exp.task, run.savedir, run.train.hardware, int(run.hours * 60), t=run)
 
 
 def lsf(exp: Experiment, fn: str, target: str):
-    """Redo one task on LSF, of the run named target or of the spec file target names (trunk.json, branch.json or score.json
-    of any run or branch, e.g. outdir/.../mae/step_0010000/score.json): `lsf score <that>` after changing the board. The
-    experiment's first task on a run restarts it fresh (start); the others run on the spec in place."""
+    """Redo one task on LSF: `lsf <experiment's task> <run>` restarts the run named so fresh (start), `lsf <task> <job file>` resubmits
+    the job in that file (go's <savedir>/<task>.json, e.g. outdir/.../mae/step_0010000/score.json), as it was: after changing the
+    board, say."""
     assert_committed()
     roots = exp.roots()
-    assert fn in TASKS, f"no task {fn!r}: {list(TASKS)}"
-    p = roots[target] if target in roots else load(target, {t.spec.__name__.lower(): t.spec for t in TASKS.values()}[Path(target).stem])  # a spec file's name (spec_path) -> its class
-    if TASKS[fn].fn is exp.task:
-        start(exp, p)
+    if target in roots:
+        assert fn == exp.task.__name__, f"a run is started by {exp.task.__name__!r}, not {fn!r}: redo {fn} from its job file"
+        start(exp, roots[target])
     else:
-        go(TASKS[fn].fn, p)
+        assert Path(target).name == f"{fn}.json", f"{target} is not a run of {exp.id} ({list(roots)}) or the job file of task {fn}"
+        submit(target)
 
 def replaylsf(exp: Experiment, name: str):
     """replay_bad_batch on LSF for the run name's first bad_batch dump. CUDA_LAUNCH_BLOCKING names a crashing kernel."""
@@ -270,28 +273,28 @@ def check_experiment(exp: Experiment):
 def submitall(exp: Experiment):
     """Submit the experiment (README: one experiment, one entrypoint): every run whose spec isn't in its savedir yet, i.e. not
     submitted before (whether it finished, is still going, or failed). Idempotent: run it again after adding runs; a run
-    already submitted is left alone (`lsf <first task> <name>` restarts one fresh)."""
+    already submitted is left alone (`lsf <the experiment's task> <name>` restarts one fresh)."""
     check_experiment(exp)
     assert_committed()
     for r in exp.roots().values():
-        if not spec_path(r).is_file():
+        if not (Path(r.savedir) / f"{exp.task.__name__}.json").is_file():
             start(exp, r)
 
 
 COMMANDS = [replay_bad_batch, lsf, replaylsf, submitall]  # take the experiment first, bound by main
 
 
-def main(exp: Experiment):
-    """The command line of experiment.py: `<task> <spec json>` (what an LSF job runs), or a command on the experiment's runs."""
-    names = {**{name: t.fn for name, t in TASKS.items()}, **{f.__name__: partial(f, exp) for f in COMMANDS}}
+def main(exp: Experiment, tasks: list[Callable]):
+    """The command line of experiment.py: `<task> <job file>` (what an LSF job runs), or a command on the experiment's runs."""
+    names = {**{f.__name__: f for f in tasks}, **{f.__name__: partial(f, exp) for f in COMMANDS}}
     if len(sys.argv) == 1 or sys.argv[1] in ("-h", "--help"):
         for name, f in names.items():
             doc = (getattr(f, "func", f).__doc__ or "").strip().splitlines()[0]
             print(f"  {name}{str(inspect.signature(f)).replace('exp: Experiment, ', '')}  {doc}")
-            if name in TASKS:
-                t = TASKS[name]
-                print(f"      needs: {t.needs}")
         sys.exit()
     assert sys.argv[1] in names, f"unknown command {sys.argv[1]!r}: {', '.join(names)}"
     log_command(sys.argv)  # commands issued outside jobs -> outdir/_log/commands.jsonl; jobs use runs.json
-    names[sys.argv[1]](*sys.argv[2:])
+    if sys.argv[1] in {f.__name__ for f in tasks}:
+        names[sys.argv[1]](**load_args(names[sys.argv[1]], sys.argv[2]))
+    else:
+        names[sys.argv[1]](*sys.argv[2:])

@@ -35,16 +35,17 @@ bjobs -w
 ```
 
 Design an experiment: `experiment.py` is declarative: `BASE` (a `Train`: model, encoder, data, optim, hardware, speed, profile) and a
-table of runs, one `Trunk` per line (`BASE.but(...)`, named; `H200` and `B300` are whole nodes). `tasks.py` is what a run does: three
-tasks, `trunk`, `branch` and `score`, each beside the spec dataclass of its name that it takes (JSON-able; each holds its parent's:
-`Score(branch)`, `Branch(trunk)`, `Trunk(train)`). A task is a job's entrypoint: it loads its spec, reads and writes files and
-checkpoints, submits the next tasks with `go()` and calls the library (`lib/`: straight-line code on loaded models and specs, no
-callbacks) in its own process. A trunk pretrains in one job and forks a branch at its start and after every segment; a branch anneals,
-runs pca and tiled inference, and goes to `score`, a CPU job after which the trunk keeps `best.pt`. `lib/task_utils.py` is the LSF and
-registry helpers. Words: *experiment* is one `experiment.py`; a *run* a line of its table; a *task* a function of `tasks.py`; a *job* a
-task submitted to LSF. `python experiment.py -h` lists the tasks with their hardware.
+table of runs, one `Trunk` per line (`replace(BASE, ...)`, named; `H200` and `B300` are whole nodes). `tasks.py` is what a run does: plain
+functions with JSON-able arguments, `trunk(t)`, `branch(t, start)` and `score(t, branch_dir)`. A task is a job's entrypoint: it reads
+and writes files and checkpoints, submits the next task with `go(task, savedir, hardware, minutes, **args)` and calls the library
+(`lib/`: straight-line code on loaded models and specs, no callbacks) in its own process. A trunk pretrains in one job and forks a
+branch at its start and after every segment; a branch anneals, runs pca and tiled inference, and goes to `score`, a CPU job after
+which the trunk keeps `best.pt`. `go` writes the arguments and resources to `<savedir>/<task>.json`, the job file that
+`python experiment.py <task> <job file>` loads by the task's type hints. `lib/task_utils.py` is the LSF helpers. Words: *experiment* is
+one `experiment.py`; a *run* a line of its table; a *task* a function of `tasks.py`; a *job* a task submitted to LSF.
+`python experiment.py -h` lists the tasks.
 ```sh
 # [On the Janelia cluster, from the experiment's commit.]
 sh jrun.sh exp experiment.py submitall        # every run not submitted yet
-sh jrun.sh exp experiment.py lsf benchmark mask7   # one task of one run (or of a spec json, e.g. a branch's score.json)
+sh jrun.sh exp experiment.py lsf trunk mask7   # restart one run fresh (or redo one task from its job file, e.g. a branch's score.json)
 ```

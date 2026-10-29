@@ -3,7 +3,7 @@ e12's, or e11's 5^3) and the training objective change what 12 h of pretraining 
 
 Declarative: every run shares BASE (its Train) and differs by the groups its line names; its schedule is its Trunk's fields. What a
 run does (tasks.py): it pretrains in segments, branches at its start and after each, scores each branch, and keeps its best.
-Run it: `sh jrun.sh exp experiment.py submitall`, then `lsf <task> <run or spec file>`; `python experiment.py -h` lists the
+Run it: `sh jrun.sh exp experiment.py submitall`, then `lsf <task> <run or job file>`; `python experiment.py -h` lists the
 commands and tasks."""
 
 from dataclasses import replace
@@ -11,7 +11,7 @@ from functools import partial
 
 from lib.task_utils import B300, H200, Experiment, main
 from lib.training import Data, Encoder, Mae, Masked, Optim, Speed, Train, Views
-from tasks import Trunk, trunk
+from tasks import TASKS, Trunk, trunk
 
 DATA = ("hemibrain", "fish2", "liconn_mouse", "microns", "cellmap")
 BATCH = 32  # per GPU
@@ -26,13 +26,13 @@ BASE = Train(
 
 run = partial(Trunk, eval_data="hemibrain", segments=10, anneal_steps=10_000, anneal_to=0.01, hours=12)  # a line of the table below
 EXPERIMENT = Experiment("e00/e13-cellmap-12h", trunk, {
-    "mae":          run(train=BASE.but(model=Mae(decoder=(512, 8)),                       hardware=H200), segment_steps=30_000),
-    "views":        run(train=BASE.but(model=Views(local=96, batch_views=True, lamb=0.1), hardware=H200), segment_steps=10_000),
-    "mask7":        run(train=BASE.but(model=mask(cube=56),                               hardware=B300), segment_steps=6_250),
-    "mask5":        run(train=BASE.but(model=mask(cube=40),                               hardware=B300), segment_steps=6_250),
-    "mask7-nocell": run(train=BASE.but(model=mask(cube=56),                               hardware=H200, data=replace(BASE.data, sets=DATA[:-1])), segment_steps=12_500),
-    "mask7-cell":   run(train=BASE.but(model=mask(cube=56),                               hardware=B300, data=replace(BASE.data, sets=("cellmap",))), segment_steps=6_250),
+    "mae":          run(train=replace(BASE, model=Mae(decoder=(512, 8)),                       hardware=H200), segment_steps=10_000),
+    "views":        run(train=replace(BASE, model=Views(local=96, batch_views=True, lamb=0.1), hardware=H200), segment_steps=10_000),
+    "mask7":        run(train=replace(BASE, model=mask(cube=56),                               hardware=B300), segment_steps=10_000),
+    "mask5":        run(train=replace(BASE, model=mask(cube=40),                               hardware=B300), segment_steps=10_000),
+    "mask5-nocell": run(train=replace(BASE, model=mask(cube=40),                               hardware=H200, data=replace(BASE.data, sets=DATA[:-1])), segment_steps=10_000),
+    "mask5-cell":   run(train=replace(BASE, model=mask(cube=40),                               hardware=B300, data=replace(BASE.data, sets=("cellmap",))), segment_steps=10_000),
 })
 
 if __name__ == "__main__":
-    main(EXPERIMENT)
+    main(EXPERIMENT, TASKS)

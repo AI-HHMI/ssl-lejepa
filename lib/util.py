@@ -120,32 +120,15 @@ def json_equal(a, b) -> bool:
         return a.keys() == b.keys() and all(json_equal(a[k], b[k]) for k in a)
     return a == b
 
-def parse(cls, data: dict):
-    """data validated as the dataclass cls (pydantic: nested dataclasses, Literals, tuple lengths), strictly: the result must
-    dump back to exactly data, so a field cls doesn't have, one data lacks, or a value pydantic coerced (e.g. "3" for 3) fails."""
+def parse(tp, data):
+    """data validated as the type tp (pydantic: dataclasses, Literals, tuple lengths), strictly: the result must dump back to
+    exactly data, so a field a dataclass doesn't have, one data lacks, or a value pydantic coerced (e.g. "3" for 3) fails."""
     import pydantic
-    job = pydantic.TypeAdapter(cls).validate_python(data)
-    assert json_equal(asdict(job), data), f"{cls.__name__} spec doesn't round-trip (a field added, missing or mistyped): {data}"
-    return job
+    adapter = pydantic.TypeAdapter(tp)
+    value = adapter.validate_python(data)
+    assert json_equal(adapter.dump_python(value), data), f"{tp} doesn't round-trip (a field added, missing or mistyped): {data}"
+    return value
 
-def load(job, cls):
-    """job itself, or, given a path (a spec dump wrote, e.g. <savedir>/trunk.json), the spec in it validated as cls (parse):
-    so an entrypoint runs the same in-process, called with its spec, and as a job, called with the spec's file."""
-    if isinstance(job, str):
-        return parse(cls, json.loads(Path(job).read_text()))
-    assert isinstance(job, cls), f"want a {cls.__name__} or the path of one's json, got {type(job).__name__}"
-    return job
-
-def spec_path(job) -> Path:
-    """Where dump writes the spec job (a dataclass with a savedir): <savedir>/<its class, lowercased>.json, e.g. trunk.json."""
-    return Path(job.savedir) / f"{type(job).__name__.lower()}.json"
-
-def dump(job) -> Path:
-    """Write the spec job to spec_path(job); its path."""
-    path = spec_path(job)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(job), indent=1) + "\n")
-    return path
 
 
 def trace_summary(trace_path: str | Path) -> dict[str, float]:

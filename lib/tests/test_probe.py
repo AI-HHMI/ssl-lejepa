@@ -14,7 +14,6 @@ import lib.data
 import lib.probe
 import lib.readers
 from lib import evals, training
-from lib.util import dump, load
 from lib.encoders import EncoderConfig
 from lib.models import Lejepa, LejepaConfig, ProjectorConfig
 from lib.probe import AFFINITY_OFFSETS_XYZ, affinities, average_precision, fit_probe, to_tokens, to_voxels
@@ -22,11 +21,6 @@ from lib.probe import AFFINITY_OFFSETS_XYZ, affinities, average_precision, fit_p
 TINY = LejepaConfig(encoder=EncoderConfig(depth=1, embed_dim=16, num_heads=2, patch_size=(4, 4, 4)),
                     projector=ProjectorConfig(dim=8, hidden=16))
 BOXES = {"train": [[24, 56], [24, 56], [24, 56]], "fit": [[20, 52], [24, 56], [24, 56]], "test": [[24, 56], [20, 52], [24, 56]]}
-
-
-def branch(tmp_path, data="hemibrain", view=24, **trunk) -> tasks.Branch:
-    """A Branch of a trunk that evaluates on data, at view^3 crops, in tmp_path/run."""
-    return tasks.Branch(savedir=str(tmp_path / "run"), trunk=tasks.Trunk(train=training.Train(data=training.Data(view=(view,) * 3)), eval_data=data, **trunk), init_from="")
 
 
 def train_of(view: int = 24) -> training.Train:
@@ -232,9 +226,9 @@ def test_scoring_config_reads_instances_truth_from_its_own_data_configs():
 
 
 def test_score_calls_mia_evals_on_the_probe_artifacts(tmp_path, monkeypatch):
-    par = tasks.Score(savedir=str(tmp_path / "run"), branch=branch(tmp_path))
+    t, savedir = tasks.Trunk(), str(tmp_path / "run")
     with pytest.raises(AssertionError, match="no probe artifacts"):
-        task_utils.mia_eval(par)
+        task_utils.mia_eval(t, savedir)
     for split in ["fit", "test"]:
         (tmp_path / "run/probe" / split).mkdir(parents=True)
     monkeypatch.setattr(task_utils, "code_provenance", lambda: {"commit_id": "abc123"})
@@ -246,12 +240,12 @@ def test_score_calls_mia_evals_on_the_probe_artifacts(tmp_path, monkeypatch):
         record.write_text(json.dumps({"scores": {"voxel_instance": {"pq": 0.25}}}))
     from mia_evals import evaluate
     monkeypatch.setattr(evaluate, "cmd_score", fake_score)
-    assert task_utils.mia_eval(par) == 0.25  # the panoptic quality, which ranks
+    assert task_utils.mia_eval(t, savedir) == 0.25  # the panoptic quality, which ranks
     (args,) = calls
     assert str(args.config).endswith(task_utils.BOARDS["neuron-instance"])
     assert args.test == tmp_path / "run/probe/test" and args.val == tmp_path / "run/probe/fit"
     assert args.leaderboard == tmp_path / "run/mia_evals" and args.no_scored
     assert args.run_dir == tmp_path / "run"
     assert (tmp_path / "run/git_commit.txt").read_text() == "abc123\n"  # copied into the record from run_dir
-    assert json.loads((tmp_path / "run/resolved_config.json").read_text())["savedir"] == par.savedir
+    assert json.loads((tmp_path / "run/resolved_config.json").read_text())["savedir"] == savedir
     assert not (tmp_path / "run/probe").exists()  # scored: its artifacts (GBs) are deleted, the record is in mia_evals/
