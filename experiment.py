@@ -26,11 +26,11 @@ BASE = Train(
 
 run = partial(Trunk, eval_data="hemibrain", segments=10, anneal_steps=10_000, anneal_to=0.01, hours=12)  # a line of the table below
 EXPERIMENT = Experiment("e00/e13-cellmap-12h", trunk, {
-    "mae":          run(train=replace(BASE, model=Mae(decoder=(512, 8)),                       hardware=H200), segment_steps=10_000),
-    "views":        run(train=replace(BASE, model=Views(local=96, batch_views=True, lamb=0.1), hardware=H200), segment_steps=10_000),
+    "mae":          run(train=replace(BASE, model=Mae(decoder=(512, 8)),                       hardware=B300), segment_steps=10_000),
+    "views":        run(train=replace(BASE, model=Views(local=96, batch_views=True, lamb=0.1), hardware=B300), segment_steps=10_000),
     "mask7":        run(train=replace(BASE, model=mask(cube=56),                               hardware=B300), segment_steps=10_000),
     "mask5":        run(train=replace(BASE, model=mask(cube=40),                               hardware=B300), segment_steps=10_000),
-    "mask5-nocell": run(train=replace(BASE, model=mask(cube=40),                               hardware=H200, data=replace(BASE.data, sets=DATA[:-1])), segment_steps=10_000),
+    "mask5-nocell": run(train=replace(BASE, model=mask(cube=40),                               hardware=B300, data=replace(BASE.data, sets=DATA[:-1])), segment_steps=10_000),
     "mask5-cell":   run(train=replace(BASE, model=mask(cube=40),                               hardware=B300, data=replace(BASE.data, sets=("cellmap",))), segment_steps=10_000),
 })
 
