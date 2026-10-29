@@ -12,7 +12,7 @@ import pytest
 
 import experiment
 import tasks
-from lib import evals, scoring, task_utils, training
+from lib import evals, scoring, task_entry, task_utils, training
 from lib.task_utils import Experiment
 
 
@@ -170,7 +170,7 @@ def test_the_experiment_file_names_runs_that_load_as_a_job_loads_them(tmp_path, 
     assert experiment.EXPERIMENT.start is tasks.start
     for h in (tasks.TRUNK_HARDWARE, tasks.ANNEAL_HARDWARE, tasks.FINETUNE_HARDWARE):
         assert h.n_workers + 1 <= task_utils.CPUS_PER_GPU
-    task_utils.assert_experiment(experiment.EXPERIMENT)
+    task_entry.assert_experiment(experiment.EXPERIMENT)
 
 
 def sweep(monkeypatch, id, init_from=""):
@@ -178,8 +178,8 @@ def sweep(monkeypatch, id, init_from=""):
     run, its hardware, minutes) and with no LSF."""
     started = []
     run = lambda n: tasks.Trunk(init_from=f"{init_from}/{n}/checkpoint.pt" if init_from else "")
-    monkeypatch.setattr(task_utils, "assert_committed", lambda: None)
-    monkeypatch.setattr(task_utils, "trash", lambda savedir: started.append(("trash", Path(savedir).name)))
+    monkeypatch.setattr(task_entry, "assert_committed", lambda: None)
+    monkeypatch.setattr(task_entry, "trash", lambda savedir: started.append(("trash", Path(savedir).name)))
     monkeypatch.setattr(tasks, "go", lambda fn, savedir, hardware, minutes, **args: started.append((fn.__name__, Path(savedir).name, hardware, minutes)))
     return Experiment(id, tasks.start, {n: run(n) for n in "abc"}), started
 
@@ -189,7 +189,7 @@ def test_submitall_starts_each_run_not_submitted_before_fresh(tmp_path, monkeypa
     exp, started = sweep(monkeypatch, "e00/e01-test")
     Path("outdir/e00/e01-test/b").mkdir(parents=True)
     Path("outdir/e00/e01-test/b/trunk.json").write_text("{}")  # submitted before
-    task_utils.submitall(exp)
+    task_entry.submitall(exp)
     a, c = [("trunk", n, tasks.TRUNK_HARDWARE, tasks.TRUNK_MINUTES) for n in "ac"]
     assert started == [("trash", "a"), a, ("trash", "c"), c]
 
@@ -207,7 +207,7 @@ def test_submitall_refuses_an_experiment_misnamed(tmp_path, monkeypatch, id, ini
         (tmp_path / "outdir/e00" / s).mkdir(parents=True)
     exp, started = sweep(monkeypatch, id, init_from)
     with pytest.raises(AssertionError, match=re.escape(error)):
-        task_utils.submitall(exp)
+        task_entry.submitall(exp)
     assert started == []  # refused before any job
 
 
@@ -216,21 +216,51 @@ def test_submitall_takes_a_child_of_its_parent(tmp_path, monkeypatch):
     for s in ("e01-train", "e01-01-pca", "e01-02-probe"):  # e01-02-probe: this experiment's own dir, from a first submit
         (tmp_path / "outdir/e00" / s).mkdir(parents=True)
     exp, started = sweep(monkeypatch, "e00/e01-02-probe", init_from="outdir/e00/e01-train")
-    task_utils.submitall(exp)
-    assert [s[1] for s in started if s[0] == "trunk"] == ["a", "b", "c"] and task_utils.experiment_id("e01-02-probe") == "e01-02"
+    task_entry.submitall(exp)
+    assert [s[1] for s in started if s[0] == "trunk"] == ["a", "b", "c"] and task_entry.experiment_id("e01-02-probe") == "e01-02"
 
 
 def test_lsf_restarts_a_run_with_the_experiments_task_and_redoes_any_other_from_its_job_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     exp, started = sweep(monkeypatch, "e00/e01-test")
     submitted = []
-    monkeypatch.setattr(task_utils, "submit_file", submitted.append)
-    task_utils.resubmit_task(exp, "start", "b")
+    monkeypatch.setattr(task_entry, "submit_file", submitted.append)
+    task_entry.resubmit_task(exp, "start", "b")
     assert [s[:2] for s in started] == [("trash", "b"), ("trunk", "b")]
     with pytest.raises(AssertionError, match="redo score from its job file"):
-        task_utils.resubmit_task(exp, "score", "b")
+        task_entry.resubmit_task(exp, "score", "b")
     file = "outdir/e00/e01-test/b/step_0000100/score.json"
-    task_utils.resubmit_task(exp, "score", file)
+    task_entry.resubmit_task(exp, "score", file)
     assert submitted == [file]
     with pytest.raises(AssertionError, match="is not a run"):
-        task_utils.resubmit_task(exp, "anneal", file)  # the file is another task's
+        task_entry.resubmit_task(exp, "anneal", file)  # the file is another task's
+
+
+def test_the_tasks_compose_through_go_from_start_to_score(tmp_path, monkeypatch):
+    """Every submission is a job file and an LSF command; running each command as a job does (main, on the file) walks start -> trunk -> anneal -> finetune -> score."""
+    monkeypatch.chdir(tmp_path)  # the real go and submit_file, with only LSF and the heavy work faked below
+    jobs, ran = [], []
+    monkeypatch.setattr(task_utils, "bsub", lambda savedir, job, minutes, hardware, cmd: jobs.append(cmd.format(code="CODE").split()))
+    monkeypatch.setattr(tasks, "Trainer", FakeTrainer)
+    monkeypatch.setattr(tasks, "assert_snapshot", lambda: None)
+    monkeypatch.setattr(tasks, "load_checkpoint", lambda path: path)
+    monkeypatch.setattr(tasks, "load_model", lambda train, init_from: (SimpleNamespace(encoder="enc"), 140))
+    monkeypatch.setattr(evals, "pca_maps", lambda *a: None)
+    monkeypatch.setattr(evals, "probe", lambda *a: None)
+    monkeypatch.setattr(tasks, "mia_pq", lambda t, savedir: 0.5)
+    monkeypatch.setattr(tasks, "keep_if_best", lambda t, savedir, score: ran.append(("kept?", Path(savedir).name, score)))
+    monkeypatch.setattr(task_entry, "log_command", lambda argv: None)
+    monkeypatch.setattr(task_entry, "assert_committed", lambda: None)
+    monkeypatch.setattr(task_entry, "trash", lambda savedir: None)
+    FakeTrainer.log, FakeTrainer.stop_after = [], None
+    exp = Experiment("e00/e01-test", tasks.start, {"a": replace(TRUNK, segments=1)})
+    task_entry.submitall(exp)
+    while jobs:
+        _, *argv = jobs.pop(0)  # [torchrun --standalone --nproc_per_node=N | python] CODE/experiment.py <task> <file>
+        i = next(i for i, a in enumerate(argv) if a.endswith("experiment.py"))
+        monkeypatch.setattr("sys.argv", ["experiment.py", *argv[i + 1:]])
+        ran.append(argv[i + 1])
+        task_entry.main(exp, tasks.TASKS)
+    # 1 segment: a trunk, a branch at its start and after the segment; each anneals, finetunes and scores
+    assert ran[0] == "trunk" and sorted(r for r in ran[1:] if isinstance(r, str)) == ["anneal"] * 2 + ["finetune"] * 2 + ["score"] * 2
+    assert [r[0] for r in ran if isinstance(r, tuple)] == ["kept?"] * 2

@@ -16,12 +16,11 @@ straight-line code on loaded models and a Train, no files named, no callbacks) i
         mia-evals on the test volume, its post-processing fitted on the tune volume; best.pt = the best score of the trunk's branches
 """
 
-import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
-from lib import evals, training
+from lib import evals
 from lib.scoring import keep_if_best, mia_pq
 from lib.task_utils import B300, RTX6000, assert_snapshot, go, record_job
 from lib.training import Hardware, Train, Trainer, make_model
@@ -140,11 +139,4 @@ def score(t: Trunk, branch_dir: str):
     keep_if_best(t, branch_dir, mia_pq(t, branch_dir))
 
 
-def benchmark(t: Trunk):
-    """Throughput and a profiler trace of the trunk's training step, with no training run: lib.training.benchmark. Every DDP rank."""
-    assert_snapshot()
-    if int(os.environ.get("RANK", 0)) == 0:
-        record_job(t.savedir, "benchmark", t=t)
-    training.benchmark(t.train, t.savedir)
-
-TASKS = [trunk, anneal, finetune, score, benchmark]  # the entrypoints of experiment.py: `<task> <job file>`
+TASKS = [trunk, anneal, finetune, score]  # the entrypoints of experiment.py: `<task> <job file>`

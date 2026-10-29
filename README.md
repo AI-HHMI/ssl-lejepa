@@ -41,7 +41,7 @@ and writes files and checkpoints, submits the next task with `go(task, savedir, 
 (`lib/`: straight-line code on loaded models and a `Train`, no callbacks) in its own process. A trunk pretrains in one job and forks a
 branch at its start and after every segment; a branch is `anneal` (the trunk's GPUs), then `finetune` (pca and tiled inference on one RTX 6000), then `score`, a CPU job after
 which the trunk keeps `best.pt`. `go` writes the arguments and resources to `<savedir>/<task>.json`, the job file that
-`python experiment.py <task> <job file>` loads by the task's type hints. `lib/task_utils.py` is the LSF helpers and `lib/scoring.py` the mia-evals scoring of a branch and the trunk's best-keeping. Words: *experiment* is
+`python experiment.py <task> <job file>` loads by the task's type hints. `lib/task_utils.py` is the LSF helpers, `lib/task_entry.py` the command line (`main`, `submitall`, `resubmit_task`, ...) and `lib/scoring.py` the mia-evals scoring of a branch and the trunk's best-keeping. Words: *experiment* is
 one `experiment.py`; a *run* a line of its table; a *task* a function of `tasks.py`; a *job* a task submitted to LSF.
 `python experiment.py -h` lists the tasks.
 ```sh
