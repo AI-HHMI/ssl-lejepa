@@ -57,7 +57,7 @@ def gone(tmp_path, monkeypatch):
     monkeypatch.setattr(tasks, "Trainer", FakeTrainer)
     monkeypatch.setattr(tasks, "go", lambda fn, savedir, hardware, minutes, **args: gone.append((fn.__name__, savedir, hardware, minutes, args)))
     monkeypatch.setattr(tasks, "check_snapshot", lambda: None)
-    monkeypatch.setattr(tasks, "load_checkpoint_file", lambda path: path)  # the loaded checkpoint stands for its path
+    monkeypatch.setattr(tasks, "load_checkpoint", lambda path: path)  # the loaded checkpoint stands for its path
     return gone
 
 
@@ -89,7 +89,7 @@ def test_a_branch_anneals_then_evaluates_and_goes_to_score(gone, monkeypatch):
     start.parent.mkdir(parents=True)
     start.write_text("start")
     savedir = f"{start.parent}/"
-    monkeypatch.setattr(tasks, "load_checkpoint", lambda train, init_from: (SimpleNamespace(encoder="enc"), 140))
+    monkeypatch.setattr(tasks, "load_model", lambda train, init_from: (SimpleNamespace(encoder="enc"), 140))
     monkeypatch.setattr(evals, "pca_maps", lambda enc, par, savedir, step, data: calls.append(("pca", enc, step, data)))
     monkeypatch.setattr(evals, "probe", lambda model, train, data, savedir, step, standardize=False: calls.append(("probe", savedir, data, standardize)))
     monkeypatch.setattr(evals, "finetune", lambda model, train, data, savedir, step: calls.append(("finetune", savedir, data)))
@@ -122,7 +122,7 @@ def test_score_keeps_a_branch_only_if_it_is_the_trunks_best(tmp_path, monkeypatc
 
 
 def test_the_boards_of_a_trunk_are_the_leaderboards_task_utils_knows():
-    assert set(task_utils.BOARDS) == set(typing.get_args(typing.get_type_hints(tasks.Trunk)["board"]))
+    assert set(task_utils.BOARD_CONFIGS) == set(typing.get_args(typing.get_type_hints(tasks.Trunk)["board"]))
 
 
 def test_go_writes_the_job_file_that_load_args_reads_and_submit_runs(tmp_path, monkeypatch):
@@ -152,7 +152,7 @@ def test_go_writes_the_job_file_that_load_args_reads_and_submit_runs(tmp_path, m
         task_utils.go(tasks.branch, "outdir/e00/x/b/", hardware, 120, t=trunk)
     assert not Path("outdir/e00/x/b").exists()
     submitted.clear()
-    task_utils.submit(file)  # a redo: the same job, from its file
+    task_utils.submit_file(file)  # a redo: the same job, from its file
     assert [s[1] for s in submitted] == ["branch"] and submitted[0][3] == 2
 
 
@@ -219,13 +219,13 @@ def test_lsf_restarts_a_run_with_the_experiments_task_and_redoes_any_other_from_
     monkeypatch.chdir(tmp_path)
     exp, started = sweep(monkeypatch, "e00/e01-test")
     submitted = []
-    monkeypatch.setattr(task_utils, "submit", submitted.append)
-    task_utils.lsf(exp, "trunk", "b")
+    monkeypatch.setattr(task_utils, "submit_file", submitted.append)
+    task_utils.resubmit(exp, "trunk", "b")
     assert [s[:2] for s in started] == [("trash", "b"), ("trunk", "b")]
     with pytest.raises(AssertionError, match="redo score from its job file"):
-        task_utils.lsf(exp, "score", "b")
+        task_utils.resubmit(exp, "score", "b")
     file = "outdir/e00/e01-test/b/step_0000100/score.json"
-    task_utils.lsf(exp, "score", file)
+    task_utils.resubmit(exp, "score", file)
     assert submitted == [file]
     with pytest.raises(AssertionError, match="is not a run"):
-        task_utils.lsf(exp, "branch", file)  # the file is another task's
+        task_utils.resubmit(exp, "branch", file)  # the file is another task's

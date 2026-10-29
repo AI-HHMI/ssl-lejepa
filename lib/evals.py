@@ -1,4 +1,4 @@
-"""Evals of a loaded model's weights, each given its model (load_checkpoint's), the Train it was trained by, the dataset (lib.data.DATASETS
+"""Evals of a loaded model's weights, each given its model (load_model's), the Train it was trained by, the dataset (lib.data.DATASETS
 name) to measure it on, and the savedir to write its artifacts to: PCA maps
 of an encoder's tokens (pca_maps), a linear affinity probe (probe), and a UNETR fitted on labels (finetune). The tasks and their
 run records are experiment.py's."""

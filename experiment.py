@@ -3,7 +3,7 @@ e12's, or e11's 5^3) and the training objective change what 12 h of pretraining 
 
 Declarative: every run shares BASE (its Train) and differs by the groups its line names; its schedule is its Trunk's fields. What a
 run does (tasks.py): it pretrains in segments, branches at its start and after each, scores each branch, and keeps its best.
-Run it: `sh jrun.sh exp experiment.py submitall`, then `lsf <task> <run or job file>`; `python experiment.py -h` lists the
+Run it: `sh jrun.sh exp experiment.py submitall`, then `resubmit <task> <run or job file>`; `python experiment.py -h` lists the
 commands and tasks."""
 
 from dataclasses import replace

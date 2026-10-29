@@ -236,7 +236,7 @@ wheels = [
 [[package]]
 name = "mia-evals"
 version = "0.0.1"
-source = { editable = "../mia-evals" }
+source = { git = "https://github.com/AI-HHMI/mia-evals?branch=lib-namespace#3eb28cba7576c55f906717b0d1f684cfff7abb97" }
 dependencies = [
     { name = "miao-io" },
     { name = "networkx" },
@@ -247,24 +247,6 @@ dependencies = [
     { name = "tqdm" },
     { name = "zarr" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "kimimaro", marker = "extra == 'truth'", specifier = ">=4.0" },
-    { name = "miao-io", specifier = ">=0.4.2" },
-    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.8" },
-    { name = "networkx", specifier = ">=3.0" },
-    { name = "numba", specifier = ">=0.59" },
-    { name = "numpy", specifier = ">=1.24" },
-    { name = "pillow", specifier = ">=9.0" },
-    { name = "pymongo", marker = "extra == 'truth'", specifier = ">=4.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
-    { name = "scipy", specifier = ">=1.10" },
-    { name = "tqdm", specifier = ">=4.0" },
-    { name = "zarr", specifier = ">=3.0" },
-]
-provides-extras = ["dev", "truth"]
 
 [[package]]
 name = "miao-io"
@@ -822,7 +804,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "lmd-catalog", git = "https://github.com/AI-HHMI/lmd-catalog?branch=main" },
-    { name = "mia-evals", editable = "../mia-evals" },
+    { name = "mia-evals", git = "https://github.com/AI-HHMI/mia-evals?branch=lib-namespace" },
     { name = "miao-io", git = "https://github.com/AI-HHMI/miao.git?branch=master" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "pandas", marker = "extra == 'analysis'" },

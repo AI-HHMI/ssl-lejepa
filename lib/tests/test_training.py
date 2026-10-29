@@ -146,7 +146,7 @@ def test_each_objective_trains_logs_its_terms_and_reloads_for_eval(tmp_path, mon
         assert all(row["loss"] == pytest.approx(row["inv"] + LejepaConfig().lamb * row["sigreg"], rel=1e-5) for row in metrics)
     else:  # an MAE's reconstruction error alone
         assert not {"inv", "sigreg"} & set(metrics[-1])
-    model, step = task_utils.load_checkpoint(params, str(tmp_path / "checkpoint.pt"))  # strict: the saved weights fit the objective's model
+    model, step = task_utils.load_model(params, str(tmp_path / "checkpoint.pt"))  # strict: the saved weights fit the objective's model
     assert step == 3 and type(model).__name__ == {"views": "Lejepa", "mae": "Mae"}[objective]
 
 
@@ -260,7 +260,7 @@ def test_mae_decoder_sets_the_mae_models_decoder():
     assert isinstance(c, MaeConfig) and (c.decoder_dim, c.decoder_depth, c.decoder_heads) == (512, 8, 16)
 
 
-def test_load_checkpoint_reads_a_milestone_file(tmp_path, monkeypatch):
+def test_load_model_reads_a_checkpoint_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     par = training.Train(data=training.Data(window=(8, 8, 8), view=(8, 8, 8)))
     monkeypatch.setattr(training, "model_config", lambda par: LejepaConfig(
@@ -268,7 +268,7 @@ def test_load_checkpoint_reads_a_milestone_file(tmp_path, monkeypatch):
     model = Lejepa(training.model_config(par))
     path = tmp_path / "step_0000130.pt"
     torch.save({"step": 130, "model": model.state_dict()}, path)
-    loaded, step = task_utils.load_checkpoint(par, str(path))
+    loaded, step = task_utils.load_model(par, str(path))
     assert step == 130 and torch.equal(loaded.encoder.blocks[0].attn.qkv.weight.cpu(), model.encoder.blocks[0].attn.qkv.weight)
 
 

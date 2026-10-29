@@ -87,7 +87,7 @@ def code_provenance() -> dict:
 
 def log_command(argv: list[str]):
     """Append one JSON line per CLI call of an experiment script outside LSF jobs, i.e. the commands you issue
-    (submitall, lsf probe n, ... on the login node via jrun.sh), to outdir/_log/commands.jsonl: time, host,
+    (submitall, resubmit trunk mask7, ... on the login node via jrun.sh), to outdir/_log/commands.jsonl: time, host,
     argv and code_provenance(). Jobs don't log here: each records what it ran in its savedir's runs.json
     (experiment.record), and appends from many cluster hosts to one NFS file could interleave or overwrite."""
     if "LSB_JOBID" in os.environ:
@@ -129,6 +129,10 @@ def parse(tp, data):
     assert json_equal(adapter.dump_python(value), data), f"{tp} doesn't round-trip (a field added, missing or mistyped): {data}"
     return value
 
+def jsonable(tp, value):
+    """value as JSON-able data of the type tp (parse's inverse)."""
+    import pydantic
+    return pydantic.TypeAdapter(tp).dump_python(value)
 
 
 def trace_summary(trace_path: str | Path) -> dict[str, float]:

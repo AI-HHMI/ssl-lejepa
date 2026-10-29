@@ -47,5 +47,5 @@ one `experiment.py`; a *run* a line of its table; a *task* a function of `tasks.
 ```sh
 # [On the Janelia cluster, from the experiment's commit.]
 sh jrun.sh exp experiment.py submitall        # every run not submitted yet
-sh jrun.sh exp experiment.py lsf trunk mask7   # restart one run fresh (or redo one task from its job file, e.g. a branch's score.json)
+sh jrun.sh exp experiment.py resubmit trunk mask7   # restart one run fresh (or redo one task from its job file, e.g. a branch's score.json)
 ```

@@ -2,7 +2,7 @@
 each a Trunk, and the tasks that process each run: plain functions in tasks.py (trunk, branch, score) with JSON-able arguments
 (dataclasses, strings), each calling the next with go(), which submits it as an LSF job: a job is a task submitted. go() writes the
 arguments and the job's resources to <savedir>/<task>.json and runs `experiment.py <task> <that file>`, which loads the arguments by
-the task's type hints and calls it, so a task runs the same in-process, called with its arguments, and as a job; `lsf <task> <run
+the task's type hints and calls it, so a task runs the same in-process, called with its arguments, and as a job; `resubmit <task> <run
 or job file>` redoes one by hand. Depends on lib/, so a task runs only from its experiment's commit. `python experiment.py` or `-h`
 lists the commands and tasks (main)."""
 
@@ -25,7 +25,7 @@ from lib import training
 from lib.training import Hardware, make_model
 from lib.util import *
 
-CODE = Path(__file__).resolve().parent.parent  # the code root: the shared checkout, or the .tmpcode/ snapshot a job runs
+CODE_ROOT = Path(__file__).resolve().parent.parent  # the code root: the shared checkout, or the .tmpcode/ snapshot a job runs
 # Code copied into .tmpcode/<experiment>/ at submission (bsub); jobs import only from these. Add files here if the experiment
 # starts depending on others. Dependencies (pyproject.toml / uv.lock) are not frozen.
 SNAPSHOT_PATHS = ["experiment.py", "tasks.py", "lib", "mia_evals"]
@@ -36,7 +36,7 @@ B300 = Hardware(queue="gpu_b300", n_gpus=8, n_workers=CPUS_PER_GPU - 1)
 # mia-evals scoring (mia_eval): CPU only. mia-evals: ~1 h and ~200 GB peak for the mutex watershed at 896^3, "give it a
 # whole node". The shortest CPU queue; check its run limit and memory per slot with `bqueues -l short`.
 SCORE_QUEUE, SCORE_SLOTS, SCORE_MINUTES = "local", 16, 4*60
-BOARDS = {"neuron-instance": "mia_evals/gary_comparison_neuron_instance/mws.toml"}  # Trunk.board: ours, truth_kind = "instances"
+BOARD_CONFIGS = {"neuron-instance": "mia_evals/gary_comparison_neuron_instance/mws.toml"}  # Trunk.board: ours, truth_kind = "instances"
 # mia_eval() calls mia-evals as a library (a path dependency on the sister checkout, see pyproject.toml); its commit is recorded
 # in each score's provenance (mia_evals_commit).
 
@@ -46,7 +46,7 @@ class Experiment:
     """An experiment (README: experiment ids): the task every run starts with, and its runs, each a Trunk whose savedir is
     outdir/<id>/<name>/."""
     id: str  # <series>/e<NN>[-<NN>...]-<slug>, e.g. e00/e15-02-pca
-    task: Callable  # takes a run (its `t`): submitted for each on the run's t.train.hardware for t.hours (start)
+    task: Callable  # takes a run (its `t`): submitted for each on the run's t.train.hardware for t.hours (start_run)
     runs: dict[str, Any]  # its Trunks (tasks.py's), by name: [a-z][a-z0-9_-]*
 
     def roots(self) -> dict[str, Any]:
@@ -68,7 +68,7 @@ def check_snapshot():
 
 def replay_bad_batch(exp: Experiment, path: str):
     """Replay a skipped (non-finite gradient) training step from its bad_batch_*.pt dump: lib.training.replay_bad_batch. Like
-    training, replay depends on lib/: only for dumps of this commit's own experiment (replaylsf submits it)."""
+    training, replay depends on lib/: only for dumps of this commit's own experiment (submit_replay submits it)."""
     import torch
     ours = Path("outdir", exp.id).resolve()
     assert Path(path).resolve().is_relative_to(ours), f"{path} isn't from this commit's experiment: replay it from its experiment's commit"
@@ -93,7 +93,7 @@ def mia_eval(t, savedir: str) -> float:
     assert (savedir / "probe/test").is_dir() and (savedir / "probe/fit").is_dir(), f"no probe artifacts in {savedir}: probe or finetune first"
     (savedir / "resolved_config.json").write_text(json.dumps({"savedir": str(savedir), "trunk": asdict(t)}) + "\n")
     (savedir / "git_commit.txt").write_text(code_provenance()["commit_id"] + "\n")
-    config = CODE / BOARDS[t.board]  # the snapshot's copy when run as a job
+    config = CODE_ROOT / BOARD_CONFIGS[t.board]  # the snapshot's copy when run as a job
     root = savedir.resolve()
     evaluate.cmd_score(Namespace(
         config=config, test=root / "probe/test", val=root / "probe/fit", leaderboard=root / "mia_evals", run_dir=root,
@@ -119,7 +119,7 @@ def keep_if_best(t, savedir: str, score: float):
             weights.unlink()
     print(f"{savedir}: score {score:.4f} {'beats' if score > best else 'does not beat'} the best so far, {best:.4f}", flush=True)
 
-def load_checkpoint(train: Train, init_from: str):
+def load_model(train: Train, init_from: str):
     """(model on the GPU if any, step) for inference or finetuning: the weights init_from names, in train's architecture.
 
     A checkpoint .pt, loaded strictly into train's architecture so an incompatible one fails loudly (Conv3d-era patch embeds
@@ -164,7 +164,7 @@ def bsub(savedir: str, job: str, minutes: int, n_gpus: int, queue: str, cmd: str
     import subprocess
     name = job_name(savedir, job)
     # A job submitting a job hands on the snapshot it runs itself, not the shared checkout's current state.
-    code = CODE if ".tmpcode" in CODE.parts else snapshot(SNAPSHOT_PATHS, Path(".tmpcode") / experiment_dir(savedir).replace("/", "-"))
+    code = CODE_ROOT if ".tmpcode" in CODE_ROOT.parts else snapshot(SNAPSHOT_PATHS, Path(".tmpcode") / experiment_dir(savedir).replace("/", "-"))
     gpu = f'-gpu "num={n_gpus}:mode=exclusive_process"' if n_gpus else ""
     full = f""" bsub -J {name} \
         -W {minutes // 60}:{minutes % 60:02d} \
@@ -178,9 +178,9 @@ def bsub(savedir: str, job: str, minutes: int, n_gpus: int, queue: str, cmd: str
     subprocess.run(full, shell=True, stdin=subprocess.DEVNULL, check=True)
     print(f"Submitted {name} (code {code}) to LSF.")
 
-def submit(file: str):
+def submit_file(file: str):
     """Submit the job file (go's <savedir>/<task>.json) to LSF, with the resources it says: the task's GPUs (torchrun), or a CPU job on
-    SCORE_QUEUE. No commit check: callers from the shared checkout (start, lsf) assert_committed() first; a job calling go() is
+    SCORE_QUEUE. No commit check: callers from the shared checkout (start_run, resubmit) assert_committed() first; a job calling go() is
     committed code."""
     job = json.loads(Path(file).read_text())
     h, name, savedir = parse(Hardware | None, job["hardware"]), job["task"], str(Path(file).parent)
@@ -192,21 +192,16 @@ def submit(file: str):
 def go(fn: Callable, savedir: str, hardware: Hardware | None, minutes: int, **args):
     """Run the task fn(**args) as its own LSF job in savedir, on hardware (None: a CPU job), for at most minutes. The arguments must
     be the task's own parameters, JSON-able by its type hints: written, with the resources, to savedir/<fn>.json (job_file), which
-    the job loads (load_args). The same file is what `lsf <task> <file>` resubmits."""
+    the job loads (load_args). The same file is what `resubmit <task> <file>` submits again."""
     name = fn.__name__
     hints = typing.get_type_hints(fn)
     assert set(args) == set(inspect.signature(fn).parameters), f"task {name} takes {list(inspect.signature(fn).parameters)}, not {list(args)}"
     assert hardware is None or hardware.n_workers + 1 <= CPUS_PER_GPU, f"n_workers={hardware.n_workers} leaves no core for the training process"
-    dumped = {k: pydantic_dump(hints[k], v) for k, v in args.items()}
+    dumped = {k: jsonable(hints[k], v) for k, v in args.items()}
     file = Path(savedir) / f"{name}.json"
     file.parent.mkdir(parents=True, exist_ok=True)
     file.write_text(json.dumps({"task": name, "hardware": asdict(hardware) if hardware else None, "minutes": minutes, "args": dumped}, indent=1) + "\n")
-    submit(str(file))
-
-def pydantic_dump(tp, value):
-    """value as JSON-able data of the type tp (parse's inverse)."""
-    import pydantic
-    return pydantic.TypeAdapter(tp).dump_python(value)
+    submit_file(str(file))
 
 def load_args(fn: Callable, file: str) -> dict:
     """The arguments of the job file for the task fn, validated against fn's type hints (parse): a stale or hand-edited file fails
@@ -215,26 +210,26 @@ def load_args(fn: Callable, file: str) -> dict:
     assert set(args) == set(inspect.signature(fn).parameters), f"{file}: has arguments {list(args)}, but task {fn.__name__} takes {list(inspect.signature(fn).parameters)}"
     return {k: parse(hints[k], v) for k, v in args.items()}
 
-def start(exp: Experiment, run):
+def start_run(exp: Experiment, run):
     """Submit run fresh: its savedir emptied (old contents -> outdir/.trash/), then the experiment's task on its Train's hardware for its hours."""
     trash(run.savedir)
     go(exp.task, run.savedir, run.train.hardware, int(run.hours * 60), t=run)
 
 
-def lsf(exp: Experiment, fn: str, target: str):
-    """Redo one task on LSF: `lsf <experiment's task> <run>` restarts the run named so fresh (start), `lsf <task> <job file>` resubmits
+def resubmit(exp: Experiment, fn: str, target: str):
+    """Redo one task on LSF: `resubmit <experiment's task> <run>` restarts the run named so fresh (start_run), `resubmit <task> <job file>` resubmits
     the job in that file (go's <savedir>/<task>.json, e.g. outdir/.../mae/step_0010000/score.json), as it was: after changing the
     board, say."""
     assert_committed()
     roots = exp.roots()
     if target in roots:
         assert fn == exp.task.__name__, f"a run is started by {exp.task.__name__!r}, not {fn!r}: redo {fn} from its job file"
-        start(exp, roots[target])
+        start_run(exp, roots[target])
     else:
         assert Path(target).name == f"{fn}.json", f"{target} is not a run of {exp.id} ({list(roots)}) or the job file of task {fn}"
-        submit(target)
+        submit_file(target)
 
-def replaylsf(exp: Experiment, name: str):
+def submit_replay(exp: Experiment, name: str):
     """replay_bad_batch on LSF for the run name's first bad_batch dump. CUDA_LAUNCH_BLOCKING names a crashing kernel."""
     run = exp.roots()[name]
     dumps = sorted(Path(run.savedir).glob("bad_batch_*.pt"))
@@ -273,15 +268,15 @@ def check_experiment(exp: Experiment):
 def submitall(exp: Experiment):
     """Submit the experiment (README: one experiment, one entrypoint): every run whose spec isn't in its savedir yet, i.e. not
     submitted before (whether it finished, is still going, or failed). Idempotent: run it again after adding runs; a run
-    already submitted is left alone (`lsf <the experiment's task> <name>` restarts one fresh)."""
+    already submitted is left alone (`resubmit <the experiment's task> <name>` restarts one fresh)."""
     check_experiment(exp)
     assert_committed()
     for r in exp.roots().values():
         if not (Path(r.savedir) / f"{exp.task.__name__}.json").is_file():
-            start(exp, r)
+            start_run(exp, r)
 
 
-COMMANDS = [replay_bad_batch, lsf, replaylsf, submitall]  # take the experiment first, bound by main
+COMMANDS = [replay_bad_batch, resubmit, submit_replay, submitall]  # take the experiment first, bound by main
 
 
 def main(exp: Experiment, tasks: list[Callable]):
