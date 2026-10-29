@@ -34,12 +34,12 @@ git checkout main
 bjobs -w
 ```
 
-Design an experiment: `experiment.py` is declarative: `BASE` (a `Train`: model, encoder, data, optim, hardware, speed, profile) and a
-table of runs, one `Trunk` per line (`replace(BASE, ...)`, named; `H200` and `B300` are whole nodes). `tasks.py` is what a run does: plain
-functions with JSON-able arguments, `trunk(t)`, `branch(t, fork_point)` and `score(t, branch_dir)`. A task is a job's entrypoint: it reads
+Design an experiment: `experiment.py` is declarative: `BASE` (a `Train`: model, encoder, data, optim, speed, profile) and a
+table of runs, one `Trunk` per line (`replace(BASE, ...)`, named). `tasks.py` is what a run does: plain
+functions with JSON-able arguments, `trunk(t)`, `anneal(t, fork_point)`, `finetune(t, branch_dir)` and `score(t, branch_dir)`; the hardware and wall time of each is one block at the top of `tasks.py`. A task is a job's entrypoint: it reads
 and writes files and checkpoints, submits the next task with `go(task, savedir, hardware, minutes, **args)` and calls the library
 (`lib/`: straight-line code on loaded models and a `Train`, no callbacks) in its own process. A trunk pretrains in one job and forks a
-branch at its start and after every segment; a branch anneals, runs pca and tiled inference, and goes to `score`, a CPU job after
+branch at its start and after every segment; a branch is `anneal` (the trunk's GPUs), then `finetune` (pca and tiled inference on one RTX 6000), then `score`, a CPU job after
 which the trunk keeps `best.pt`. `go` writes the arguments and resources to `<savedir>/<task>.json`, the job file that
 `python experiment.py <task> <job file>` loads by the task's type hints. `lib/task_utils.py` is the LSF helpers and `lib/scoring.py` the mia-evals scoring of a branch and the trunk's best-keeping. Words: *experiment* is
 one `experiment.py`; a *run* a line of its table; a *task* a function of `tasks.py`; a *job* a task submitted to LSF.
@@ -47,5 +47,5 @@ one `experiment.py`; a *run* a line of its table; a *task* a function of `tasks.
 ```sh
 # [On the Janelia cluster, from the experiment's commit.]
 sh jrun.sh exp experiment.py submitall        # every run not submitted yet
-sh jrun.sh exp experiment.py resubmit_task trunk mask7   # restart one run fresh (or redo one task from its job file, e.g. a branch's score.json)
+sh jrun.sh exp experiment.py resubmit_task start mask7   # restart one run fresh (or redo one task from its job file, e.g. a branch's score.json; a run is restarted with the experiment's `start`)
 ```

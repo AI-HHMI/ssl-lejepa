@@ -1,30 +1,36 @@
-"""The tasks of an experiment, and the Trunk they take: what experiment.py's runs are made of. Three tasks, plain functions with
-JSON-able arguments (dataclasses, strings): trunk(t), branch(t, fork_point) and score(t, branch_dir). Each is a job's entrypoint
-(`python experiment.py <task> <job file>`, see lib.task_utils.go): it reads and writes the files and checkpoints, submits the next
-task (go: its arguments, savedir, hardware and wall time) and calls the library (lib/: straight-line code on loaded models and
-a Train, no files named, no callbacks) in its own process.
+"""The tasks of an experiment, and the Trunk they take: what experiment.py's runs are made of. Four tasks, plain functions with
+JSON-able arguments (dataclasses, strings): trunk(t), anneal(t, fork_point), finetune(t, branch_dir) and score(t, branch_dir). Each is
+a job's entrypoint (`python experiment.py <task> <job file>`, see lib.task_utils.go): it reads and writes the files and checkpoints,
+submits the next task (go: its arguments, savedir, hardware and wall time, from the block below) and calls the library (lib/:
+straight-line code on loaded models and a Train, no files named, no callbacks) in its own process.
 
-    trunk(t):                                    # one job, the run's GPUs, up to t.hours
+    trunk(t):                                    # one job, up to TRUNK_MINUTES
         fork(); repeat t.segments times: train(t.segment_steps, lr, lr); fork()
-        fork() = go branch(t, a checkpoint of the weights and optimizer)    # data: the train volumes' images
-    branch(t, fork_point):                       # a job on the run's GPUs, as many as the trunk's
-        train(t.anneal_steps, lr, lr x t.anneal_lr_frac); pca on a val crop; tiled inference, a Linear (or a UNETR) fitted on the
-        fit volume and predicting the test and tune volumes; go score(t, the branch's dir)
+        fork() = go anneal(t, a checkpoint of the weights and optimizer)    # data: the train volumes' images
+    anneal(t, fork_point):                       # as many GPUs as the trunk
+        train(t.anneal_steps, lr, lr x t.anneal_lr_frac); go finetune(t, the branch's dir)
+    finetune(t, branch_dir):                     # one small GPU: the encoder is frozen or the head is small
+        pca on a val crop; tiled inference, a Linear (or a UNETR) fitted on the fit volume and predicting the test and tune
+        volumes; go score(t, the branch's dir)
     score(t, branch_dir):                        # a CPU job, ~1 h, so the GPUs aren't held
         mia-evals on the test volume, its post-processing fitted on the tune volume; best.pt = the best score of the trunk's branches
 """
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
 from lib import evals, training
 from lib.scoring import keep_if_best, mia_pq
-from lib.task_utils import assert_snapshot, go, record_job
+from lib.task_utils import B300, RTX6000, assert_snapshot, go, record_job
 from lib.training import Hardware, Train, Trainer, make_model
 
-BRANCH_MINUTES = 120  # the LSF wall limit of a branch (anneal, pca, probe or UNETR)
+# Where each task runs and its LSF wall limit (a trunk killed at it keeps the branches of its finished segments). The only place
+# hardware is chosen: each task's Train gets its trunk's or anneal's Hardware (what its data workers and ranks are).
+TRUNK_HARDWARE, TRUNK_MINUTES = B300, 12 * 60
+ANNEAL_HARDWARE, ANNEAL_MINUTES = B300, 2 * 60
+FINETUNE_HARDWARE, FINETUNE_MINUTES = RTX6000, 2 * 60  # pca, then a Linear or a UNETR
 # A score is CPU only. mia-evals: ~1 h and ~200 GB peak for the mutex watershed at 896^3, "give it a whole node". The shortest CPU
 # queue; check its run limit and memory per slot with `bqueues -l short`.
 SCORE_HARDWARE, SCORE_MINUTES = Hardware(queue="local", n_gpus=0, slots=16), 4 * 60
@@ -65,7 +71,6 @@ class Trunk:
     init_from: str = ""  # the starting weights: "" random, or a checkpoint .pt (its weights and optimizer)
     segments: int = 10
     segment_steps: int = 10_000
-    hours: float = 12.0  # the LSF wall limit: a trunk killed at it keeps the branches of its finished segments
     anneal_steps: int = 10_000  # a branch's steps, its lr falling linearly to train.optim.lr x anneal_lr_frac
     anneal_lr_frac: float = 0.01  # the branch's final lr, as a fraction of train.optim.lr
     eval_data: str = ""  # the lib.data.DATASETS a branch is evaluated on: its val images, and its fit, test and tune blocks
@@ -74,14 +79,20 @@ class Trunk:
     board: Literal["neuron-instance"] = "neuron-instance"  # the mia-evals leaderboard (lib.task_utils.BOARD_CONFIGS) a branch is scored on
 
 
+def start(t: Trunk):
+    """Submit a run: its trunk."""
+    go(trunk, t.savedir, TRUNK_HARDWARE, TRUNK_MINUTES, t=t)
+
+
 def trunk(t: Trunk):
     """Pretrain at a constant lr, with a branch at the start and after every segment (step_<N>/ each; metrics.json, best.pt)."""
     assert_snapshot()
-    with Trainer(t.train, t.savedir, t.segments * t.segment_steps, load_checkpoint(t.init_from)) as trainer:
+    train = replace(t.train, hardware=TRUNK_HARDWARE)
+    with Trainer(train, t.savedir, t.segments * t.segment_steps, load_checkpoint(t.init_from)) as trainer:
         def fork():
             fork_point = Path(t.savedir) / f"step_{trainer.step:07d}/fork.pt"
             trainer.save(fork_point)
-            go(branch, str(fork_point.parent), t.train.hardware, BRANCH_MINUTES, t=t, fork_point=str(fork_point))
+            go(anneal, str(fork_point.parent), ANNEAL_HARDWARE, ANNEAL_MINUTES, t=t, fork_point=str(fork_point))
         if trainer.r.rank0:
             record_job(t.savedir, "trunk", t=t)
             fork()
@@ -92,25 +103,34 @@ def trunk(t: Trunk):
             if trainer.r.rank0: fork()
 
 
-def branch(t: Trunk, fork_point: str):
-    """Anneal the weights saved at fork_point (in the branch's dir), then pca and tiled inference on them, and go score (checkpoint.pt, pca2.png, probe.json or finetune_curve.json)."""
+def anneal(t: Trunk, fork_point: str):
+    """Anneal the weights saved at fork_point (in the branch's dir), and go finetune (checkpoint.pt)."""
     assert_snapshot()
     branch_dir, lr = str(Path(fork_point).parent), t.train.optim.lr
     end = Path(branch_dir) / "checkpoint.pt"
-    with Trainer(t.train, branch_dir, t.anneal_steps, load_checkpoint(fork_point)) as trainer:
+    train = replace(t.train, hardware=ANNEAL_HARDWARE)
+    with Trainer(train, branch_dir, t.anneal_steps, load_checkpoint(fork_point)) as trainer:
         if trainer.r.rank0:
-            record_job(branch_dir, "branch", t=t, fork_point=fork_point)
+            record_job(branch_dir, "anneal", t=t, fork_point=fork_point)
         trainer.train(t.anneal_steps, lr, lr * t.anneal_lr_frac)
         if trainer.r.rank0:
             trainer.save(end)
     if not trainer.r.rank0: return  # the other ranks are done
     Path(fork_point).unlink()
-    model, step = load_model(t.train, str(end))  # a fresh eager model: the compiled one is gone with the trainer
-    evals.pca_maps(model.encoder, t.train, Path(branch_dir), step, t.eval_data)
+    go(finetune, branch_dir, FINETUNE_HARDWARE, FINETUNE_MINUTES, t=t, branch_dir=branch_dir)
+
+
+def finetune(t: Trunk, branch_dir: str):
+    """pca and tiled inference on a branch's annealed weights, and go score (pca2.png, probe.json or finetune_curve.json)."""
+    assert_snapshot()
+    record_job(branch_dir, "finetune", t=t, branch_dir=branch_dir)
+    train = replace(t.train, hardware=FINETUNE_HARDWARE)
+    model, step = load_model(train, str(Path(branch_dir) / "checkpoint.pt"))
+    evals.pca_maps(model.encoder, train, Path(branch_dir), step, t.eval_data)
     if t.eval_head == "probe":
-        evals.probe(model, t.train, t.eval_data, branch_dir, step, t.standardize)
+        evals.probe(model, train, t.eval_data, branch_dir, step, t.standardize)
     else:
-        evals.finetune(model, t.train, t.eval_data, branch_dir, step)
+        evals.finetune(model, train, t.eval_data, branch_dir, step)
     go(score, branch_dir, SCORE_HARDWARE, SCORE_MINUTES, t=t, branch_dir=branch_dir)
 
 
@@ -127,4 +147,4 @@ def benchmark(t: Trunk):
         record_job(t.savedir, "benchmark", t=t)
     training.benchmark(t.train, t.savedir)
 
-TASKS = [trunk, branch, score, benchmark]  # the entrypoints of experiment.py: `<task> <job file>`
+TASKS = [trunk, anneal, finetune, score, benchmark]  # the entrypoints of experiment.py: `<task> <job file>`

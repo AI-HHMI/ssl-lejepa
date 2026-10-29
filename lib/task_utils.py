@@ -1,5 +1,5 @@
 """What an experiment.py and its tasks.py are made of, and the LSF code that runs it. An experiment is a table of runs (Experiment),
-each a Trunk, and the tasks that process each run: plain functions in tasks.py (trunk, branch, score) with JSON-able arguments
+each a Trunk, and the tasks that process each run: plain functions in tasks.py (trunk, anneal, finetune, score) with JSON-able arguments
 (dataclasses, strings), each calling the next with go(), which submits it as an LSF job: a job is a task submitted. go() writes the
 arguments and the job's resources to <savedir>/<task>.json and runs `experiment.py <task> <that file>`, which loads the arguments by
 the task's type hints and calls it, so a task runs the same in-process, called with its arguments, and as a job; `resubmit_task <task> <run
@@ -31,14 +31,15 @@ CPUS_PER_GPU = 12  # LSF slots per GPU: 8 GPUs -> all 96 cores; training process
 # Whole nodes (Optim.batch_size and Hardware.n_workers are per GPU); an H200 node has one GPU taken by someone else's job.
 H200 = Hardware(queue="gpu_h200", n_gpus=7, n_workers=CPUS_PER_GPU - 1)
 B300 = Hardware(queue="gpu_b300", n_gpus=8, n_workers=CPUS_PER_GPU - 1)
+RTX6000 = Hardware(queue="gpu_rtx6000", n_gpus=1, n_workers=CPUS_PER_GPU - 1)  # one of a node's 8 GPUs
 
 
 @dataclass
 class Experiment:
-    """An experiment (README: experiment ids): the task every run starts with, and its runs, each a Trunk whose savedir is
+    """An experiment (README: experiment ids): how a run starts, and its runs, each a Trunk whose savedir is
     outdir/<id>/<name>/."""
     id: str  # <series>/e<NN>[-<NN>...]-<slug>, e.g. e00/e15-02-pca
-    start_task: Callable  # takes a run (its `t`): submitted for each on the run's t.train.hardware for t.hours (start_run)
+    start: Callable  # takes a run (its Trunk) and submits its first task (tasks.py's start): start_run
     runs: dict[str, Any]  # its Trunks (tasks.py's), by name: [a-z][a-z0-9_-]*
 
     def placed_runs(self) -> dict[str, Any]:
@@ -138,9 +139,9 @@ def load_args(fn: Callable, file: str) -> dict:
     return {k: parse(hints[k], v) for k, v in args.items()}
 
 def start_run(exp: Experiment, run):
-    """Submit run fresh: its savedir emptied (old contents -> outdir/.trash/), then the experiment's task on its Train's hardware for its hours."""
+    """Submit run fresh: its savedir emptied (old contents -> outdir/.trash/), then the experiment's start of it."""
     trash(run.savedir)
-    go(exp.start_task, run.savedir, run.train.hardware, int(run.hours * 60), t=run)
+    exp.start(run)
 
 
 def resubmit_task(exp: Experiment, task: str, run_or_file: str):
@@ -150,7 +151,7 @@ def resubmit_task(exp: Experiment, task: str, run_or_file: str):
     assert_committed()
     roots = exp.placed_runs()
     if run_or_file in roots:
-        assert task == exp.start_task.__name__, f"a run is started by {exp.start_task.__name__!r}, not {task!r}: redo {task} from its job file"
+        assert task == exp.start.__name__, f"a run is started by {exp.start.__name__!r}, not {task!r}: redo {task} from its job file"
         start_run(exp, roots[run_or_file])
     else:
         assert Path(run_or_file).name == f"{task}.json", f"{run_or_file} is not a run of {exp.id} ({list(roots)}) or the job file of task {task}"
@@ -162,7 +163,9 @@ def submit_replay(exp: Experiment, name: str):
     dumps = sorted(Path(run.savedir).glob("bad_batch_*.pt"))
     assert dumps, f"no bad_batch_*.pt in {run.savedir}"
     assert_committed()
-    bsub(run.savedir, "replay", 30, replace(run.train.hardware, n_gpus=1), f"env CUDA_LAUNCH_BLOCKING=1 python {{code}}/experiment.py replay_bad_batch {dumps[0]}")
+    job = next(f for f in dumps[0].parent.glob("*.json") if f.name != "jobs.json")  # the job file of the task that dumped it: its hardware
+    hardware = replace(parse(Hardware, json.loads(job.read_text())["hardware"]), n_gpus=1)
+    bsub(run.savedir, "replay", 30, hardware, f"env CUDA_LAUNCH_BLOCKING=1 python {{code}}/experiment.py replay_bad_batch {dumps[0]}")
 
 def experiment_id(name: str) -> str | None:
     """The id of a sweep dir name under outdir/<series>/: 'e15-02-pca' -> 'e15-02'. None for one from before
@@ -195,11 +198,11 @@ def assert_experiment(exp: Experiment):
 def submitall(exp: Experiment):
     """Submit the experiment (README: one experiment, one entrypoint): every run whose job file isn't in its savedir yet, i.e. not
     submitted before (whether it finished, is still going, or failed). Idempotent: run it again after adding runs; a run
-    already submitted is left alone (`resubmit_task <the experiment's task> <name>` restarts one fresh)."""
+    already submitted is left alone (`resubmit_task <the experiment's start> <name>` restarts one fresh)."""
     assert_experiment(exp)
     assert_committed()
     for r in exp.placed_runs().values():
-        if not (Path(r.savedir) / f"{exp.start_task.__name__}.json").is_file():
+        if not any(Path(r.savedir).glob("*.json")):  # a job file: a task was submitted
             start_run(exp, r)
 
 

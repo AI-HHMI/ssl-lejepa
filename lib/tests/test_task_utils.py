@@ -1,4 +1,4 @@
-"""Tests for lib.task_utils and tasks.py: the tasks' wiring (trunk, branch, score), the LSF submission, the commands on an Experiment,
+"""Tests for lib.task_utils and tasks.py: the tasks' wiring (trunk, anneal, finetune, score), the LSF submission, the commands on an Experiment,
 and the experiment file."""
 
 import json
@@ -70,9 +70,9 @@ def test_a_trunk_branches_at_its_start_and_after_every_segment_at_a_constant_lr(
     assert FakeTrainer.log[0] == ("init", TRUNK.savedir, 300, "")
     assert [e for e in FakeTrainer.log if e[0] == "train"] == [("train", 100, 1e-3, 1e-3)] * 3
     assert [Path(e[1]).parent.name for e in FakeTrainer.log if e[0] == "save"] == [f"step_{s:07d}" for s in [0, 100, 200, 300]]
-    assert [g[0] for g in gone] == ["branch"] * 4
+    assert [g[0] for g in gone] == ["anneal"] * 4
     # the branch of the first segment's end: its own dir, the trunk's hardware, the trunk and the fork point it takes
-    assert gone[1] == ("branch", f"{TRUNK.savedir}/step_0000100", TRUNK.train.hardware, tasks.BRANCH_MINUTES,
+    assert gone[1] == ("anneal", f"{TRUNK.savedir}/step_0000100", tasks.ANNEAL_HARDWARE, tasks.ANNEAL_MINUTES,
                        {"t": TRUNK, "fork_point": f"{TRUNK.savedir}/step_0000100/fork.pt"})
 
 
@@ -83,25 +83,31 @@ def test_a_trunk_that_diverges_branches_no_more(gone):
     assert len(gone) == 2
 
 
-def test_a_branch_anneals_then_evaluates_and_goes_to_score(gone, monkeypatch):
-    calls = []
+def test_an_anneal_goes_to_finetune_on_one_small_gpu(gone):
     fork_point = Path(TRUNK.savedir) / "step_0000100/fork.pt"
     fork_point.parent.mkdir(parents=True)
     fork_point.write_text("fork point")
     branch_dir = str(fork_point.parent)
+    tasks.anneal(TRUNK, str(fork_point))
+    end = f"{branch_dir}/checkpoint.pt"
+    assert FakeTrainer.log == [("init", branch_dir, 40, str(fork_point)), ("train", 40, 1e-3, pytest.approx(1e-4)), ("save", end)]
+    assert not fork_point.exists()  # taken
+    assert gone == [("finetune", branch_dir, tasks.FINETUNE_HARDWARE, tasks.FINETUNE_MINUTES, {"t": TRUNK, "branch_dir": branch_dir})]
+    assert tasks.FINETUNE_HARDWARE.n_gpus == 1 and tasks.FINETUNE_HARDWARE.queue == "gpu_rtx6000"
+
+
+def test_a_finetune_evaluates_the_annealed_weights_and_goes_to_score(gone, monkeypatch):
+    calls = []
+    branch_dir = f"{TRUNK.savedir}/step_0000100"
     monkeypatch.setattr(tasks, "load_model", lambda train, init_from: (SimpleNamespace(encoder="enc"), 140))
     monkeypatch.setattr(evals, "pca_maps", lambda enc, train, savedir, step, data: calls.append(("pca", enc, step, data)))
     monkeypatch.setattr(evals, "probe", lambda model, train, data, savedir, step, standardize=False: calls.append(("probe", savedir, data, standardize)))
     monkeypatch.setattr(evals, "finetune", lambda model, train, data, savedir, step: calls.append(("finetune", savedir, data)))
-    tasks.branch(TRUNK, str(fork_point))
-    end = f"{branch_dir}/checkpoint.pt"
-    assert FakeTrainer.log == [("init", branch_dir, 40, str(fork_point)), ("train", 40, 1e-3, pytest.approx(1e-4)), ("save", end)]
-    assert not fork_point.exists()  # taken
+    tasks.finetune(TRUNK, branch_dir)
     assert calls == [("pca", "enc", 140, "hemibrain"), ("probe", branch_dir, "hemibrain", False)]
     assert gone == [("score", branch_dir, tasks.SCORE_HARDWARE, tasks.SCORE_MINUTES, {"t": TRUNK, "branch_dir": branch_dir})]  # a CPU job
     calls.clear(), gone.clear()
-    fork_point.write_text("fork point")
-    tasks.branch(replace(TRUNK, eval_head="finetune"), str(fork_point))  # the variant: a UNETR, scored all the same
+    tasks.finetune(replace(TRUNK, eval_head="finetune"), branch_dir)  # the variant: a UNETR, scored all the same
     assert calls[1] == ("finetune", branch_dir, "hemibrain") and [g[0] for g in gone] == ["score"]
 
 
@@ -129,29 +135,29 @@ def test_go_writes_the_job_file_that_load_args_reads_and_submit_runs(tmp_path, m
     submitted = []
     monkeypatch.setattr(task_utils, "bsub", lambda savedir, job, minutes, hardware, cmd: submitted.append((savedir, job, minutes, hardware, cmd)))
     hardware = training.Hardware(queue="gpu_b300", n_gpus=2, n_workers=11)
-    trunk = replace(TRUNK, savedir="outdir/e00/x/a", hours=3, train=training.Train(hardware=hardware))
+    trunk = replace(TRUNK, savedir="outdir/e00/x/a", train=training.Train(hardware=hardware))
     branch_dir, fork_point = "outdir/e00/x/a/step_0000100", "outdir/e00/x/a/step_0000100/fork.pt"
-    task_utils.go(tasks.branch, branch_dir, hardware, 120, t=trunk, fork_point=fork_point)
+    task_utils.go(tasks.anneal, branch_dir, hardware, 120, t=trunk, fork_point=fork_point)
     task_utils.go(tasks.score, branch_dir, tasks.SCORE_HARDWARE, tasks.SCORE_MINUTES, t=trunk, branch_dir=branch_dir)
-    file = f"{branch_dir}/branch.json"
-    assert submitted == [(branch_dir, "branch", 120, hardware, f"torchrun --standalone --nproc_per_node=2 {{code}}/experiment.py branch {file}"),
+    file = f"{branch_dir}/anneal.json"
+    assert submitted == [(branch_dir, "anneal", 120, hardware, f"torchrun --standalone --nproc_per_node=2 {{code}}/experiment.py anneal {file}"),
                          (branch_dir, "score", tasks.SCORE_MINUTES, tasks.SCORE_HARDWARE, f"python {{code}}/experiment.py score {branch_dir}/score.json")]  # a CPU job: no torchrun
-    assert task_utils.load_args(tasks.branch, file) == {"t": trunk, "fork_point": fork_point}  # what the job runs: the same arguments
+    assert task_utils.load_args(tasks.anneal, file) == {"t": trunk, "fork_point": fork_point}  # what the job runs: the same arguments
     job = json.loads(Path(file).read_text())
-    assert job["task"] == "branch" and job["minutes"] == 120 and job["hardware"]["n_gpus"] == 2
+    assert job["task"] == "anneal" and job["minutes"] == 120 and job["hardware"]["n_gpus"] == 2
     bad = {**job, "args": {**job["args"], "fork_point": 3}}
     Path("bad.json").write_text(json.dumps(bad))
     with pytest.raises(Exception, match="valid string"):  # validated: a mistyped argument fails at load, before any GPU work
-        task_utils.load_args(tasks.branch, "bad.json")
+        task_utils.load_args(tasks.anneal, "bad.json")
     Path("extra.json").write_text(json.dumps({**job, "args": {**job["args"], "steps": 3}}))
     with pytest.raises(AssertionError, match="takes"):  # so does one the task doesn't take
-        task_utils.load_args(tasks.branch, "extra.json")
+        task_utils.load_args(tasks.anneal, "extra.json")
     with pytest.raises(AssertionError, match="takes"):  # and go() refuses it before writing anything
-        task_utils.go(tasks.branch, "outdir/e00/x/b", hardware, 120, t=trunk)
+        task_utils.go(tasks.anneal, "outdir/e00/x/b", hardware, 120, t=trunk)
     assert not Path("outdir/e00/x/b").exists()
     submitted.clear()
     task_utils.submit_file(file)  # a redo: the same job, from its file
-    assert [s[1] for s in submitted] == ["branch"] and submitted[0][3] == hardware
+    assert [s[1] for s in submitted] == ["anneal"] and submitted[0][3] == hardware
 
 
 def test_the_experiment_file_names_runs_that_load_as_a_job_loads_them(tmp_path, monkeypatch):
@@ -160,9 +166,10 @@ def test_the_experiment_file_names_runs_that_load_as_a_job_loads_them(tmp_path, 
         assert r.savedir == f"outdir/{experiment.EXPERIMENT.id}/{name}"
         assert task_utils.parse(tasks.Trunk, asdict(r)) == r, name
         training.model_config(r.train)  # its model builds on its encoder's patch
-        assert r.hours * 60 > 0 and r.segments * r.segment_steps > 0
-        assert r.train.hardware.n_workers + 1 <= task_utils.CPUS_PER_GPU
-    assert experiment.EXPERIMENT.start_task is tasks.trunk
+        assert r.segments * r.segment_steps > 0
+    assert experiment.EXPERIMENT.start is tasks.start
+    for h in (tasks.TRUNK_HARDWARE, tasks.ANNEAL_HARDWARE, tasks.FINETUNE_HARDWARE):
+        assert h.n_workers + 1 <= task_utils.CPUS_PER_GPU
     task_utils.assert_experiment(experiment.EXPERIMENT)
 
 
@@ -173,8 +180,8 @@ def sweep(monkeypatch, id, init_from=""):
     run = lambda n: tasks.Trunk(init_from=f"{init_from}/{n}/checkpoint.pt" if init_from else "")
     monkeypatch.setattr(task_utils, "assert_committed", lambda: None)
     monkeypatch.setattr(task_utils, "trash", lambda savedir: started.append(("trash", Path(savedir).name)))
-    monkeypatch.setattr(task_utils, "go", lambda fn, savedir, hardware, minutes, **args: started.append((fn.__name__, Path(savedir).name, hardware, minutes)))
-    return Experiment(id, tasks.trunk, {n: run(n) for n in "abc"}), started
+    monkeypatch.setattr(tasks, "go", lambda fn, savedir, hardware, minutes, **args: started.append((fn.__name__, Path(savedir).name, hardware, minutes)))
+    return Experiment(id, tasks.start, {n: run(n) for n in "abc"}), started
 
 
 def test_submitall_starts_each_run_not_submitted_before_fresh(tmp_path, monkeypatch):
@@ -183,8 +190,8 @@ def test_submitall_starts_each_run_not_submitted_before_fresh(tmp_path, monkeypa
     Path("outdir/e00/e01-test/b").mkdir(parents=True)
     Path("outdir/e00/e01-test/b/trunk.json").write_text("{}")  # submitted before
     task_utils.submitall(exp)
-    hours = int(tasks.Trunk().hours * 60)
-    assert started == [("trash", "a"), ("trunk", "a", tasks.Trunk().train.hardware, hours), ("trash", "c"), ("trunk", "c", tasks.Trunk().train.hardware, hours)]
+    a, c = [("trunk", n, tasks.TRUNK_HARDWARE, tasks.TRUNK_MINUTES) for n in "ac"]
+    assert started == [("trash", "a"), a, ("trash", "c"), c]
 
 
 @pytest.mark.parametrize("id,init_from,existing,error", [
@@ -218,7 +225,7 @@ def test_lsf_restarts_a_run_with_the_experiments_task_and_redoes_any_other_from_
     exp, started = sweep(monkeypatch, "e00/e01-test")
     submitted = []
     monkeypatch.setattr(task_utils, "submit_file", submitted.append)
-    task_utils.resubmit_task(exp, "trunk", "b")
+    task_utils.resubmit_task(exp, "start", "b")
     assert [s[:2] for s in started] == [("trash", "b"), ("trunk", "b")]
     with pytest.raises(AssertionError, match="redo score from its job file"):
         task_utils.resubmit_task(exp, "score", "b")
@@ -226,4 +233,4 @@ def test_lsf_restarts_a_run_with_the_experiments_task_and_redoes_any_other_from_
     task_utils.resubmit_task(exp, "score", file)
     assert submitted == [file]
     with pytest.raises(AssertionError, match="is not a run"):
-        task_utils.resubmit_task(exp, "branch", file)  # the file is another task's
+        task_utils.resubmit_task(exp, "anneal", file)  # the file is another task's
