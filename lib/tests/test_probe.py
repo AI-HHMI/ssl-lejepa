@@ -228,7 +228,7 @@ def test_scoring_config_reads_instances_truth_from_its_own_data_configs():
 def test_score_calls_mia_evals_on_the_probe_artifacts(tmp_path, monkeypatch):
     t, savedir = tasks.Trunk(), str(tmp_path / "run")
     with pytest.raises(AssertionError, match="no probe artifacts"):
-        task_utils.mia_eval(t, savedir)
+        task_utils.mia_pq(t, savedir)
     for split in ["fit", "test"]:
         (tmp_path / "run/probe" / split).mkdir(parents=True)
     monkeypatch.setattr(task_utils, "code_provenance", lambda: {"commit_id": "abc123"})
@@ -240,7 +240,7 @@ def test_score_calls_mia_evals_on_the_probe_artifacts(tmp_path, monkeypatch):
         record.write_text(json.dumps({"scores": {"voxel_instance": {"pq": 0.25}}}))
     from mia_evals import evaluate
     monkeypatch.setattr(evaluate, "cmd_score", fake_score)
-    assert task_utils.mia_eval(t, savedir) == 0.25  # the panoptic quality, which ranks
+    assert task_utils.mia_pq(t, savedir) == 0.25  # the panoptic quality, which ranks
     (args,) = calls
     assert str(args.config).endswith(task_utils.BOARD_CONFIGS["neuron-instance"])
     assert args.test == tmp_path / "run/probe/test" and args.val == tmp_path / "run/probe/fit"

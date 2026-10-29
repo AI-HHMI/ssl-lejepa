@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Literal
 
 from lib import evals, training
-from lib.task_utils import SCORE_MINUTES, check_snapshot, go, keep_if_best, load_model, mia_eval, record
+from lib.task_utils import SCORE_MINUTES, assert_snapshot, go, keep_if_best, load_model, mia_pq, record_job
 from lib.training import Train, Trainer
 
 BRANCH_MINUTES = 120  # the LSF wall limit of a branch (anneal, pca, probe or UNETR)
@@ -52,14 +52,14 @@ class Trunk:
 
 def trunk(t: Trunk):
     """Pretrain at a constant lr, with a branch at the start and after every segment (step_<N>/ each; metrics.json, best.pt)."""
-    check_snapshot()
+    assert_snapshot()
     with Trainer(t.train, t.savedir, t.segments * t.segment_steps, load_checkpoint(t.init_from)) as trainer:
         def fork():
             start = Path(t.savedir) / f"step_{trainer.step:07d}/start.pt"
             trainer.save(start)
             go(branch, f"{start.parent}/", t.train.hardware, BRANCH_MINUTES, t=t, start=str(start))
         if trainer.r.rank0:
-            record(t.savedir, "trunk", t=t)
+            record_job(t.savedir, "trunk", t=t)
             fork()
         lr = t.train.optim.lr
         for _ in range(t.segments):
@@ -70,12 +70,12 @@ def trunk(t: Trunk):
 
 def branch(t: Trunk, start: str):
     """Anneal a fork point's weights (start, in the branch's dir), then pca and tiled inference on them, and go score (checkpoint.pt, pca2.png, probe.json or finetune_curve.json)."""
-    check_snapshot()
+    assert_snapshot()
     savedir, lr = f"{Path(start).parent}/", t.train.optim.lr
     end = Path(savedir) / "checkpoint.pt"
     with Trainer(t.train, savedir, t.anneal_steps, load_checkpoint(start)) as trainer:
         if trainer.r.rank0:
-            record(savedir, "branch", t=t, start=start)
+            record_job(savedir, "branch", t=t, start=start)
         trainer.train(t.anneal_steps, lr, lr * t.anneal_to)
         if trainer.r.rank0:
             trainer.save(end)
@@ -92,15 +92,15 @@ def branch(t: Trunk, start: str):
 
 def score(t: Trunk, branch_dir: str):
     """mia-evals on a branch's predictions; its weights are kept if they score best in the trunk (mia_evals/<board>/records/*.json, ../best.pt)."""
-    record(branch_dir, "score", t=t, branch_dir=branch_dir)
-    keep_if_best(t, branch_dir, mia_eval(t, branch_dir))
+    record_job(branch_dir, "score", t=t, branch_dir=branch_dir)
+    keep_if_best(t, branch_dir, mia_pq(t, branch_dir))
 
 
 def benchmark(t: Trunk):
     """Throughput and a profiler trace of the trunk's training step, with no training run: lib.training.benchmark. Every DDP rank."""
-    check_snapshot()
+    assert_snapshot()
     if int(os.environ.get("RANK", 0)) == 0:
-        record(t.savedir, "benchmark", t=t)
+        record_job(t.savedir, "benchmark", t=t)
     training.benchmark(t.train, t.savedir)
 
 TASKS = [trunk, branch, score, benchmark]  # the entrypoints of experiment.py: `<task> <job file>`

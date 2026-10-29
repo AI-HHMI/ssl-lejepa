@@ -56,7 +56,7 @@ def gone(tmp_path, monkeypatch):
     gone = []
     monkeypatch.setattr(tasks, "Trainer", FakeTrainer)
     monkeypatch.setattr(tasks, "go", lambda fn, savedir, hardware, minutes, **args: gone.append((fn.__name__, savedir, hardware, minutes, args)))
-    monkeypatch.setattr(tasks, "check_snapshot", lambda: None)
+    monkeypatch.setattr(tasks, "assert_snapshot", lambda: None)
     monkeypatch.setattr(tasks, "load_checkpoint", lambda path: path)  # the loaded checkpoint stands for its path
     return gone
 
@@ -114,7 +114,7 @@ def test_score_keeps_a_branch_only_if_it_is_the_trunks_best(tmp_path, monkeypatc
         d = trunk / step
         d.mkdir(parents=True)
         (d / "checkpoint.pt").write_text(step)
-        monkeypatch.setattr(tasks, "mia_eval", lambda t, savedir, pq=pq: pq)
+        monkeypatch.setattr(tasks, "mia_pq", lambda t, savedir, pq=pq: pq)
         tasks.score(TRUNK, f"{d}/")
     assert (trunk / "best.pt").read_text() == "step_0000200"
     assert json.loads((trunk / "best.json").read_text())["step"] == 200
@@ -165,7 +165,7 @@ def test_the_experiment_file_names_runs_that_load_as_a_job_loads_them(tmp_path, 
         assert r.hours * 60 > 0 and r.segments * r.segment_steps > 0
         assert r.train.hardware.n_workers + 1 <= task_utils.CPUS_PER_GPU
     assert experiment.EXPERIMENT.task is tasks.trunk
-    task_utils.check_experiment(experiment.EXPERIMENT)
+    task_utils.assert_experiment(experiment.EXPERIMENT)
 
 
 def sweep(monkeypatch, id, init_from=""):
@@ -220,12 +220,12 @@ def test_lsf_restarts_a_run_with_the_experiments_task_and_redoes_any_other_from_
     exp, started = sweep(monkeypatch, "e00/e01-test")
     submitted = []
     monkeypatch.setattr(task_utils, "submit_file", submitted.append)
-    task_utils.resubmit(exp, "trunk", "b")
+    task_utils.resubmit_task(exp, "trunk", "b")
     assert [s[:2] for s in started] == [("trash", "b"), ("trunk", "b")]
     with pytest.raises(AssertionError, match="redo score from its job file"):
-        task_utils.resubmit(exp, "score", "b")
+        task_utils.resubmit_task(exp, "score", "b")
     file = "outdir/e00/e01-test/b/step_0000100/score.json"
-    task_utils.resubmit(exp, "score", file)
+    task_utils.resubmit_task(exp, "score", file)
     assert submitted == [file]
     with pytest.raises(AssertionError, match="is not a run"):
-        task_utils.resubmit(exp, "branch", file)  # the file is another task's
+        task_utils.resubmit_task(exp, "branch", file)  # the file is another task's

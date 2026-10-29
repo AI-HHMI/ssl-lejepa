@@ -33,11 +33,11 @@ CPUS_PER_GPU = 12  # LSF slots per GPU: 8 GPUs -> all 96 cores; training process
 # Whole nodes (Optim.batch_size and Hardware.n_workers are per GPU); an H200 node has one GPU taken by someone else's job.
 H200 = Hardware(queue="gpu_h200", n_gpus=7, n_workers=CPUS_PER_GPU - 1)
 B300 = Hardware(queue="gpu_b300", n_gpus=8, n_workers=CPUS_PER_GPU - 1)
-# mia-evals scoring (mia_eval): CPU only. mia-evals: ~1 h and ~200 GB peak for the mutex watershed at 896^3, "give it a
+# mia-evals scoring (mia_pq): CPU only. mia-evals: ~1 h and ~200 GB peak for the mutex watershed at 896^3, "give it a
 # whole node". The shortest CPU queue; check its run limit and memory per slot with `bqueues -l short`.
 SCORE_QUEUE, SCORE_SLOTS, SCORE_MINUTES = "local", 16, 4*60
 BOARD_CONFIGS = {"neuron-instance": "mia_evals/gary_comparison_neuron_instance/mws.toml"}  # Trunk.board: ours, truth_kind = "instances"
-# mia_eval() calls mia-evals as a library (a path dependency on the sister checkout, see pyproject.toml); its commit is recorded
+# mia_pq() calls mia-evals as a library (a git dependency on its lib-namespace branch, see pyproject.toml); its commit is recorded
 # in each score's provenance (mia_evals_commit).
 
 
@@ -59,7 +59,7 @@ def experiment_dir(savedir: str) -> str:
     return "/".join(Path(savedir).parts[1:3])
 
 
-def check_snapshot():
+def assert_snapshot():
     """LSF jobs must run a code snapshot (bsub): the shared checkout's lib/ may be another sweep's by now."""
     b1 = "LSB_JOBID" in os.environ
     b2 = ".tmpcode" not in Path(__file__).resolve().parts
@@ -75,7 +75,7 @@ def replay_bad_batch(exp: Experiment, path: str):
     dump = torch.load(path, map_location="cpu", weights_only=False)
     return training.replay_bad_batch(dump)
 
-def mia_eval(t, savedir: str) -> float:
+def mia_pq(t, savedir: str) -> float:
     """Score the affinities in savedir (probe/{fit,test}, written by a branch's probe or finetune) as mia-evals' neuron-instance task on trunk t's board
     (mutex watershed + size filter, fitted on the fit block, reported on the test block); panoptic quality, which ranks, comes
     back (VOI and ARE are in the record).
@@ -138,12 +138,12 @@ def load_model(train: Train, init_from: str):
     model.load_state_dict(ckpt["model"])  # strict: architecture drift fails loudly
     return model.to(device).eval(), ckpt["step"]
 
-def record(savedir: str, fn: str, **args):
-    """Append one row to savedir/runs.json: which task ran (fn), its arguments (dataclasses as dicts), code_provenance(), argv and LSF
+def record_job(savedir: str, task: str, **args):
+    """Append one row to savedir/runs.json: which task ran, its arguments (dataclasses as dicts), code_provenance(), argv and LSF
     job. Written first thing, so even a run that crashes before any results describes itself. Repro for the dir's artifacts: that
     commit + argv. The command that submitted the job is in outdir/_log/commands.jsonl (log_command)."""
     params = {k: asdict(v) if is_dataclass(v) else v for k, v in args.items()}
-    row = {"fn": fn, "params": params, **code_provenance(), "argv": sys.argv, "lsf_job": os.environ.get("LSB_JOBID")}
+    row = {"fn": task, "params": params, **code_provenance(), "argv": sys.argv, "lsf_job": os.environ.get("LSB_JOBID")}
     Path(savedir).mkdir(parents=True, exist_ok=True)
     with open(Path(savedir) / "runs.json", "a") as f:
         f.write(json.dumps(row) + "\n")
@@ -216,18 +216,18 @@ def start_run(exp: Experiment, run):
     go(exp.task, run.savedir, run.train.hardware, int(run.hours * 60), t=run)
 
 
-def resubmit(exp: Experiment, fn: str, target: str):
+def resubmit_task(exp: Experiment, task: str, run_or_file: str):
     """Redo one task on LSF: `resubmit <experiment's task> <run>` restarts the run named so fresh (start_run), `resubmit <task> <job file>` resubmits
     the job in that file (go's <savedir>/<task>.json, e.g. outdir/.../mae/step_0010000/score.json), as it was: after changing the
     board, say."""
     assert_committed()
     roots = exp.roots()
-    if target in roots:
-        assert fn == exp.task.__name__, f"a run is started by {exp.task.__name__!r}, not {fn!r}: redo {fn} from its job file"
-        start_run(exp, roots[target])
+    if run_or_file in roots:
+        assert task == exp.task.__name__, f"a run is started by {exp.task.__name__!r}, not {task!r}: redo {task} from its job file"
+        start_run(exp, roots[run_or_file])
     else:
-        assert Path(target).name == f"{fn}.json", f"{target} is not a run of {exp.id} ({list(roots)}) or the job file of task {fn}"
-        submit_file(target)
+        assert Path(run_or_file).name == f"{task}.json", f"{run_or_file} is not a run of {exp.id} ({list(roots)}) or the job file of task {task}"
+        submit_file(run_or_file)
 
 def submit_replay(exp: Experiment, name: str):
     """replay_bad_batch on LSF for the run name's first bad_batch dump. CUDA_LAUNCH_BLOCKING names a crashing kernel."""
@@ -243,7 +243,7 @@ def experiment_id(name: str) -> str | None:
     m = re.fullmatch(r"(e\d\d(?:-\d\d)*)-[a-z][a-z0-9-]*", name)
     return m[1] if m else None
 
-def check_experiment(exp: Experiment):
+def assert_experiment(exp: Experiment):
     """The experiment's id rules (README: experiment ids), checked against outdir/, the cluster's source of truth: the id is
     well formed and no other sweep dir has it; a child (e15-02) builds on its parent (e15), i.e. every init_from points into
     outdir/<series>/e15-*/; a root (e15) builds on no numbered experiment. One that depends on two experiments can't be named,
@@ -269,14 +269,14 @@ def submitall(exp: Experiment):
     """Submit the experiment (README: one experiment, one entrypoint): every run whose spec isn't in its savedir yet, i.e. not
     submitted before (whether it finished, is still going, or failed). Idempotent: run it again after adding runs; a run
     already submitted is left alone (`resubmit <the experiment's task> <name>` restarts one fresh)."""
-    check_experiment(exp)
+    assert_experiment(exp)
     assert_committed()
     for r in exp.roots().values():
         if not (Path(r.savedir) / f"{exp.task.__name__}.json").is_file():
             start_run(exp, r)
 
 
-COMMANDS = [replay_bad_batch, resubmit, submit_replay, submitall]  # take the experiment first, bound by main
+COMMANDS = [replay_bad_batch, resubmit_task, submit_replay, submitall]  # take the experiment first, bound by main
 
 
 def main(exp: Experiment, tasks: list[Callable]):
