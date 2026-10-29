@@ -9,11 +9,10 @@ import zarr
 
 import experiment
 import tasks
-from lib import task_utils
 import lib.data
 import lib.probe
 import lib.readers
-from lib import evals, training
+from lib import evals, scoring, task_utils, training
 from lib.encoders import EncoderConfig
 from lib.models import Lejepa, LejepaConfig, ProjectorConfig
 from lib.probe import AFFINITY_OFFSETS_XYZ, affinities, average_precision, fit_probe, to_tokens, to_voxels
@@ -200,24 +199,24 @@ def test_score_artifacts_of_any_set_with_a_tune_block_are_named_for_it(tmp_path,
 
 
 def test_load_model_init_from(tmp_path, monkeypatch):
-    monkeypatch.setattr(training, "model_config", lambda par: TINY)
+    monkeypatch.setattr(training, "model_config", lambda train: TINY)
     small = training.Train(encoder=training.Encoder(n_layers=1, width=16))
-    a, step = task_utils.load_model(small, "random")
-    b, _ = task_utils.load_model(small, "random")
+    a, step = tasks.load_model(small, "random")
+    b, _ = tasks.load_model(small, "random")
     assert step == 0 and all(torch.equal(x, y) for x, y in zip(a.state_dict().values(), b.state_dict().values()))  # seeded
     # Another run's checkpoint: loaded into small's architecture even though its saved params differ from small's.
     trained = {k: v + 1 if v.is_floating_point() else v for k, v in a.state_dict().items()}
     torch.save({"step": 42, "params": {"encoder": {"width": 16}}, "model": trained}, tmp_path / "checkpoint.pt")
-    c, step = task_utils.load_model(small, str(tmp_path / "checkpoint.pt"))
+    c, step = tasks.load_model(small, str(tmp_path / "checkpoint.pt"))
     assert step == 42 and all(torch.equal(x, trained[k]) for k, x in c.state_dict().items())
     with pytest.raises(AssertionError, match="no checkpoint"):
-        task_utils.load_model(small, str(tmp_path))
+        tasks.load_model(small, str(tmp_path))
 
 
 def test_scoring_config_reads_instances_truth_from_its_own_data_configs():
     import tomllib
     from pathlib import Path
-    path = task_utils.CODE_ROOT / task_utils.BOARD_CONFIGS["neuron-instance"]
+    path = task_utils.CODE_ROOT / scoring.BOARD_CONFIGS["neuron-instance"]
     c = tomllib.loads(path.read_text())
     assert c["task"]["truth_kind"] == "instances"  # GT read from the store, no .gt.zarr copies
     for split, box in [("test", "[[4000, 5000], [4000, 5000], [4000, 5000]]"), ("fit", "[[4000, 5000], [4000, 5000], [3000, 4000]]")]:
@@ -228,10 +227,10 @@ def test_scoring_config_reads_instances_truth_from_its_own_data_configs():
 def test_score_calls_mia_evals_on_the_probe_artifacts(tmp_path, monkeypatch):
     t, savedir = tasks.Trunk(), str(tmp_path / "run")
     with pytest.raises(AssertionError, match="no probe artifacts"):
-        task_utils.mia_pq(t, savedir)
+        scoring.mia_pq(t, savedir)
     for split in ["fit", "test"]:
         (tmp_path / "run/probe" / split).mkdir(parents=True)
-    monkeypatch.setattr(task_utils, "code_provenance", lambda: {"commit_id": "abc123"})
+    monkeypatch.setattr(scoring, "code_provenance", lambda: {"commit_id": "abc123"})
     calls = []
     def fake_score(args):  # mia-evals writes its record into the leaderboard dir
         calls.append(args)
@@ -240,9 +239,9 @@ def test_score_calls_mia_evals_on_the_probe_artifacts(tmp_path, monkeypatch):
         record.write_text(json.dumps({"scores": {"voxel_instance": {"pq": 0.25}}}))
     from mia_evals import evaluate
     monkeypatch.setattr(evaluate, "cmd_score", fake_score)
-    assert task_utils.mia_pq(t, savedir) == 0.25  # the panoptic quality, which ranks
+    assert scoring.mia_pq(t, savedir) == 0.25  # the panoptic quality, which ranks
     (args,) = calls
-    assert str(args.config).endswith(task_utils.BOARD_CONFIGS["neuron-instance"])
+    assert str(args.config).endswith(scoring.BOARD_CONFIGS["neuron-instance"])
     assert args.test == tmp_path / "run/probe/test" and args.val == tmp_path / "run/probe/fit"
     assert args.leaderboard == tmp_path / "run/mia_evals" and args.no_scored
     assert args.run_dir == tmp_path / "run"

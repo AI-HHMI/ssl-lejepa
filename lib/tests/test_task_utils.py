@@ -12,7 +12,7 @@ import pytest
 
 import experiment
 import tasks
-from lib import evals, task_utils, training
+from lib import evals, scoring, task_utils, training
 from lib.task_utils import Experiment
 
 
@@ -24,10 +24,10 @@ def provenance(monkeypatch):  # run records independent of git state
 class FakeTrainer:
     """tasks.Trainer without a model: records what the phase asks of it."""
     log = []
-    stop_after = None  # the number of train() calls after which .stopped is set
+    stop_after = None  # the number of train() calls after which .stop_reason is set
 
-    def __init__(self, par, savedir, steps, init=None):
-        self.par, self.step, self.stopped, self.r, self.n = par, 0, "", SimpleNamespace(rank0=True), 0
+    def __init__(self, config, savedir, steps, init=None):
+        self.config, self.step, self.stop_reason, self.r, self.n = config, 0, "", SimpleNamespace(rank0=True), 0
         self.log.append(("init", savedir, steps, init))
 
     def __enter__(self):
@@ -39,7 +39,7 @@ class FakeTrainer:
     def train(self, steps, lr0, lr1):
         self.step += steps
         self.n += 1
-        self.stopped = "diverged" if self.n == self.stop_after else ""
+        self.stop_reason = "diverged" if self.n == self.stop_after else ""
         self.log.append(("train", steps, lr0, lr1))
 
     def save(self, path):
@@ -61,8 +61,8 @@ def gone(tmp_path, monkeypatch):
     return gone
 
 
-TRUNK = tasks.Trunk(savedir="outdir/e00/e01-test/a/", train=training.Train(optim=training.Optim(lr=1e-3)), segments=3, segment_steps=100,
-                    anneal_steps=40, anneal_to=0.1, eval_data="hemibrain")
+TRUNK = tasks.Trunk(savedir="outdir/e00/e01-test/a", train=training.Train(optim=training.Optim(lr=1e-3)), segments=3, segment_steps=100,
+                    anneal_steps=40, anneal_lr_frac=0.1, eval_data="hemibrain")
 
 
 def test_a_trunk_branches_at_its_start_and_after_every_segment_at_a_constant_lr(gone):
@@ -72,8 +72,8 @@ def test_a_trunk_branches_at_its_start_and_after_every_segment_at_a_constant_lr(
     assert [Path(e[1]).parent.name for e in FakeTrainer.log if e[0] == "save"] == [f"step_{s:07d}" for s in [0, 100, 200, 300]]
     assert [g[0] for g in gone] == ["branch"] * 4
     # the branch of the first segment's end: its own dir, the trunk's hardware, the trunk and the fork point it takes
-    assert gone[1] == ("branch", f"{TRUNK.savedir}step_0000100/", TRUNK.train.hardware, tasks.BRANCH_MINUTES,
-                       {"t": TRUNK, "start": f"{TRUNK.savedir}step_0000100/start.pt"})
+    assert gone[1] == ("branch", f"{TRUNK.savedir}/step_0000100", TRUNK.train.hardware, tasks.BRANCH_MINUTES,
+                       {"t": TRUNK, "fork_point": f"{TRUNK.savedir}/step_0000100/fork.pt"})
 
 
 def test_a_trunk_that_diverges_branches_no_more(gone):
@@ -85,29 +85,28 @@ def test_a_trunk_that_diverges_branches_no_more(gone):
 
 def test_a_branch_anneals_then_evaluates_and_goes_to_score(gone, monkeypatch):
     calls = []
-    start = Path(TRUNK.savedir) / "step_0000100/start.pt"
-    start.parent.mkdir(parents=True)
-    start.write_text("start")
-    savedir = f"{start.parent}/"
+    fork_point = Path(TRUNK.savedir) / "step_0000100/fork.pt"
+    fork_point.parent.mkdir(parents=True)
+    fork_point.write_text("fork point")
+    branch_dir = str(fork_point.parent)
     monkeypatch.setattr(tasks, "load_model", lambda train, init_from: (SimpleNamespace(encoder="enc"), 140))
-    monkeypatch.setattr(evals, "pca_maps", lambda enc, par, savedir, step, data: calls.append(("pca", enc, step, data)))
+    monkeypatch.setattr(evals, "pca_maps", lambda enc, train, savedir, step, data: calls.append(("pca", enc, step, data)))
     monkeypatch.setattr(evals, "probe", lambda model, train, data, savedir, step, standardize=False: calls.append(("probe", savedir, data, standardize)))
     monkeypatch.setattr(evals, "finetune", lambda model, train, data, savedir, step: calls.append(("finetune", savedir, data)))
-    tasks.branch(TRUNK, str(start))
-    end = f"{savedir}checkpoint.pt"
-    assert FakeTrainer.log == [("init", savedir, 40, str(start)), ("train", 40, 1e-3, pytest.approx(1e-4)), ("save", end)]
-    assert not start.exists()  # taken
-    assert calls == [("pca", "enc", 140, "hemibrain"), ("probe", savedir, "hemibrain", False)]
-    assert gone == [("score", savedir, None, task_utils.SCORE_MINUTES, {"t": TRUNK, "branch_dir": savedir})]  # a CPU job
+    tasks.branch(TRUNK, str(fork_point))
+    end = f"{branch_dir}/checkpoint.pt"
+    assert FakeTrainer.log == [("init", branch_dir, 40, str(fork_point)), ("train", 40, 1e-3, pytest.approx(1e-4)), ("save", end)]
+    assert not fork_point.exists()  # taken
+    assert calls == [("pca", "enc", 140, "hemibrain"), ("probe", branch_dir, "hemibrain", False)]
+    assert gone == [("score", branch_dir, tasks.SCORE_HARDWARE, tasks.SCORE_MINUTES, {"t": TRUNK, "branch_dir": branch_dir})]  # a CPU job
     calls.clear(), gone.clear()
-    start.write_text("start")
-    tasks.branch(replace(TRUNK, eval_head="unetr"), str(start))  # the variant: a UNETR, scored all the same
-    assert calls[1] == ("finetune", savedir, "hemibrain") and [g[0] for g in gone] == ["score"]
+    fork_point.write_text("fork point")
+    tasks.branch(replace(TRUNK, eval_head="finetune"), str(fork_point))  # the variant: a UNETR, scored all the same
+    assert calls[1] == ("finetune", branch_dir, "hemibrain") and [g[0] for g in gone] == ["score"]
 
 
 def test_score_keeps_a_branch_only_if_it_is_the_trunks_best(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(task_utils, "code_provenance", lambda: {"commit_id": "x", "subject": "", "dirty": False, "diff_hash": ""})
     trunk = Path("outdir/e00/e01-test/a")
     pqs = {"step_0000100": 0.2, "step_0000200": 0.5, "step_0000300": 0.3}
     for step, pq in pqs.items():
@@ -115,33 +114,32 @@ def test_score_keeps_a_branch_only_if_it_is_the_trunks_best(tmp_path, monkeypatc
         d.mkdir(parents=True)
         (d / "checkpoint.pt").write_text(step)
         monkeypatch.setattr(tasks, "mia_pq", lambda t, savedir, pq=pq: pq)
-        tasks.score(TRUNK, f"{d}/")
+        tasks.score(TRUNK, str(d))
     assert (trunk / "best.pt").read_text() == "step_0000200"
     assert json.loads((trunk / "best.json").read_text())["step"] == 200
     assert not list(trunk.glob("step_*/checkpoint.pt"))  # the losers' weights are deleted
 
 
-def test_the_boards_of_a_trunk_are_the_leaderboards_task_utils_knows():
-    assert set(task_utils.BOARD_CONFIGS) == set(typing.get_args(typing.get_type_hints(tasks.Trunk)["board"]))
+def test_the_boards_of_a_trunk_are_the_leaderboards_scoring_knows():
+    assert set(scoring.BOARD_CONFIGS) == set(typing.get_args(typing.get_type_hints(tasks.Trunk)["board"]))
 
 
 def test_go_writes_the_job_file_that_load_args_reads_and_submit_runs(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     submitted = []
-    monkeypatch.setattr(task_utils, "bsub", lambda savedir, job, minutes, n_gpus, queue, cmd, **kw: submitted.append((savedir, job, minutes, n_gpus, queue, cmd, kw)))
+    monkeypatch.setattr(task_utils, "bsub", lambda savedir, job, minutes, hardware, cmd: submitted.append((savedir, job, minutes, hardware, cmd)))
     hardware = training.Hardware(queue="gpu_b300", n_gpus=2, n_workers=11)
-    trunk = replace(TRUNK, savedir="outdir/e00/x/a/", hours=3, train=training.Train(hardware=hardware))
-    start = "outdir/e00/x/a/step_0000100/start.pt"
-    task_utils.go(tasks.branch, "outdir/e00/x/a/step_0000100/", hardware, 120, t=trunk, start=start)
-    task_utils.go(tasks.score, "outdir/e00/x/a/step_0000100/", None, task_utils.SCORE_MINUTES, t=trunk, branch_dir="outdir/e00/x/a/step_0000100/")
-    file = "outdir/e00/x/a/step_0000100/branch.json"
-    assert submitted == [("outdir/e00/x/a/step_0000100", "branch", 120, 2, "gpu_b300", f"torchrun --standalone --nproc_per_node=2 {{code}}/experiment.py branch {file}", {}),
-                         ("outdir/e00/x/a/step_0000100", "score", task_utils.SCORE_MINUTES, 0, task_utils.SCORE_QUEUE,
-                          "python {code}/experiment.py score outdir/e00/x/a/step_0000100/score.json", {"slots": task_utils.SCORE_SLOTS})]
-    assert task_utils.load_args(tasks.branch, file) == {"t": trunk, "start": start}  # what the job runs: the same arguments
+    trunk = replace(TRUNK, savedir="outdir/e00/x/a", hours=3, train=training.Train(hardware=hardware))
+    branch_dir, fork_point = "outdir/e00/x/a/step_0000100", "outdir/e00/x/a/step_0000100/fork.pt"
+    task_utils.go(tasks.branch, branch_dir, hardware, 120, t=trunk, fork_point=fork_point)
+    task_utils.go(tasks.score, branch_dir, tasks.SCORE_HARDWARE, tasks.SCORE_MINUTES, t=trunk, branch_dir=branch_dir)
+    file = f"{branch_dir}/branch.json"
+    assert submitted == [(branch_dir, "branch", 120, hardware, f"torchrun --standalone --nproc_per_node=2 {{code}}/experiment.py branch {file}"),
+                         (branch_dir, "score", tasks.SCORE_MINUTES, tasks.SCORE_HARDWARE, f"python {{code}}/experiment.py score {branch_dir}/score.json")]  # a CPU job: no torchrun
+    assert task_utils.load_args(tasks.branch, file) == {"t": trunk, "fork_point": fork_point}  # what the job runs: the same arguments
     job = json.loads(Path(file).read_text())
     assert job["task"] == "branch" and job["minutes"] == 120 and job["hardware"]["n_gpus"] == 2
-    bad = {**job, "args": {**job["args"], "start": 3}}
+    bad = {**job, "args": {**job["args"], "fork_point": 3}}
     Path("bad.json").write_text(json.dumps(bad))
     with pytest.raises(Exception, match="valid string"):  # validated: a mistyped argument fails at load, before any GPU work
         task_utils.load_args(tasks.branch, "bad.json")
@@ -149,22 +147,22 @@ def test_go_writes_the_job_file_that_load_args_reads_and_submit_runs(tmp_path, m
     with pytest.raises(AssertionError, match="takes"):  # so does one the task doesn't take
         task_utils.load_args(tasks.branch, "extra.json")
     with pytest.raises(AssertionError, match="takes"):  # and go() refuses it before writing anything
-        task_utils.go(tasks.branch, "outdir/e00/x/b/", hardware, 120, t=trunk)
+        task_utils.go(tasks.branch, "outdir/e00/x/b", hardware, 120, t=trunk)
     assert not Path("outdir/e00/x/b").exists()
     submitted.clear()
     task_utils.submit_file(file)  # a redo: the same job, from its file
-    assert [s[1] for s in submitted] == ["branch"] and submitted[0][3] == 2
+    assert [s[1] for s in submitted] == ["branch"] and submitted[0][3] == hardware
 
 
 def test_the_experiment_file_names_runs_that_load_as_a_job_loads_them(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    for name, r in experiment.EXPERIMENT.roots().items():  # a job validates its json (pydantic's Literals), which building the dataclass doesn't
-        assert r.savedir == f"outdir/{experiment.EXPERIMENT.id}/{name}/"
+    for name, r in experiment.EXPERIMENT.placed_runs().items():  # a job validates its json (pydantic's Literals), which building the dataclass doesn't
+        assert r.savedir == f"outdir/{experiment.EXPERIMENT.id}/{name}"
         assert task_utils.parse(tasks.Trunk, asdict(r)) == r, name
         training.model_config(r.train)  # its model builds on its encoder's patch
         assert r.hours * 60 > 0 and r.segments * r.segment_steps > 0
         assert r.train.hardware.n_workers + 1 <= task_utils.CPUS_PER_GPU
-    assert experiment.EXPERIMENT.task is tasks.trunk
+    assert experiment.EXPERIMENT.start_task is tasks.trunk
     task_utils.assert_experiment(experiment.EXPERIMENT)
 
 

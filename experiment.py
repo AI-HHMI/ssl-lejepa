@@ -3,7 +3,7 @@ e12's, or e11's 5^3) and the training objective change what 12 h of pretraining 
 
 Declarative: every run shares BASE (its Train) and differs by the groups its line names; its schedule is its Trunk's fields. What a
 run does (tasks.py): it pretrains in segments, branches at its start and after each, scores each branch, and keeps its best.
-Run it: `sh jrun.sh exp experiment.py submitall`, then `resubmit <task> <run or job file>`; `python experiment.py -h` lists the
+Run it: `sh jrun.sh exp experiment.py submitall`, then `resubmit_task <task> <run or job file>`; `python experiment.py -h` lists the
 commands and tasks."""
 
 from dataclasses import replace
@@ -24,7 +24,7 @@ BASE = Train(
     speed=Speed(cudagraphs=True),
 )
 
-run = partial(Trunk, eval_data="hemibrain", segments=10, anneal_steps=10_000, anneal_to=0.01, hours=12)  # a line of the table below
+run = partial(Trunk, eval_data="hemibrain", segments=10, anneal_steps=10_000, anneal_lr_frac=0.01, hours=12)  # a line of the table below
 EXPERIMENT = Experiment("e00/e13-cellmap-12h", trunk, {
     "mae":          run(train=replace(BASE, model=Mae(decoder=(512, 8)),                       hardware=B300), segment_steps=10_000),
     "views":        run(train=replace(BASE, model=Views(local=96, batch_views=True, lamb=0.1), hardware=B300), segment_steps=10_000),

@@ -20,7 +20,7 @@ from lib.util import *
 FINETUNE_STEPS = 10_000  # finetune: fit steps (lib.decoders.unetr.fit_unetr, batch 4), scored at 100, 200, 400, ... and the last
 
 
-def pca_maps(encoder, par: Train, savedir: Path, step: int, data: str):
+def pca_maps(encoder, train: Train, savedir: Path, step: int, data: str):
     """PCA maps of patch-token embeddings on a crop of the middle of dataset data's first val volume -> savedir/pca2.png, pca.json.
 
     pca2.png rows: the middle z-slice of each of the crop's 3 tile layers (a token's tile is the 96^3 view the encoder
@@ -34,11 +34,11 @@ def pca_maps(encoder, par: Train, savedir: Path, step: int, data: str):
     encoder.eval()
 
     # 3 tiles deep in z so each row of pca2.png is a different tile.
-    shape = (3 * par.data.view[0], 4 * par.data.view[1], 4 * par.data.view[2])
+    shape = (3 * train.data.view[0], 4 * train.data.view[1], 4 * train.data.view[2])
     img = crop(dataset(data).val[0], shape)
 
     # Tokens from non-overlapping tiles at the training global-view size, stitched into one grid.
-    tile, patch = par.data.view, encoder.patch_embed.patch_size
+    tile, patch = train.data.view, encoder.patch_embed.patch_size
     assert all(s % t == 0 for s, t in zip(shape, tile)), f"crop {shape} must tile by {tile}"
     grid = [s // p for s, p in zip(shape, patch)]
     feats = torch.empty(*grid, encoder.config.embed_dim)  # Z Y X D, tokens (after the final LayerNorm)

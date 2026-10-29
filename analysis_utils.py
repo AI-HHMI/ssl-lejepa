@@ -40,10 +40,10 @@ def run_dirs(sweep: str) -> list[Path]:
     return sorted(dirs, key=lambda d: int(d.name[1:]))
 
 def saved_params(d: Path) -> dict:
-    """A run's own params: runs.json (written first thing, so crashed runs have it too), else performance.json
-    (runs from before runs.json had params), else {}. The newest row: a dir's rows agree on params except where an
+    """A run's own params: jobs.json (runs.json before 2026-10-29: written first thing, so crashed runs have it too), else
+    performance.json (runs from before they had params), else {}. The newest row: a dir's rows agree on params except where an
     older job predates a field (e.g. a probe row from before init_from)."""
-    for name in ["runs.json", "performance.json"]:
+    for name in ["jobs.json", "runs.json", "performance.json"]:
         found = next((r["params"] for r in reversed(read_jsonl(d / name)) if "params" in r), None)
         if found:
             return found
@@ -353,9 +353,9 @@ def check_runs(root: str = "outdir/e00"):
             saved = r.get("params", {}).get("savedir")
             if saved and Path(saved) != d:
                 issues.append(f"row for {saved}")
-        n = sum(r.get("fn", "run") == "run" for r in read_jsonl(d / "runs.json"))
+        n = sum(r.get("fn", "run") in ("run", "trunk") for name in ("jobs.json", "runs.json") for r in read_jsonl(d / name))
         if n > 1:
-            issues.append(f"{n} training rows in runs.json")
+            issues.append(f"{n} training rows in jobs.json or runs.json")
         for log in d.glob("job_*.log"):
             m = re.search(r"input \+ view slices to (\S+)/views", log.read_text(errors="ignore"))
             if m and Path(m.group(1)) != d:

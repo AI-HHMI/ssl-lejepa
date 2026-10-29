@@ -1,4 +1,4 @@
-"""Inference and scoring helpers that need no spec: tokens and logits of an encoder or UNETR over a volume in tiles, PCA colours,
+"""Inference and scoring helpers that need no Train: tokens and logits of an encoder or UNETR over a volume in tiles, PCA colours,
 and the mia-evals affinity artifacts, per-block scores and boundary pictures."""
 
 from itertools import product

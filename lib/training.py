@@ -1,4 +1,4 @@
-"""Train (how a model is trained, in groups: the spec every task of an experiment shares), what follows from one (its model), and
+"""Train (how a model is trained, in groups: what every task of an experiment shares), what follows from one (its model), and
 training it: the data loader, DDP setup, model and optimizer, the step, the Trainer that takes a few at a time, checkpoints, the stop
 rules, throughput benchmark and replay of a skipped step. Tasks and their bookkeeping (code snapshot check, run records, evals,
 branches) are tasks.py's and lib.task_utils'."""
@@ -85,7 +85,7 @@ class Data:
 @dataclass(slots=True)
 class Optim:
     batch_size: int = 84  # per GPU
-    lr: float = 1e-4  # a trunk: linear warmup, then held; a branch: down to lr x Trunk.anneal_to
+    lr: float = 1e-4  # a trunk: linear warmup, then held; a branch: down to lr x Trunk.anneal_lr_frac
     weight_decay: float = 0.0  # AdamW decay on weight matrices (biases/norms excluded); 0 = the original plain Adam
     adam_beta2: float = 0.999  # Adam second-moment decay; 0.999 = torch default (all runs so far), mia-muvit uses 0.95
     grad_compress: bool = False  # DDP bf16_compress_hook: all-reduce gradients in bf16 (half the bytes)
@@ -96,6 +96,7 @@ class Hardware:
     n_gpus: int = 1  # DDP ranks on one node (launched via torchrun); Optim.batch_size and n_workers are per GPU
     n_workers: int = 16  # data loader workers per GPU (lib.task_utils.CPUS_PER_GPU - 1 at most)
     prefetch_factor: int = 2
+    slots: int = 0  # LSF slots to reserve; 0: lib.task_utils.CPUS_PER_GPU per GPU (a CPU job, n_gpus = 0, names its slots)
 
 @dataclass(slots=True)
 class Speed:
@@ -140,29 +141,29 @@ class Rank:
         import torch
         return torch.device(f"cuda:{self.local}" if torch.cuda.is_available() else "cpu")
 
-def encoder_config(par: Train) -> EncoderConfig:
-    e = par.encoder
+def encoder_config(train: Train) -> EncoderConfig:
+    e = train.encoder
     return EncoderConfig(depth=e.n_layers, embed_dim=e.width, num_heads=e.width // 64, qk_norm=e.qk_norm)
 
-def model_config(par: Train) -> models.LejepaConfig | models.MaeConfig:
-    """par's model's config: its objective on the encoder par says, and the view par.global_size (plus the shift of masked tokens)."""
-    m, (z, y, x), patch = par.model, par.data.view, encoder_config(par).patch_size[0]  # the encoder's token side, voxels
+def model_config(train: Train) -> models.LejepaConfig | models.MaeConfig:
+    """train's model's config: its objective on the encoder train says, and the view train.global_size (plus the shift of masked tokens)."""
+    m, (z, y, x), patch = train.model, train.data.view, encoder_config(train).patch_size[0]  # the encoder's token side, voxels
     if isinstance(m, Mae):
         dim, depth = m.decoder
-        return models.MaeConfig(encoder=encoder_config(par), view=ViewConfig(views="displace", global_size=par.data.view),
+        return models.MaeConfig(encoder=encoder_config(train), view=ViewConfig(views="displace", global_size=train.data.view),
                          decoder_dim=dim, decoder_depth=depth, decoder_heads=dim // 32)
     if isinstance(m, Views):
-        return models.LejepaConfig(encoder=encoder_config(par), objective="views", batch_views=m.batch_views, lamb=m.lamb,
-                            view=ViewConfig(views="displace", n_global=2, n_local=4, global_size=par.data.view, local_size=(m.local,) * 3))
+        return models.LejepaConfig(encoder=encoder_config(train), objective="views", batch_views=m.batch_views, lamb=m.lamb,
+                            view=ViewConfig(views="displace", n_global=2, n_local=4, global_size=train.data.view, local_size=(m.local,) * 3))
     assert m.cube % patch == 0, f"the masked cube {m.cube} must be a multiple of the patch {patch}"
     s = m.shift  # both views' region: the context's, and the targets' offset by up to the shift
-    return models.LejepaConfig(encoder=encoder_config(par), objective="mask", lamb=m.lamb, sigreg_over=m.sigreg_over, stop_grad=m.stop_grad,
+    return models.LejepaConfig(encoder=encoder_config(train), objective="mask", lamb=m.lamb, sigreg_over=m.sigreg_over, stop_grad=m.stop_grad,
                         view=ViewConfig(views="displace", n_global=1, n_local=0, global_size=(z + s, y + s, x + s)),
                         mask=models.MaskConfig(cube=m.cube // patch, shift=s, aligned=m.aligned, expand=m.expand))
 
-def make_model(par: Train) -> models.Lejepa | models.Mae:
-    """par's model, untrained."""
-    c = model_config(par)
+def make_model(train: Train) -> models.Lejepa | models.Mae:
+    """The model a Train describes, untrained."""
+    c = model_config(train)
     return models.Mae(c) if isinstance(c, models.MaeConfig) else models.Lejepa(c)
 
 
@@ -171,14 +172,14 @@ def collate_images(samples):
     import torch
     return torch.stack([s["img"] for s in samples])
 
-def compile_model(model: models.Lejepa | models.Mae, par: Train):
-    """torch.compile the encoder in place, as par says (no-op unless par.speed.compile)."""
+def compile_model(model: models.Lejepa | models.Mae, train: Train):
+    """torch.compile the encoder in place, as train says (no-op unless train.speed.compile)."""
     import torch
-    assert par.speed.compile or not (par.speed.cudagraphs or par.speed.compile_blocks), "cudagraphs / compile_blocks require compile"
-    if not par.speed.compile:
+    assert train.speed.compile or not (train.speed.cudagraphs or train.speed.compile_blocks), "cudagraphs / compile_blocks require compile"
+    if not train.speed.compile:
         return
     torch._logging.set_logs(recompiles=True)  # pyright: ignore[reportPrivateImportUsage]  # recompiles show up in job_*.log
-    if par.speed.cudagraphs:
+    if train.speed.cudagraphs:
         # CUDA graphs replay whole kernel sequences, removing per-kernel CPU launch cost.
         # They need static shapes: displace has exactly 2 encoder shapes (the whole view, and its visible tokens), basic has ~9.
         kwargs = dict(mode="reduce-overhead", dynamic=False)
@@ -186,24 +187,24 @@ def compile_model(model: models.Lejepa | models.Mae, par: Train):
         kwargs = dict(dynamic=True)  # Views change shape every step.
     # A whole-encoder compile releases every gradient at the end of one fused backward, so DDP can't
     # start all-reducing until backward is done. Per-block compile releases each block's grads as it finishes.
-    for m in (model.encoder.blocks if par.speed.compile_blocks else [model.encoder]):
+    for m in (model.encoder.blocks if train.speed.compile_blocks else [model.encoder]):
         m.compile(**kwargs)
-    if par.speed.eager_patch_embed:
+    if train.speed.eager_patch_embed:
         # Inductor's fused patchify kernel (triton_poi_fused__to_copy__unsafe_view_clone_permute_view_0: the input's
         # reshape/permute + bf16 cast) hits an illegal memory access under static shapes at batch 64 on B300 and
         # H200 (e00/b300-compile, replay of b300-train8h/d0 with CUDA_LAUNCH_BLOCKING). Run it eagerly instead.
         pe = model.encoder.patch_embed
         setattr(pe, "forward", torch.compiler.disable(pe.forward))  # instance override; nn.Module.__call__ uses it
 
-def save_view_pngs(par: Train, savedir: str, dataset, n_samples: int = 3):
+def save_view_pngs(train: Train, savedir: str, dataset, n_samples: int = 3):
     """Save what the model sees: for n_samples fresh samples, the input and each of its views, as
     center-z slices at native voxel size, left to right (input | globals | locals) -> savedir/views_{i}.png."""
     from PIL import Image
-    cfg = model_config(par)
+    cfg = model_config(train)
     p = cfg.encoder.patch_size
     maker = ViewMaker(cfg.view, patch_size=(p, p, p) if isinstance(p, int) else p)
     samples = [dataset[i] for i in range(n_samples)]
-    x = finish_images(collate_deferred(samples))["img"] if par.speed.defer_image_ops else collate_images(samples)  # Batch C Z Y X
+    x = finish_images(collate_deferred(samples))["img"] if train.speed.defer_image_ops else collate_images(samples)  # Batch C Z Y X
     globals_, locals_ = maker(x)
     to_u8 = lambda v: (v[0, v.shape[1] // 2].clamp(0, 1) * 255).byte().numpy()  # C Z Y X -> Y X center slice
     savedir = Path(savedir)
@@ -215,40 +216,40 @@ def save_view_pngs(par: Train, savedir: str, dataset, n_samples: int = 3):
         Image.fromarray(np.concatenate(panels, axis=1)).save(savedir / f"views_{b}.png")
     print(f"Saved {n_samples} input + view slices to {savedir}/views_*.png", flush=True)
 
-def dataloader(par: Train, savedir: str, steps: int):
+def dataloader(train: Train, savedir: str, steps: int):
     import torch
     # The datasets' train volumes (lib/data.py), images only, each sampled by its weight alone (lib.data.sampling); output is z y x.
-    volumes = [volume_config(v, v.zyx, weight=w) for v, w in sampling(par.data.sets, par.data.power)]
+    volumes = [volume_config(v, v.zyx, weight=w) for v, w in sampling(train.data.sets, train.data.power)]
     mcfg = MiaoConfig(
         volumes=volumes,
-        patch_size=list(par.data.window),
+        patch_size=list(train.data.window),
         resolutions=[[8.0, 8.0, 8.0]],
         # Extra batches keep workers busy (as in real training) through the last, profiled steps.
-        samples_per_epoch=par.optim.batch_size * (steps + par.hardware.n_workers * par.hardware.prefetch_factor),
+        samples_per_epoch=train.optim.batch_size * (steps + train.hardware.n_workers * train.hardware.prefetch_factor),
         sampling="random",
         output_axes="lzyx",
-        defer_image_ops=par.speed.defer_image_ops,
+        defer_image_ops=train.speed.defer_image_ops,
     )
     dl = VolumeDataset(mcfg)
     loader = torch.utils.data.DataLoader(
       dl,
-      batch_size=par.optim.batch_size,
-      num_workers=par.hardware.n_workers,
-      collate_fn=collate_deferred if par.speed.defer_image_ops else collate_images,
-      prefetch_factor=par.hardware.prefetch_factor if par.hardware.n_workers else None,  # n_workers 0 (tests): loads in this process, no workers
+      batch_size=train.optim.batch_size,
+      num_workers=train.hardware.n_workers,
+      collate_fn=collate_deferred if train.speed.defer_image_ops else collate_images,
+      prefetch_factor=train.hardware.prefetch_factor if train.hardware.n_workers else None,  # n_workers 0 (tests): loads in this process, no workers
       pin_memory=torch.cuda.is_available(),
-      multiprocessing_context="spawn" if par.hardware.n_workers else None,
+      multiprocessing_context="spawn" if train.hardware.n_workers else None,
     )
     batches = iter(loader)
     if int(os.environ.get("RANK", 0)) == 0:
-        save_view_pngs(par, savedir, dl)
+        save_view_pngs(train, savedir, dl)
     return batches
 
-def setup(par: Train) -> Rank:
-    """Torch settings, this rank's CUDA device and the DDP process group for training par; this process's Rank. Every rank."""
+def setup(train: Train) -> Rank:
+    """Torch settings, this rank's CUDA device and the DDP process group for training a Train; this process's Rank. Every rank."""
     import torch
     import torch.distributed as dist
-    torch.set_float32_matmul_precision(par.speed.f32mode)
+    torch.set_float32_matmul_precision(train.speed.f32mode)
     # cuDNN's fused attention backward returns NaN grads on some trained weights where flash and mem-efficient
     # don't (replay_bad_batch on e00/nanhunt_beta95/d9): the "divergences" of e00/viewsizes* and nanhunt*.
     # Runs before 2026-09-28 used it (torch's default pick on H200/B300).
@@ -256,7 +257,7 @@ def setup(par: Train) -> Rank:
     # Set by torchrun. Unset (plain `python`, tests) means a single process.
     # Don't seed torch identically across ranks: DataLoader workers derive miao's numpy seed from it.
     r = Rank(rank=int(os.environ.get("RANK", 0)), world=int(os.environ.get("WORLD_SIZE", 1)), local=int(os.environ.get("LOCAL_RANK", 0)))
-    assert r.world == par.hardware.n_gpus, f"launched {r.world} ranks but par.hardware.n_gpus={par.hardware.n_gpus}"
+    assert r.world == train.hardware.n_gpus, f"launched {r.world} ranks but train.hardware.n_gpus={train.hardware.n_gpus}"
     if torch.cuda.is_available():
         torch.cuda.set_device(r.local)
     if r.world > 1:
@@ -265,35 +266,35 @@ def setup(par: Train) -> Rank:
     print(f"Rank {r.rank}/{r.world} is using torch device {r.device()} .")
     return r
 
-def build(par: Train, r: Rank, ckpt: dict | None):
+def build(train: Train, r: Rank, ckpt: dict | None):
     """(model to step: compiled, and DDP-wrapped across ranks; the bare Lejepa, for checkpoints and logging; AdamW; the step it
-    starts at) for training par: fresh, or from the loaded checkpoint ckpt's weights, Adam moments and step."""
+    starts at) for training train: fresh, or from the loaded checkpoint ckpt's weights, Adam moments and step."""
     import torch
-    model = make_model(par)
+    model = make_model(train)
     if ckpt is not None:
         model.load_state_dict(ckpt["model"])  # strict: architecture drift fails loudly
     if r.rank0: pprint(model)
     model = model.to(r.device())
-    compile_model(model, par)
+    compile_model(model, train)
     lejepa = model  # unwrapped, for checkpoints
     if r.world > 1:
         # SIGReg and projector BatchNorm statistics stay per-rank (local batch) for now.
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[r.local] if r.device().type == "cuda" else None)
-        if par.optim.grad_compress:
+        if train.optim.grad_compress:
             from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
             model.register_comm_hook(None, default_hooks.bf16_compress_hook)
     # AdamW with weight_decay=0 is exactly Adam. Decay only weight matrices, not biases or norm gains.
     decay = [p for p in model.parameters() if p.ndim >= 2]
     no_decay = [p for p in model.parameters() if p.ndim < 2]
-    opt = torch.optim.AdamW([{"params": decay, "weight_decay": par.optim.weight_decay},
+    opt = torch.optim.AdamW([{"params": decay, "weight_decay": train.optim.weight_decay},
                              {"params": no_decay, "weight_decay": 0.0}],
-                            lr=par.optim.lr, betas=(0.9, par.optim.adam_beta2))  # the lr is set at every step (Trainer.train)
+                            lr=train.optim.lr, betas=(0.9, train.optim.adam_beta2))  # the lr is set at every step (Trainer.train)
     if ckpt is not None:  # the Adam moments and step count only: the fresh param groups keep their own lr
         ckpt["opt"]["param_groups"] = opt.state_dict()["param_groups"]
         opt.load_state_dict(ckpt["opt"])
     return model, lejepa, opt, ckpt["step"] if ckpt else 0
 
-def train_step(model, opt, batches, par: Train, r: Rank, bench: Benchmark):
+def train_step(model, opt, batches, train: Train, r: Rank, bench: Benchmark):
     """One optimizer step on the next batch, each part in its profiler phase (bench). A step whose gradient is non-finite is
     skipped, not applied: a single one would write NaN into every weight via opt.step() (the sudden divergences in
     e00/viewsizes*); DDP ranks share the all-reduced norm, so they skip together, at one host sync per step.
@@ -301,16 +302,16 @@ def train_step(model, opt, batches, par: Train, r: Rank, bench: Benchmark):
     views draw on the CPU generator and SIGReg slices on the GPU's, so a skipped step replays exactly from its dump.)"""
     import torch
     device = r.device()
-    if par.speed.cudagraphs:
+    if train.speed.cudagraphs:
         torch.compiler.cudagraph_mark_step_begin()  # previous step's graph outputs may be overwritten
     # No annotation hooks or profiler are active during the throughput baseline.
     with bench.phase("01_DATA_IO"):
         x = next(batches)
     with bench.phase("03_H2D_TRANSFER"):
         # Deferred batches are dicts of per-sample uint8 crops; finish_images copies and normalizes them.
-        x = finish_images(x, device)["img"] if par.speed.defer_image_ops else x.to(device, non_blocking=True)
+        x = finish_images(x, device)["img"] if train.speed.defer_image_ops else x.to(device, non_blocking=True)
     rng = (torch.get_rng_state(), torch.cuda.get_rng_state(device) if device.type == "cuda" else None)
-    with bench.phase("04_FORWARD_AND_LOSS"), torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.speed.amp):
+    with bench.phase("04_FORWARD_AND_LOSS"), torch.autocast(device.type, dtype=torch.bfloat16, enabled=train.speed.amp):
         out = model(x)
     bench.count(out)
     with bench.phase("05_BACKWARD"):
@@ -323,22 +324,22 @@ def train_step(model, opt, batches, par: Train, r: Rank, bench: Benchmark):
         opt.zero_grad(set_to_none=True)
     return x, out, grad_norm, skipped, rng
 
-def save_bad_batch(par: Train, savedir: str, lejepa, x, rng, step: int):
+def save_bad_batch(train: Train, savedir: str, lejepa, x, rng, step: int):
     """A skipped step, replayable (replay_bad_batch): the weights, still the pre-step ones, the input (uint8: lossless) and
     the RNG state before its forward -> savedir/bad_batch_<step>.pt."""
     import torch
-    torch.save({"step": step, "params": asdict(par), "model_config": asdict(lejepa.config), "model": lejepa.state_dict(),
+    torch.save({"step": step, "params": asdict(train), "model_config": asdict(lejepa.config), "model": lejepa.state_dict(),
                 "x_uint8": (x.clamp(0, 1) * 255).round().byte().cpu(), "rng_cpu": rng[0], "rng_cuda": rng[1]},
                Path(savedir) / f"bad_batch_{step:07d}.pt")
 
-def log_metrics(f, par: Train, lejepa, x, out, grad_norm, lr: float, step: int, n_skipped: int, seconds: float):
+def log_metrics(f, train: Train, lejepa, x, out, grad_norm, lr: float, step: int, n_skipped: int, seconds: float):
     """One metrics.json row (and a progress line) for this step."""
     import torch
     loss = out.loss.detach().item()
     # Median pre-LayerNorm token norm on a global-view-sized corner of 4 samples: residual-stream
     # growth tends to precede divergence (see e00/viewsizes). Eager and grad-free, so cheap.
-    g = par.data.view
-    with torch.no_grad(), torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=par.speed.amp):
+    g = train.data.view
+    with torch.no_grad(), torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=train.speed.amp):
         resid = lejepa.encoder.forward_residual(x[:4, :, :g[0], :g[1], :g[2]])
     # LeJEPA's loss = inv + lamb * sigreg, logged apart: sigreg is ~1.05 for exactly Gaussian projections
     # (its floor), and its pull scales with the per-GPU batch, so the total alone mixes invariance
@@ -350,7 +351,7 @@ def log_metrics(f, par: Train, lejepa, x, out, grad_norm, lr: float, step: int, 
     f.flush()
     print(f"finished step {step + 1}, loss={loss:.4f}", flush=True)
 
-def stop_reason(r: Rank, out, n_skipped: int, step: int) -> str:
+def reason_to_stop(r: Rank, out, n_skipped: int, step: int) -> str:
     """Why every rank stops after this step ("" to go on), agreed by one all-reduce: a non-finite loss (divergence), or too many
     skipped (non-finite gradient) steps."""
     import torch
@@ -364,29 +365,29 @@ def stop_reason(r: Rank, out, n_skipped: int, step: int) -> str:
                f"{n_skipped} steps skipped for non-finite gradients by step {step + 1}; stopping"]
     return next((m for m, s in zip(reasons, stop.tolist()) if s), "")
 
-def record_oom(par: Train, savedir: str, r: Rank, step: int, err: Exception):
+def record_oom(train: Train, savedir: str, r: Rank, step: int, err: Exception):
     """An out-of-memory error as a result row in performance.json (the table shows which configs don't fit)."""
     import torch
-    row = {"tbl": "oom", "time": time.time(), "params": asdict(par), "idx_step": step, "error": str(err).splitlines()[0][:300]}
+    row = {"tbl": "oom", "time": time.time(), "params": asdict(train), "idx_step": step, "error": str(err).splitlines()[0][:300]}
     if r.device().type == "cuda":
         row |= {"gpu_name": torch.cuda.get_device_name(r.device()), "max_mem_gb": torch.cuda.max_memory_allocated(r.device()) / 1e9}
     with open(Path(savedir) / "performance.json", "a") as f:
         f.write(json.dumps(row) + "\n")
 
 class Trainer:
-    """A model, its optimizer and its data, trained a few steps at a time: `with Trainer(par, steps) as t:` then t.train(...) as
+    """A model, its optimizer and its data, trained a few steps at a time: `with Trainer(config, savedir, steps) as t:` then t.train(...) as
     often as you like, t.save(path) between. Every DDP rank makes one; leaving the block destroys the process group.
     Rank 0 writes metrics.json, and the throughput window and profile of Benchmark (at the first steps)."""
 
-    def __init__(self, par: Train, savedir: str, steps: int, init: dict | None = None):
+    def __init__(self, config: Train, savedir: str, steps: int, init: dict | None = None):
         """savedir: where it writes. steps: the most it will train in all (the loader's supply, the benchmark's windows).
         init: None fresh, or a loaded checkpoint (what save() wrote: torch.load of a .pt)."""
-        self.par, self.savedir = par, savedir
-        self.r = setup(par)
-        self.batches = dataloader(par, savedir, steps)  # each rank its own, with its own miao seed (see setup)
-        self.model, self.lejepa, self.opt, self.step = build(par, self.r, init)  # step: steps done, in all
-        self.first, self.n_skipped, self.stopped, self.start_time, self.lr = self.step, 0, "", time.time(), par.optim.lr
-        self.bench = Benchmark(par, savedir, steps, self.r.device(), self.r.world, self.r.rank0)
+        self.config, self.savedir = config, savedir
+        self.r = setup(config)
+        self.batches = dataloader(config, savedir, steps)  # each rank its own, with its own miao seed (see setup)
+        self.model, self.lejepa, self.opt, self.step = build(config, self.r, init)  # step: steps done, in all
+        self.first_step, self.n_skipped, self.stop_reason, self.start_time, self.lr = self.step, 0, "", time.time(), config.optim.lr
+        self.bench = Benchmark(config, savedir, steps, self.r.device(), self.r.world, self.r.rank0)
 
     def __enter__(self) -> Trainer:
         self.bench.__enter__()
@@ -397,7 +398,7 @@ class Trainer:
         import torch.distributed as dist
         self.bench.__exit__(kind, err, tb)
         if isinstance(err, torch.OutOfMemoryError) and self.r.rank0:
-            record_oom(self.par, self.savedir, self.r, self.step, err)  # then the job fails as usual
+            record_oom(self.config, self.savedir, self.r, self.step, err)  # then the job fails as usual
         if self.r.world > 1:
             dist.destroy_process_group()
 
@@ -406,30 +407,30 @@ class Trainer:
         self.lr = lr * min(1.0, (self.step + 1) / LR_WARMUP)
         for g in self.opt.param_groups:
             g["lr"] = self.lr
-        return train_step(self.model, self.opt, self.batches, self.par, self.r, self.bench)
+        return train_step(self.model, self.opt, self.batches, self.config, self.r, self.bench)
 
     def train(self, steps: int, lr0: float, lr1: float):
         """steps more steps, the lr going linearly from lr0 to lr1. No validation, no checkpoints: those are the caller's. Stops
-        early (self.stopped says why) on a non-finite loss or too many skipped steps; later calls then train nothing."""
-        r, par = self.r, self.par
+        early (self.stop_reason says why) on a non-finite loss or too many skipped steps; later calls then train nothing."""
+        r, config = self.r, self.config
         with open(Path(self.savedir) / "metrics.json" if r.rank0 else os.devnull, "a") as f:
-            for i in range(steps * (not self.stopped)):
+            for i in range(steps * (not self.stop_reason)):
                 lr = lr0 + (lr1 - lr0) * i / steps
-                self.bench.begin(self.step - self.first)
+                self.bench.begin(self.step - self.first_step)
                 x, out, grad_norm, skipped, rng = self.advance(lr)
                 if skipped:
                     self.n_skipped += 1
                     print(f"Non-finite grad norm at step {self.step}; skipped ({self.n_skipped} so far)", flush=True)
                     if r.rank0 and self.n_skipped <= BAD_BATCHES_KEPT:
-                        save_bad_batch(par, self.savedir, self.lejepa, x, rng, self.step)
+                        save_bad_batch(config, self.savedir, self.lejepa, x, rng, self.step)
                 with self.bench.phase("07_LOGGING"):
                     if r.rank0 and (self.step % 10 == 0 or i + 1 == steps):
-                        log_metrics(f, par, self.lejepa, x, out, grad_norm, self.lr, self.step, self.n_skipped, time.time() - self.start_time)
-                self.bench.end(self.step - self.first)
+                        log_metrics(f, config, self.lejepa, x, out, grad_norm, self.lr, self.step, self.n_skipped, time.time() - self.start_time)
+                self.bench.end(self.step - self.first_step)
                 self.step += 1
-                if self.step % 100 == 0 and (reason := stop_reason(r, out, self.n_skipped, self.step - 1)):
+                if self.step % 100 == 0 and (reason := reason_to_stop(r, out, self.n_skipped, self.step - 1)):
                     print(reason, flush=True)
-                    self.stopped = reason
+                    self.stop_reason = reason
                     break
 
     def save(self, path: Path):
@@ -440,21 +441,21 @@ class Trainer:
         assert not bad, f"not saving step {self.step}: {len(bad)} non-finite tensors, e.g. {bad[0]}"
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        torch.save({"step": self.step, "params": asdict(self.par), "model_config": asdict(self.lejepa.config), "model": state,
+        torch.save({"step": self.step, "params": asdict(self.config), "model_config": asdict(self.lejepa.config), "model": state,
                     "opt": self.opt.state_dict()}, tmp)
         tmp.replace(path)  # never leave a half-written checkpoint
         print(f"Saved {path}", flush=True)
 
 
-def benchmark(par: Train, savedir: str):
-    """Throughput and a profiler trace of par's training step, with no training run, in savedir:
+def benchmark(train: Train, savedir: str):
+    """Throughput and a profiler trace of a Train's training step, with no training run, in savedir:
     warmup_steps untimed, benchmark_steps timed (performance.json), then profile_steps traced (profile.json, profile.out,
     trace_summary.json); no metrics, checkpoints or evals. Same setup, data and step as Trainer.train. Every DDP rank."""
-    steps = par.profile.warmup_steps + par.profile.benchmark_steps + 1 + par.profile.profile_steps  # Benchmark's windows, no more
-    with Trainer(par, savedir, steps) as t:
+    steps = train.profile.warmup_steps + train.profile.benchmark_steps + 1 + train.profile.profile_steps  # Benchmark's windows, no more
+    with Trainer(train, savedir, steps) as t:
         for i in range(steps):
             t.bench.begin(i)
-            t.advance(par.optim.lr)
+            t.advance(train.optim.lr)
             t.bench.end(i)
 
 def replay_bad_batch(dump: dict):
@@ -475,25 +476,25 @@ def replay_bad_batch(dump: dict):
     import torch
     from contextlib import nullcontext
     from torch.nn.attention import SDPBackend, sdpa_kernel
-    par = parse(Train, dump["params"])
+    train = parse(Train, dump["params"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.set_float32_matmul_precision(par.speed.f32mode)
+    torch.set_float32_matmul_precision(train.speed.f32mode)
     x = dump["x_uint8"].to(device).float() / 255  # Batch C Z Y X, exactly the training input
 
     def step(label: str, compiled: bool, backend: SDPBackend | None = None) -> tuple[float, int]:
-        model = make_model(par)  # this commit's own experiment (experiment.replay_bad_batch asserts it), so its own architecture
+        model = make_model(train)  # this commit's own experiment (experiment.replay_bad_batch asserts it), so its own architecture
         model.load_state_dict(dump["model"])  # the pre-step weights
         model.to(device).train()
         if compiled:
-            compile_model(model, par)
-            if par.speed.cudagraphs:
+            compile_model(model, train)
+            if train.speed.cudagraphs:
                 torch.compiler.cudagraph_mark_step_begin()
         # Same view crops (CPU generator) and SIGReg slices (GPU generator) as the original step.
         torch.set_rng_state(dump["rng_cpu"])
         if device.type == "cuda" and dump["rng_cuda"] is not None:
             torch.cuda.set_rng_state(dump["rng_cuda"], device)
         with sdpa_kernel(backend) if backend else nullcontext():
-            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=par.speed.amp):
+            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=train.speed.amp):
                 out = model(x)
             assert isinstance(out, LejepaOutput)
             out.loss.backward()

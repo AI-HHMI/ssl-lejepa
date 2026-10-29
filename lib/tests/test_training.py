@@ -9,7 +9,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from lib import readers, task_utils, training
+import tasks
+from lib import readers, training
 from lib.data import Volume
 from lib.encoders import EncoderConfig
 from lib.losses import LejepaOutput, SIGRegConfig
@@ -25,10 +26,10 @@ def small(objective=None, profile_steps=0, compile=True, qk_norm=False) -> Train
                  profile=training.Profile(warmup_steps=1, benchmark_steps=2, profile_steps=profile_steps))
 
 
-def train(par: Train, savedir, steps: int, lr1: float | None = None):
-    """A Trainer's one train() of steps steps, the lr par.optim.lr (to lr1, if given); the Trainer, closed."""
-    with training.Trainer(par, str(savedir), steps) as t:
-        t.train(steps, par.optim.lr, par.optim.lr if lr1 is None else lr1)
+def run_trainer(train: Train, savedir, steps: int, lr1: float | None = None):
+    """A Trainer's one train() of steps steps, the lr train.optim.lr (to lr1, if given); the Trainer, closed."""
+    with training.Trainer(train, str(savedir), steps) as t:
+        t.train(steps, train.optim.lr, train.optim.lr if lr1 is None else lr1)
     return t
 
 
@@ -74,12 +75,12 @@ def patch_training(monkeypatch):
     monkeypatch.setattr(training, "VolumeDataset", SyntheticDataset)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
-    def small_model_config(par):  # par's objective, tiny
+    def small_model_config(train):  # train's objective, tiny
         encoder = EncoderConfig(depth=1, embed_dim=16, num_heads=2, patch_size=(4, 4, 4))
-        if par.model.kind == "mae":
+        if train.model.kind == "mae":
             return MaeConfig(encoder=encoder, decoder_dim=8, decoder_heads=2, decoder_depth=1)
         return LejepaConfig(
-            encoder=encoder, objective=par.model.kind, view=ViewConfig(n_global=2, n_local=1) if par.model.kind == "views" else ViewConfig(),
+            encoder=encoder, objective=train.model.kind, view=ViewConfig(n_global=2, n_local=1) if train.model.kind == "views" else ViewConfig(),
             mask=MaskConfig(cube=1), projector=ProjectorConfig(dim=8, hidden=16), sigreg=SIGRegConfig(num_slices=4, knots=3),
         )
 
@@ -104,7 +105,7 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
         return model
 
     monkeypatch.setattr(training.models, "Lejepa", small_model)
-    train(params, tmp_path, n_steps)
+    run_trainer(params, tmp_path, n_steps)
 
     assert consumed == list(range(n_steps * params.optim.batch_size))
     metrics = [json.loads(line) for line in (tmp_path / "metrics.json").read_text().splitlines()]
@@ -139,14 +140,14 @@ def test_training_profile(tmp_path, monkeypatch, profile_steps, n_steps, recorde
 def test_each_objective_trains_logs_its_terms_and_reloads_for_eval(tmp_path, monkeypatch, objective):
     params = small({"views": training.Views(), "mae": training.Mae()}[objective])
     patch_training(monkeypatch)
-    train(params, tmp_path, 3).save(tmp_path / "checkpoint.pt")
+    run_trainer(params, tmp_path, 3).save(tmp_path / "checkpoint.pt")
     metrics = [json.loads(line) for line in (tmp_path / "metrics.json").read_text().splitlines()]
     assert metrics[-1]["idx_step"] == 2 and all(torch.isfinite(torch.tensor(row["loss"])) for row in metrics)
     if objective == "views":  # LeJEPA's two terms, logged apart
         assert all(row["loss"] == pytest.approx(row["inv"] + LejepaConfig().lamb * row["sigreg"], rel=1e-5) for row in metrics)
     else:  # an MAE's reconstruction error alone
         assert not {"inv", "sigreg"} & set(metrics[-1])
-    model, step = task_utils.load_model(params, str(tmp_path / "checkpoint.pt"))  # strict: the saved weights fit the objective's model
+    model, step = tasks.load_model(params, str(tmp_path / "checkpoint.pt"))  # strict: the saved weights fit the objective's model
     assert step == 3 and type(model).__name__ == {"views": "Lejepa", "mae": "Mae"}[objective]
 
 
@@ -168,7 +169,7 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
             return out
 
     monkeypatch.setattr(training.models, "Lejepa", PoisonedStep)
-    train(params, run, 6).save(run / "checkpoint.pt")
+    run_trainer(params, run, 6).save(run / "checkpoint.pt")
 
     metrics = [json.loads(line) for line in (run / "metrics.json").read_text().splitlines()]
     assert metrics[-1]["idx_step"] == 5 and metrics[-1]["skipped"] == 1  # training continued past the bad step
@@ -196,11 +197,11 @@ def test_benchmark_times_and_profiles_the_training_step_only(tmp_path, monkeypat
 
 def test_the_lr_goes_linearly_from_lr0_to_lr1_after_the_warmup(tmp_path, monkeypatch):
     monkeypatch.setattr(training, "LR_WARMUP", 20)
-    par = small(compile=False, qk_norm=True)
+    train = small(compile=False, qk_norm=True)
     patch_training(monkeypatch)
-    train(par, tmp_path, 200, lr1=0.0)
+    run_trainer(train, tmp_path, 200, lr1=0.0)
     rows = [json.loads(line) for line in (tmp_path / "metrics.json").read_text().splitlines()]
-    lr = par.optim.lr
+    lr = train.optim.lr
     lerp = lambda i: lr * (1 - i / 200) * min(1, (i + 1) / 20)  # lr0 -> lr1 over the call, times the warmup
     assert all(r["lr"] == pytest.approx(lerp(r["idx_step"])) for r in rows)
     assert max(r["lr"] for r in rows) == pytest.approx(lr * 0.9, rel=0.1) and rows[-1]["lr"] < 0.02 * lr  # up, then down to ~0
@@ -217,23 +218,23 @@ def test_qk_norm_normalizes_each_heads_queries_and_keys():
 
 def test_a_trainer_trains_in_calls_and_a_checkpoint_continues_it(tmp_path, monkeypatch):
     monkeypatch.setattr(training, "LR_WARMUP", 100)  # a short warmup, so a short trunk gets past it
-    par = small(compile=False)
-    lr = par.optim.lr
+    train = small(compile=False)
+    lr = train.optim.lr
     patch_training(monkeypatch)
     trunk_dir, branch_dir = tmp_path / "trunk", tmp_path / "trunk/step_0000130"
     trunk_dir.mkdir()
     branch_dir.mkdir()
-    with training.Trainer(par, str(trunk_dir), 130) as t:
+    with training.Trainer(train, str(trunk_dir), 130) as t:
         t.train(65, lr, lr)
         t.train(65, lr, lr)  # the second call goes on where the first stopped: the step, the warmup, the loader
         assert t.step == 130
-        t.save(branch_dir / "start.pt")
+        t.save(branch_dir / "fork.pt")
     trunk = [json.loads(line) for line in (trunk_dir / "metrics.json").read_text().splitlines()]
     assert [r["idx_step"] for r in trunk] == list(range(0, 70, 10)) + [64] + list(range(70, 130, 10)) + [129]  # one run of steps
     assert all(r["lr"] == pytest.approx(lr * min(1, (r["idx_step"] + 1) / 100)) for r in trunk)  # warmup, then constant
     assert trunk[-1]["lr"] == lr
 
-    with training.Trainer(par, str(branch_dir), 12, torch.load(branch_dir / "start.pt", weights_only=False)) as t:
+    with training.Trainer(train, str(branch_dir), 12, torch.load(branch_dir / "fork.pt", weights_only=False)) as t:
         assert t.step == 130  # the checkpoint's
         t.train(12, lr, 0.01 * lr)
     metrics = [json.loads(line) for line in (branch_dir / "metrics.json").read_text().splitlines()]
@@ -244,13 +245,13 @@ def test_a_trainer_trains_in_calls_and_a_checkpoint_continues_it(tmp_path, monke
 
 
 def test_a_trainer_stops_on_a_non_finite_loss_and_trains_no_more(tmp_path, monkeypatch):
-    par = small(compile=False)
-    lr = par.optim.lr
+    train = small(compile=False)
+    lr = train.optim.lr
     patch_training(monkeypatch)
-    monkeypatch.setattr(training, "stop_reason", lambda *a: "diverged")
-    with training.Trainer(par, str(tmp_path), 500) as t:
+    monkeypatch.setattr(training, "reason_to_stop", lambda *a: "diverged")
+    with training.Trainer(train, str(tmp_path), 500) as t:
         t.train(200, lr, lr)
-        assert t.stopped == "diverged" and t.step == 100  # agreed every 100 steps
+        assert t.stop_reason == "diverged" and t.step == 100  # agreed every 100 steps
         t.train(200, lr, lr)
         assert t.step == 100
 
@@ -262,13 +263,13 @@ def test_mae_decoder_sets_the_mae_models_decoder():
 
 def test_load_model_reads_a_checkpoint_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    par = training.Train(data=training.Data(window=(8, 8, 8), view=(8, 8, 8)))
-    monkeypatch.setattr(training, "model_config", lambda par: LejepaConfig(
+    train = training.Train(data=training.Data(window=(8, 8, 8), view=(8, 8, 8)))
+    monkeypatch.setattr(training, "model_config", lambda train: LejepaConfig(
         encoder=EncoderConfig(depth=1, embed_dim=16, num_heads=2, patch_size=(4, 4, 4)), projector=ProjectorConfig(dim=8, hidden=16)))
-    model = Lejepa(training.model_config(par))
+    model = Lejepa(training.model_config(train))
     path = tmp_path / "step_0000130.pt"
     torch.save({"step": 130, "model": model.state_dict()}, path)
-    loaded, step = task_utils.load_model(par, str(path))
+    loaded, step = tasks.load_model(train, str(path))
     assert step == 130 and torch.equal(loaded.encoder.blocks[0].attn.qkv.weight.cpu(), model.encoder.blocks[0].attn.qkv.weight)
 
 
@@ -285,5 +286,5 @@ def test_each_objective_takes_its_own_knobs_from_the_spec():
 def test_the_models_round_trip_through_a_spec_json():
     from lib.util import parse
     for model in (training.Mae(decoder=(512, 8)), training.Masked(cube=56, sigreg_over="both"), training.Views(local=96)):
-        par = training.Train(model=model)
-        assert parse(training.Train, asdict(par)) == par and type(parse(training.Train, asdict(par)).model) is type(model)
+        train = training.Train(model=model)
+        assert parse(training.Train, asdict(train)) == train and type(parse(training.Train, asdict(train)).model) is type(model)

@@ -87,8 +87,8 @@ def code_provenance() -> dict:
 
 def log_command(argv: list[str]):
     """Append one JSON line per CLI call of an experiment script outside LSF jobs, i.e. the commands you issue
-    (submitall, resubmit trunk mask7, ... on the login node via jrun.sh), to outdir/_log/commands.jsonl: time, host,
-    argv and code_provenance(). Jobs don't log here: each records what it ran in its savedir's runs.json
+    (submitall, resubmit_task trunk mask7, ... on the login node via jrun.sh), to outdir/_log/commands.jsonl: time, host,
+    argv and code_provenance(). Jobs don't log here: each records what it ran in its savedir's jobs.json
     (experiment.record), and appends from many cluster hosts to one NFS file could interleave or overwrite."""
     if "LSB_JOBID" in os.environ:
         return

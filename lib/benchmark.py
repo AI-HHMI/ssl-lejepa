@@ -44,19 +44,19 @@ class Benchmark:
     following profile_steps are traced (rank 0 only) to profile.json, profile.out and
     trace_summary.json. Use as a context manager around the loop, and each step call
     begin(i), phase(name) around each part, count(out) after the forward, and end(i).
-    `par` is a Train (its profile, optim and data groups); savedir is where it writes;
+    `train` is a Train (its profile, optim and data groups); savedir is where it writes;
     total_steps is how many steps the loop will take at most.
     """
 
-    def __init__(self, par, savedir: str, total_steps: int, device: torch.device, world_size: int, rank0: bool):
-        self.par = par
+    def __init__(self, train, savedir: str, total_steps: int, device: torch.device, world_size: int, rank0: bool):
+        self.train = train
         self.device = device
         self.world_size = world_size
         self.rank0 = rank0
         self.savedir = Path(savedir)
         self.use_cuda = device.type == "cuda"
-        self.profile_start = par.profile.warmup_steps + par.profile.benchmark_steps
-        self.profile_stop = min(self.profile_start + 1 + par.profile.profile_steps, total_steps)
+        self.profile_start = train.profile.warmup_steps + train.profile.benchmark_steps
+        self.profile_stop = min(self.profile_start + 1 + train.profile.profile_steps, total_steps)
         self.benchmark_stop = min(self.profile_start, total_steps)
         self.started: float | None = None  # perf_counter at the start of the timed window
         self.n_tokens = 0  # encoder tokens since the window started
@@ -79,11 +79,11 @@ class Benchmark:
         return torch.profiler.record_function(name) if self.prof is not None else nullcontext()
 
     def begin(self, idx_step: int) -> None:
-        par = self.par
-        if idx_step == par.profile.warmup_steps and idx_step < self.benchmark_stop:
+        train = self.train
+        if idx_step == train.profile.warmup_steps and idx_step < self.benchmark_stop:
             self.synchronize()
             self.started = time.perf_counter()
-        b1 = self.rank0 and par.profile.profile_steps > 0
+        b1 = self.rank0 and train.profile.profile_steps > 0
         b2 = idx_step == self.profile_start and idx_step + 1 < self.profile_stop
         if b1 and b2:
             self.synchronize()
@@ -92,11 +92,11 @@ class Benchmark:
                 activities.append(torch.profiler.ProfilerActivity.CUDA)
             self.prof = self.scope.enter_context(torch.profiler.profile(
                 activities=activities,
-                schedule=torch.profiler.schedule(wait=0, warmup=1, active=par.profile.profile_steps, repeat=1),
+                schedule=torch.profiler.schedule(wait=0, warmup=1, active=train.profile.profile_steps, repeat=1),
                 on_trace_ready=self._save_trace,
                 record_shapes=False, profile_memory=False, with_stack=False,
             ))
-            self.prof.add_metadata_json("run_config", json.dumps(asdict(par)))
+            self.prof.add_metadata_json("run_config", json.dumps(asdict(train)))
 
     def count(self, out) -> None:
         if self.started is not None:
@@ -114,7 +114,7 @@ class Benchmark:
 
     def _write_throughput(self) -> None:
         assert self.started is not None, "timed window never started"
-        par, world_size = self.par, self.world_size
+        train, world_size = self.train, self.world_size
         n_tokens, n_flops = self.n_tokens, self.n_flops
         if world_size > 1:  # Tokens and FLOPs summed over ranks; every rank reaches this step.
             total = torch.tensor([n_tokens, n_flops], dtype=torch.float64, device=self.device)
@@ -122,16 +122,16 @@ class Benchmark:
             n_tokens, n_flops = int(total[0].item()), float(total[1].item())
         self.synchronize()  # Only window boundaries synchronize; phases remain asynchronous.
         seconds = time.perf_counter() - self.started
-        steps = self.benchmark_stop - par.profile.warmup_steps
-        samples_per_second = steps * par.optim.batch_size * world_size / seconds
+        steps = self.benchmark_stop - train.profile.warmup_steps
+        samples_per_second = steps * train.optim.batch_size * world_size / seconds
         result = {
             "tbl": "throughput", "time": time.time(), "device": str(self.device),
-            "torch_version": torch.__version__, "params": asdict(par),
+            "torch_version": torch.__version__, "params": asdict(train),
             "steps": steps, "seconds": seconds, "seconds_per_step": seconds / steps,
             "samples_per_second": samples_per_second,
-            "input_mvox_per_second": samples_per_second * prod(par.data.window) / 1e6,
+            "input_mvox_per_second": samples_per_second * prod(train.data.window) / 1e6,
             "tokens_per_second": n_tokens / seconds,
-            "tokens_per_sample": n_tokens / (steps * par.optim.batch_size * world_size),
+            "tokens_per_sample": n_tokens / (steps * train.optim.batch_size * world_size),
             "world_size": world_size,
             "tflops_per_second": n_flops / seconds / 1e12,  # node total
         }
