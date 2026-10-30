@@ -71,9 +71,16 @@ def test_a_trunk_branches_at_its_start_and_after_every_segment_at_a_constant_lr(
     assert [e for e in FakeTrainer.log if e[0] == "train"] == [("train", 100, 1e-3, 1e-3)] * 3
     assert [Path(e[1]).parent.name for e in FakeTrainer.log if e[0] == "save"] == [f"step_{s:07d}" for s in [0, 100, 200, 300]]
     assert [g[0] for g in gone] == ["anneal"] * 4
+    assert (Path(TRUNK.savedir) / "last.pt").read_text() == "step 300"  # the state to continue from
     # the branch of the first segment's end: its own dir, the trunk's hardware, the trunk and the fork point it takes
     assert gone[1] == ("anneal", f"{TRUNK.savedir}/step_0000100", tasks.ANNEAL_HARDWARE, tasks.ANNEAL_MINUTES,
                        {"t": TRUNK, "fork_point": f"{TRUNK.savedir}/step_0000100/fork.pt"})
+
+
+def test_a_trunk_continuing_an_init_from_branches_only_after_its_segments(gone):
+    tasks.trunk(replace(TRUNK, init_from="outdir/e00/e00-prev/a/last.pt"))
+    assert FakeTrainer.log[0] == ("init", TRUNK.savedir, 300, "outdir/e00/e00-prev/a/last.pt")
+    assert [Path(e[1]).parent.name for e in FakeTrainer.log if e[0] == "save"] == [f"step_{s:07d}" for s in [100, 200, 300]]
 
 
 def test_a_trunk_that_diverges_branches_no_more(gone):

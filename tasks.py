@@ -16,6 +16,7 @@ straight-line code on loaded models and a Train, no files named, no callbacks) i
         mia-evals on the test volume, its post-processing fitted on the tune volume; best.pt = the best score of the trunk's branches
 """
 
+import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
@@ -67,7 +68,7 @@ class Trunk:
     these: an Experiment's runs. It also says what its branches do."""
     savedir: str = "outdir/e00/scratch"
     train: Train = field(default_factory=Train)
-    init_from: str = ""  # the starting weights: "" random, or a checkpoint .pt (its weights and optimizer)
+    init_from: str = ""  # the starting weights: "" random, or a checkpoint .pt (its weights and optimizer): to extend a run, the last.pt of its trunk
     segments: int = 10
     segment_steps: int = 10_000
     anneal_steps: int = 10_000  # a branch's steps, its lr falling linearly to train.optim.lr x anneal_lr_frac
@@ -84,17 +85,21 @@ def start(t: Trunk):
 
 
 def trunk(t: Trunk):
-    """Pretrain at a constant lr, with a branch at the start and after every segment (step_<N>/ each; metrics.json, best.pt)."""
+    """Pretrain at a constant lr, with a branch at the start (unless it continues an init_from) and after every segment (step_<N>/ each;
+    metrics.json, best.pt). last.pt is the latest fork point's weights and optimizer, a run's state to continue from."""
     assert_snapshot()
     train = replace(t.train, hardware=TRUNK_HARDWARE)
     with Trainer(train, t.savedir, t.segments * t.segment_steps, load_checkpoint(t.init_from)) as trainer:
         def fork():
             fork_point = Path(t.savedir) / f"step_{trainer.step:07d}/fork.pt"
             trainer.save(fork_point)
+            last = Path(t.savedir) / "last.pt"  # a hard link, so it survives the anneal taking fork_point
+            os.link(fork_point, last.with_suffix(".tmp"))
+            os.replace(last.with_suffix(".tmp"), last)
             go(anneal, str(fork_point.parent), ANNEAL_HARDWARE, ANNEAL_MINUTES, t=t, fork_point=str(fork_point))
         if trainer.r.rank0:
             record_job(t.savedir, "trunk", t=t)
-            fork()
+            if not t.init_from: fork()  # a continued trunk starts at a state its source already branched at
         lr = t.train.optim.lr
         for _ in range(t.segments):
             trainer.train(t.segment_steps, lr, lr)
