@@ -7,6 +7,7 @@ straight-line code on loaded models and a Train, no files named, no callbacks) i
     trunk(t):                                    # one job, up to TRUNK_MINUTES
         fork(); repeat t.segments times: train(t.segment_steps, lr, lr); fork()
         fork() = go anneal(t, a checkpoint of the weights and optimizer)    # data: the train volumes' images
+                 (t.anneal_steps == 0: no anneal, the checkpoint is the branch's end: go finetune)
     anneal(t, fork_point):                       # as many GPUs as the trunk
         train(t.anneal_steps, lr, lr x t.anneal_lr_frac); go finetune(t, the branch's dir)
     finetune(t, branch_dir):                     # one small GPU: the encoder is frozen or the head is small
@@ -23,12 +24,12 @@ from typing import Literal
 
 from lib import evals
 from lib.scoring import keep_if_best, mia_pq
-from lib.task_utils import B300, RTX6000, assert_snapshot, go, record_job
+from lib.task_utils import B300, H200, RTX6000, assert_snapshot, go, record_job
 from lib.training import Hardware, Train, Trainer, make_model
 
 # Where each task runs and its LSF wall limit (a trunk killed at it keeps the branches of its finished segments). The only place
 # hardware is chosen: each task's Train gets its trunk's or anneal's Hardware (what its data workers and ranks are).
-TRUNK_HARDWARE, TRUNK_MINUTES = B300, 12 * 60
+TRUNK_HARDWARE, TRUNK_MINUTES = H200, 12 * 60
 ANNEAL_HARDWARE, ANNEAL_MINUTES = B300, 2 * 60
 FINETUNE_HARDWARE, FINETUNE_MINUTES = RTX6000, 2 * 60  # pca, then a Linear or a UNETR
 # A score is CPU only. mia-evals: ~1 h and ~200 GB peak for the mutex watershed at 896^3, "give it a whole node". The shortest CPU
@@ -71,7 +72,7 @@ class Trunk:
     init_from: str = ""  # the starting weights: "" random, or a checkpoint .pt (its weights and optimizer): to extend a run, the last.pt of its trunk
     segments: int = 10
     segment_steps: int = 10_000
-    anneal_steps: int = 10_000  # a branch's steps, its lr falling linearly to train.optim.lr x anneal_lr_frac
+    anneal_steps: int = 10_000  # a branch's steps (0: none, a branch is the trunk's weights as they are), its lr falling linearly to train.optim.lr x anneal_lr_frac
     anneal_lr_frac: float = 0.01  # the branch's final lr, as a fraction of train.optim.lr
     eval_data: str = ""  # the lib.data.DATASETS a branch is evaluated on: its val images, and its fit, test and tune blocks
     eval_head: Literal["probe", "finetune"] = "probe"  # the branch's tiled inference: evals.probe (a Linear on the frozen encoder) or evals.finetune (a UNETR)
@@ -91,12 +92,16 @@ def trunk(t: Trunk):
     train = replace(t.train, hardware=TRUNK_HARDWARE)
     with Trainer(train, t.savedir, t.segments * t.segment_steps, load_checkpoint(t.init_from)) as trainer:
         def fork():
-            fork_point = Path(t.savedir) / f"step_{trainer.step:07d}/fork.pt"
-            trainer.save(fork_point)
-            last = Path(t.savedir) / "last.pt"  # a hard link, so it survives the anneal taking fork_point
-            os.link(fork_point, last.with_suffix(".tmp"))
+            branch_dir = Path(t.savedir) / f"step_{trainer.step:07d}"
+            state = branch_dir / ("fork.pt" if t.anneal_steps else "checkpoint.pt")  # no anneal: the weights as they are
+            trainer.save(state)
+            last = Path(t.savedir) / "last.pt"  # a hard link, so it survives the anneal taking its fork point
+            os.link(state, last.with_suffix(".tmp"))
             os.replace(last.with_suffix(".tmp"), last)
-            go(anneal, str(fork_point.parent), ANNEAL_HARDWARE, ANNEAL_MINUTES, t=t, fork_point=str(fork_point))
+            if t.anneal_steps:
+                go(anneal, str(branch_dir), ANNEAL_HARDWARE, ANNEAL_MINUTES, t=t, fork_point=str(state))
+            else:
+                go(finetune, str(branch_dir), FINETUNE_HARDWARE, FINETUNE_MINUTES, t=t, branch_dir=str(branch_dir))
         if trainer.r.rank0:
             record_job(t.savedir, "trunk", t=t)
             if not t.init_from: fork()  # a continued trunk starts at a state its source already branched at

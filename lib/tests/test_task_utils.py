@@ -83,6 +83,14 @@ def test_a_trunk_continuing_an_init_from_branches_only_after_its_segments(gone):
     assert [Path(e[1]).parent.name for e in FakeTrainer.log if e[0] == "save"] == [f"step_{s:07d}" for s in [100, 200, 300]]
 
 
+def test_a_trunk_without_an_anneal_finetunes_its_weights_as_they_are(gone):
+    tasks.trunk(replace(TRUNK, anneal_steps=0))
+    assert [g[0] for g in gone] == ["finetune"] * 4
+    assert gone[1] == ("finetune", f"{TRUNK.savedir}/step_0000100", tasks.FINETUNE_HARDWARE, tasks.FINETUNE_MINUTES,
+                       {"t": replace(TRUNK, anneal_steps=0), "branch_dir": f"{TRUNK.savedir}/step_0000100"})
+    assert [Path(e[1]).name for e in FakeTrainer.log if e[0] == "save"] == ["checkpoint.pt"] * 4  # the branch's end, what finetune loads
+
+
 def test_a_trunk_that_diverges_branches_no_more(gone):
     FakeTrainer.stop_after = 2
     tasks.trunk(TRUNK)
@@ -177,6 +185,8 @@ def test_the_experiment_file_names_runs_that_load_as_a_job_loads_them(tmp_path, 
     assert experiment.EXPERIMENT.start is tasks.start
     for h in (tasks.TRUNK_HARDWARE, tasks.ANNEAL_HARDWARE, tasks.FINETUNE_HARDWARE):
         assert h.n_workers + 1 <= task_utils.CPUS_PER_GPU
+    for r in experiment.EXPERIMENT.runs.values():  # a child's parent is in outdir/, on the cluster
+        if r.init_from: Path(r.init_from).parent.parent.mkdir(parents=True, exist_ok=True)
     task_entry.assert_experiment(experiment.EXPERIMENT)
 
 

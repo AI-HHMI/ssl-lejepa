@@ -1,8 +1,10 @@
-"""e13-cellmap-12h: e12's six runs in this format (e12's are named d0-d5). Do CellMap's organelle EM, the masked cube's size (7^3 tokens,
-e12's, or e11's 5^3) and the training objective change what 12 h of pretraining gives a linear probe on hemibrain?
+"""e13-02-mask7-extend: e13's mask7 trunk, 100k more steps from its final state (step 100k) on one H200 node: does 12 h of pretraining
+more help a linear probe on hemibrain? The branches are the trunk's weights as they are (anneal_steps=0), finetuned on RTX 6000s.
 
 Declarative: every run shares BASE (its Train) and differs by the groups its line names; its schedule is its Trunk's fields. What a
-run does (tasks.py): it pretrains in segments, branches at its start and after each (anneal, finetune, score), and keeps the best branch.
+run does (tasks.py): it pretrains in segments, branches after each (finetune, score), and keeps the best branch.
+Before submitting, e13's mask7 needs its last.pt (its trunk predates it): `ln outdir/e00/e13-cellmap-12h/mask7/step_0100000/start.pt
+outdir/e00/e13-cellmap-12h/mask7/last.pt`, a hard link its pending branch job can't delete.
 Run it: `sh jrun.sh exp experiment.py submitall`, then `resubmit_task <start or task> <run or job file>`; `python experiment.py -h` lists the
 commands and tasks."""
 
@@ -11,7 +13,7 @@ from functools import partial
 
 from lib.task_entry import main
 from lib.task_utils import Experiment
-from lib.training import Data, Encoder, Mae, Masked, Optim, Speed, Train, Views
+from lib.training import Data, Encoder, Masked, Optim, Speed, Train
 from tasks import TASKS, Trunk, start
 
 DATA = ("hemibrain", "fish2", "liconn_mouse", "microns", "cellmap")
@@ -25,14 +27,9 @@ BASE = Train(
     speed=Speed(cudagraphs=True),
 )
 
-run = partial(Trunk, eval_data="hemibrain", segments=10, anneal_steps=10_000, anneal_lr_frac=0.01)  # a line of the table below
-EXPERIMENT = Experiment("e00/e13-cellmap-12h", start, {
-    "mae":          run(train=replace(BASE, model=Mae(decoder=(512, 8))), segment_steps=10_000),
-    "views":        run(train=replace(BASE, model=Views(local=96, batch_views=True, lamb=0.1)), segment_steps=10_000),
-    "mask7":        run(train=replace(BASE, model=mask(cube=56)), segment_steps=10_000),
-    "mask5":        run(train=replace(BASE, model=mask(cube=40)), segment_steps=10_000),
-    "mask5-nocell": run(train=replace(BASE, model=mask(cube=40), data=replace(BASE.data, sets=DATA[:-1])), segment_steps=10_000),
-    "mask5-cell":   run(train=replace(BASE, model=mask(cube=40), data=replace(BASE.data, sets=("cellmap",))), segment_steps=10_000),
+EXPERIMENT = Experiment("e00/e13-02-mask7-extend", start, {
+    "mask7": Trunk(train=replace(BASE, model=mask(cube=56)), init_from="outdir/e00/e13-cellmap-12h/mask7/last.pt",
+                   eval_data="hemibrain", segments=10, segment_steps=10_000, anneal_steps=0),
 })
 
 if __name__ == "__main__":
