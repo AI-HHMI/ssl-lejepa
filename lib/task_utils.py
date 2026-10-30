@@ -25,8 +25,8 @@ CODE_ROOT = Path(__file__).resolve().parent.parent  # the code root: the shared 
 # starts depending on others. Dependencies (pyproject.toml / uv.lock) are not frozen.
 SNAPSHOT_PATHS = ["experiment.py", "tasks.py", "lib", "mia_evals"]
 CPUS_PER_GPU = 12  # LSF slots per GPU: 8 GPUs -> all 96 cores; training processes need cores beyond the data workers
-# Whole nodes (Optim.batch_size and Hardware.n_workers are per GPU); an H200 node has one GPU taken by someone else's job.
-H200 = Hardware(queue="gpu_h200", n_gpus=7, n_workers=CPUS_PER_GPU - 1)
+# Whole nodes (Optim.batch_size and Hardware.n_workers are per GPU).
+H200 = Hardware(queue="gpu_h200", n_gpus=8, n_workers=CPUS_PER_GPU - 1)
 B300 = Hardware(queue="gpu_b300", n_gpus=8, n_workers=CPUS_PER_GPU - 1)
 RTX6000 = Hardware(queue="gpu_rtx6000", n_gpus=1, n_workers=CPUS_PER_GPU - 1)  # one of a node's 8 GPUs
 
